@@ -1,0 +1,27 @@
+{
+  "name": "scadforge",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Natural-language to parametric OpenSCAD builder — monorepo root",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "packageManager": "pnpm@11.24.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm -r --if-present run test",
+    "lint": "eslint .",
+    "license-gate": "node scripts/check-licenses.mjs",
+    "license-gate:self-test": "node scripts/check-licenses.mjs --self-test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.13.0",
+    "eslint": "^9.13.0",
+    "globals": "^15.11.0",
+    "typescript": "^5.6.3",
+    "typescript-eslint": "^8.13.0",
+    "vitest": "^2.1.4"
+  }
+}
