@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Spike 1 — openscad-wasm in a Vite Web Worker</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #111; color: #eee; font-family: ui-monospace, monospace; }
+      #app { display: flex; flex-direction: column; height: 100%; }
+      #viewport { flex: 1 1 auto; min-height: 0; }
+      #stats { flex: 0 0 auto; max-height: 40vh; overflow: auto; padding: 8px 12px; background: #000; border-top: 1px solid #333; font-size: 12px; white-space: pre-wrap; }
+      #stats table { border-collapse: collapse; width: 100%; }
+      #stats td, #stats th { border: 1px solid #333; padding: 2px 6px; text-align: left; }
+      h1 { font-size: 13px; margin: 8px 12px 0; color: #7fd; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <h1>Spike 1: openscad-wasm in a Vite Web Worker (throwaway — Issue #3)</h1>
+      <div id="viewport"></div>
+      <div id="stats">Booting worker…</div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "spike-01-wasm-preview",
+  "private": true,
+  "version": "0.0.0",
+  "description": "THROWAWAY spike (Issue #3): openscad-wasm in a Vite Web Worker, rendered with three.js. Not part of the pnpm workspace. See docs/spikes/01-wasm-preview/README.md.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "gen-manifest": "node scripts/gen-manifest.mjs"
+  },
+  "dependencies": {
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "@types/three": "^0.169.0"
+  }
+}
