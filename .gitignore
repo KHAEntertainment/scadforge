@@ -23,3 +23,6 @@ build/
 
 # ScadForge runtime project data in sample/test projects
 .scadforge/exports/
+
+# Local bind-mount target for the docker/ openscad compose service
+/data/

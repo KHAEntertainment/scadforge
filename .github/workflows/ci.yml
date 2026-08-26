@@ -38,3 +38,12 @@ jobs:
 
       - name: License gate
         run: node scripts/check-licenses.mjs
+
+  docker-smoke-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build pinned OpenSCAD image + smoke render
+        run: bash docker/ci-smoke-render.sh
