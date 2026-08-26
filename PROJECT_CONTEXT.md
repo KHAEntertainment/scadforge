@@ -20,7 +20,7 @@
 ## Architecture Decisions
 - **Auth scheme**: **None** (local-first, single user, BYO API key via env). Do not introduce auth.
 - **API spec**: REST + SSE. Error format `{"error_code": "...", "message": "..."}`. No pagination in v1.
-- **SSE event union**: defined in `packages/protocol` (frozen by Issue #10): `turn_started, tool_call, tool_result, snapshot_created, assistant_text, turn_done, error`
+- **SSE event union**: defined in `packages/protocol` (FROZEN — Issue #13, PR #21, merged 2026-08-26): `turn_started, tool_call, tool_result, snapshot_created, assistant_text, turn_done, error`
 - **Database migration framework**: None (no DB)
 - **API Contract doc**: contracts live as TypeScript types + zod schemas in `packages/protocol`, `packages/scad-core/src/types.ts`, `packages/agent/src/tools/contract.ts` — these are the canonical API contract (no separate API_CONTRACT.md)
 - **Agent tools (7, shared Agent SDK + MCP)**: `read_project, write_scad, set_params, render_views, validate_mesh, export, library_lookup`
