@@ -45,19 +45,25 @@
 - **Contract freeze rule**: after their freeze issue merges, `packages/protocol/**`, `packages/scad-core/src/types.ts`, `packages/agent/src/tools/contract.ts` are Tech-Lead-owned. Workers must not edit them inside feature PRs — request changes via issue comment.
 - **Agent output contract**: never paste full `.scad` into chat; short summaries only.
 
-## Spike Decisions (filled at Round-0 close)
-- **OpenSCAD nightly pin (date + digest)**: TBD — Spike 2 (#4)
-- **WASM output format + three.js loader**: TBD — Spike 1 (#3)
-- **WASM instance reuse vs re-instantiation**: TBD — Spike 1 (#3)
-- **validate_mesh input format (3MF parse vs parallel STL export)**: TBD — Spike 4 (#6)
-- **render_views camera constants**: TBD — Spike 2 (#4)
+## Spike Decisions (Round-0 close, 2026-08-26 — all four spikes GO or GO-WITH-CAVEATS)
+- **OpenSCAD pin**: `docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7` → OpenSCAD **2026.01.19** (git e43242666), official weekly CI image, multi-arch (native arm64). AppImage-in-Docker rejected (x86 nightly segfaults under QEMU on Apple Silicon; arm64 AppImage too old; source build OOMs). Caveat: trails newest x86-only nightly ~5 weeks — recheck tags if a newer feature becomes load-bearing.
+- **render_views camera constants** (frozen into contract): common flags `--viewall --autocenter --projection=ortho --imgsize=1024,768 --backend=Manifold --render --colorscheme=Cornfield`; rotations iso `55,0,25`, front `90,0,0`, top `0,0,0`, right `90,0,90`. Verified: 3MF color export ✓, `--export-format=param` ✓, byte-identical determinism ✓, ~3.7s per 5-view set.
+- **Section view**: two-pass — export mesh, then wrapper with `import()` + `difference()`. The SDP §6.2 single-pass `difference(){ include ... }` sketch DOES NOT PARSE (include is rejected in nested scopes).
+- **WASM preview (M2)**: binary STL (`--export-format=binstl`) + three.js `STLLoader` (3MF compiled out of the wasm build; STL carries no color — server renders remain color authority). **Re-instantiate the module per render** inside one long-lived worker (`callMain` reuse aborts / leaks ~3.4GB). ~1.6s/render, stable heap; cold-init 12.7s uncached dominated by 56-file BOSL2 fetch (bundle-packaging fix queued for M2).
+- **validate_mesh input**: parallel binary-STL export (zero-dep parse), NOT 3MF parsing — `openscad -o out.3mf -o out.stl` emits both in one render. `ValidationReport = {manifold, status, volume_mm3, surface_area, bbox, triangle_count, components, genus}`; `genus` meaningful only when `components === 1`. Gates: manifold hard, volume > 0.001 hard, components === 1 hard with `allowMultiPart` override. Use manifold-3d for manifoldness (hand-rolled edge-pairing gives false positives on CGAL unions).
+- **Agent SDK (M1 #13 requirements)**: pin `@anthropic-ai/claude-agent-sdk` **exactly 0.3.246** (zod ^4; caret ranges hit a fatal duplicate-tool_use-id bug); always `settingSources: []` (omitting it leaks operator ~/.claude config, 210× tokens) and `tools: []` (else MCP tools defer behind ToolSearch); real usage only via `message_delta` with `includePartialMessages: true`; tool-result images = MCP CallToolResult `{type:'image', data:<base64>, mimeType:'image/png'}` with a text label block before each image; NEVER `isError:true` on results carrying images (content collapses to string); pass budget enforced in the write_scad tool handler (not maxTurns) so mcp-server inherits it; "no .scad in chat" enforced host-side by stripping fenced blocks from assistant_text; SDK makes an auxiliary ~900-token haiku call per run (known cost constant). Cost: ~$0.08 single-pass turn, ~$0.14 two-pass; latency dominated by OpenSCAD, not the model.
 
 ## Completed Features
-- (none yet — Round 0 in progress)
+- [x] Monorepo scaffold + CI + license gate (Issue #2, PR #8, merged 2026-08-26)
+- [x] Spike 1 openscad-wasm (Issue #3, PR #9, GO)
+- [x] Spike 2 OpenSCAD docker pin + view harness (Issue #4, PR #11, GO-WITH-CAVEATS)
+- [x] Spike 3 Agent SDK loop (Issue #5, PR #12, GO-WITH-CAVEATS)
+- [x] Spike 4 manifold-3d validation (Issue #6, PR #7, GO)
 
 ## Current Status
-- **Last updated**: 2026-08-25
-- **Current iteration goal**: M0 Bootstrap + Spikes — monorepo scaffold (#2) and 4 de-risking spikes (#3–#6) as a parallel 5-worker wave; Round-0 close = Architecture Decision Checkpoint fills the Spike Decisions section above
-- **Execution plan**: `~/.claude/plans/greenfield-project-ai-scad-is-delegated-coral.md` (approved 2026-08-25); milestones M0–M4
-- **Known tech debt**: none
+- **Last updated**: 2026-08-26
+- **M0 complete.** All spikes GO; Architecture Decision Checkpoint recorded above.
+- **Current iteration goal**: M1 Core Loop — contract freeze first, then 6-worker parallel wave, closing with Scenario A end-to-end
+- **Execution plan**: `~/.claude/plans/greenfield-project-ai-scad-is-delegated-coral.md` (approved 2026-08-25)
+- **Known tech debt**: #10 license-gate hardening (peerDependencies + real pnpm-list CI path); BOSL2 56-file fetch packaging (M2); prod validate_mesh needs clean malformed-input errors (QA finding, fold into scad-core issue)
 - **Open PRs**: none

@@ -29,7 +29,8 @@ Always prefer RTK wrappers: `rtk git`, `rtk gh`, `rtk npm`, `rtk tsc`, `rtk lint
 ## Pinned toolchain
 
 - Node 22, pnpm
-- OpenSCAD nightly (Docker): **pin TBD — set by Spike 2 (#4); recorded here + `docker/openscad.Dockerfile` + PROJECT_CONTEXT.md.** Required flags verified by spike: `--backend=manifold`, `--export-format=3mf` (colors), `--export-format=param`, fixed `--camera` presets.
+- OpenSCAD (Docker): **`docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7`** = OpenSCAD 2026.01.19 (official weekly image, native arm64). Verified flags: `--backend=Manifold`, 3MF color export, `--export-format=param`, camera presets (see PROJECT_CONTEXT.md Spike Decisions). Section view is two-pass (mesh export → `import()` + `difference()`) — `include` inside braces does not parse.
+- Claude Agent SDK: pin **exactly `0.3.246`**; always pass `settingSources: []` and `tools: []`; usage accounting via `message_delta` + `includePartialMessages: true`. Full requirements in PROJECT_CONTEXT.md Spike Decisions.
 
 ## Units & conventions
 
