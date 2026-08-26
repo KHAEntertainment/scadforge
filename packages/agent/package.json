@@ -11,6 +11,11 @@
     "build": "tsc -p tsconfig.json",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@scadforge/protocol": "workspace:*",
+    "@scadforge/scad-core": "workspace:*",
+    "zod": "^4.4.3"
+  },
   "devDependencies": {
     "typescript": "^5.6.3",
     "vitest": "^2.1.4"
