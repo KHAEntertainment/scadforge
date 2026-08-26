@@ -1,0 +1,28 @@
+# ScadForge — pinned OpenSCAD service for local dev + apps/server.
+#
+# Quickstart:
+#   docker compose up openscad          # builds + prints `openscad --version`
+#   docker compose run --rm openscad --version
+#
+# apps/server (packages/scad-core's renderer) talks to this same pinned image
+# via subprocess, not via this compose file directly — set SCADFORGE_OPENSCAD_IMAGE
+# to override which image tag/digest it invokes. See docker/README.md.
+
+name: scadforge
+
+services:
+  openscad:
+    build:
+      context: .
+      dockerfile: docker/openscad.Dockerfile
+    image: ${SCADFORGE_OPENSCAD_IMAGE:-scadforge-openscad:pinned}
+    # Default command just proves the pinned version is reachable
+    # (`docker compose up` → prints "OpenSCAD version 2026.01.19 ...").
+    command: ["--version"]
+    volumes:
+      # Project directories (.scad sources, .scadforge/ per-project store):
+      # mount the host project root apps/server reads/writes into the same
+      # path inside the container so exported files land back on the host.
+      - ./data/projects:/work/projects
+      # Vendored libraries (BOSL2/MCAD) consumed via `use <...>` / `include <...>`:
+      - ./packages/libs:/work/libs:ro
