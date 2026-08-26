@@ -10,6 +10,7 @@ build/
 
 # Local session state (agent scratch, never committed)
 .agent/
+.worktrees/
 
 # Env / secrets
 .env
