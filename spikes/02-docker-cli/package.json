@@ -1,0 +1,14 @@
+{
+  "name": "spike-02-docker-cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Spike 2 (Issue #4): OpenSCAD nightly in Docker driven from Node. Standalone — not part of the pnpm workspace.",
+  "scripts": {
+    "build:image": "docker build -t scadforge-openscad:pinned .",
+    "run-views": "node run-views.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
