@@ -63,6 +63,36 @@ procedure below rather than reaching for emulation or a from-source build.
 6. Commit with a message noting old → new digest and version, and re-run the
    full render_views verification.
 
+## Image-agnostic invocation (read before overriding `SCADFORGE_OPENSCAD_IMAGE`)
+
+**The raw upstream `openscad/openscad` image has no `openscad` entrypoint.**
+`docker inspect openscad/openscad@sha256:0af06...b52fa7` reports
+`Entrypoint=[] Cmd=[bash]` — only the image built from
+`docker/openscad.Dockerfile` sets `ENTRYPOINT ["openscad"]`, and that's a
+**local convenience only**, not something every image behind
+`SCADFORGE_OPENSCAD_IMAGE` can be assumed to have (found by Phase 4 QA on
+PR #22: `docker run --rm openscad/openscad@sha256:0af06...b52fa7 --version`
+fails with `exec: "--version": executable file not found in $PATH` because
+`--version` is treated as the container's `Cmd`, not an arg to `openscad`).
+
+**Rule: every programmatic invocation must name the `openscad` executable
+explicitly — never rely on image `ENTRYPOINT`/`CMD`.** Concretely:
+- `compose.yaml`'s `openscad` service sets `entrypoint: ["openscad"]`
+  explicitly (not inherited from the Dockerfile), so it behaves identically
+  whether `SCADFORGE_OPENSCAD_IMAGE` resolves to the locally built tag or a
+  bare upstream digest.
+- Any direct `docker run` (CI, the #14 scad-core runner, ad hoc debugging)
+  must pass `--entrypoint openscad` explicitly:
+  ```bash
+  docker run --rm --entrypoint openscad "$SCADFORGE_OPENSCAD_IMAGE" --version
+  ```
+  This is the verified-working form — confirmed identical against both the
+  locally built `scadforge-openscad:pinned` tag and the bare
+  `openscad/openscad@sha256:0af06...b52fa7` digest (see "Verified re-run of
+  the QA reproduction" below). Do **not** use the earlier documented form
+  (`docker run --rm "$IMAGE" --version`, relying on `ENTRYPOINT`) — that is
+  the exact command QA showed fails against a raw upstream digest.
+
 ## Local usage
 
 ```bash
@@ -75,6 +105,11 @@ docker compose up openscad
 docker compose run --rm openscad --version
 ```
 
+Both work against `SCADFORGE_OPENSCAD_IMAGE` overridden to a raw upstream
+digest too, because `compose.yaml` sets `entrypoint: ["openscad"]` explicitly
+(see "Image-agnostic invocation" above) rather than depending on the image's
+own entrypoint.
+
 Root `compose.yaml` mounts:
 - `./data/projects` → `/work/projects` — project directories (`.scad`
   sources + the per-project `.scadforge/` filesystem store)
@@ -83,6 +118,24 @@ Root `compose.yaml` mounts:
 
 `./data/` is gitignored; Docker creates it automatically on first
 `compose up` / `compose run` if it doesn't exist yet.
+
+### Library resolution: `OPENSCADPATH`
+
+OpenSCAD resolves `use <...>` / `include <...>` library paths via the
+`OPENSCADPATH` environment variable (colon-separated, like `PATH`).
+`compose.yaml` sets `OPENSCADPATH=/work/libs` on the `openscad` service to
+match the `./packages/libs:/work/libs:ro` mount above, so
+`use <BOSL2/std.scad>` resolves once BOSL2/MCAD are vendored into
+`packages/libs` (tracked separately — `packages/libs` is currently a package
+scaffold with no vendored `.scad` files yet, per Phase 4 QA's non-blocking
+note).
+
+**Convention for the #14 scad-core runner**: whenever it bind-mounts a
+library directory into the container (its own `docker run`/exec, not this
+compose file), it should mount it at the same path, `/work/libs`, and set
+`-e OPENSCADPATH=/work/libs` on that invocation — matching this compose
+service so library-relative `.scad` includes behave identically regardless
+of which caller (compose, the runner, CI) invokes OpenSCAD.
 
 ## Consuming this image from Node (apps/server / packages/scad-core)
 
@@ -100,15 +153,50 @@ If unset, tooling defaults to the locally built tag `scadforge-openscad:pinned`
 (i.e. `docker build -f docker/openscad.Dockerfile -t scadforge-openscad:pinned .`).
 This is the same env var name `compose.yaml`'s `openscad` service image tag
 reads, so a single override applies to both compose and any direct
-`docker run` invocations.
+`docker run` invocation — **provided the invocation names the executable
+explicitly**, per "Image-agnostic invocation" above:
+
+```bash
+# Verified-working form, either image:
+docker run --rm --entrypoint openscad "$SCADFORGE_OPENSCAD_IMAGE" --version
+```
+
+### Verified re-run of the QA reproduction
+
+Re-running Phase 4 QA's exact repro after the fix, against the exact digest
+value the README previously (incorrectly) documented as a working override:
+
+```
+$ docker run --rm openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7 --version
+docker: Error response from daemon: failed to create task for container: failed to create shim task:
+OCI runtime create failed: runc create failed: unable to start container process: error during
+container init: exec: "--version": executable file not found in $PATH
+(exit 127)   # <- QA's reported failure, reproduced verbatim
+
+$ docker run --rm --entrypoint openscad openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7 --version
+OpenSCAD version 2026.01.19   # <- fixed form, exit 0
+
+$ SCADFORGE_OPENSCAD_IMAGE="openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7" docker compose up openscad
+ Container scadforge-openscad-1 Started
+openscad-1  | OpenSCAD version 2026.01.19
+openscad-1 exited with code 0   # <- QA's exact repro command, now passing
+```
 
 ## CI
 
-`.github/workflows/ci.yml` has a `docker-smoke-render` job that:
+`.github/workflows/ci.yml` has a `docker-smoke-render` job
+(`docker/ci-smoke-render.sh`) that:
 1. Builds `docker/openscad.Dockerfile`.
-2. Runs `openscad --version` and asserts it reports `2026.01.19`.
-3. Renders a trivial `cube([10,10,10]);` model to PNG and asserts the output
-   file exists and starts with the PNG magic bytes.
+2. Runs `openscad --version` (via `--entrypoint openscad`) against the
+   locally built image and asserts it reports `2026.01.19`.
+3. **Regression-guards the override contract**: runs the identical
+   `--entrypoint openscad --version` check against the bare upstream digest
+   (`openscad/openscad@sha256:0af06...b52fa7`, no local build/retag) and
+   asserts the same pinned version — this is the exact scenario Phase 4 QA
+   found broken, now covered so it can't regress silently.
+4. Renders a trivial `cube([10,10,10]);` model to PNG (also via
+   `--entrypoint openscad`) and asserts the output file exists and starts
+   with the PNG magic bytes.
 
 This keeps `@docker`-tagged Vitest suites runnable in CI without needing a
 registry pull on every run (the image builds from the pinned digest, which

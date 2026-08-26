@@ -7,6 +7,17 @@
 # apps/server (packages/scad-core's renderer) talks to this same pinned image
 # via subprocess, not via this compose file directly — set SCADFORGE_OPENSCAD_IMAGE
 # to override which image tag/digest it invokes. See docker/README.md.
+#
+# IMPORTANT — image-agnostic invocation (fixed after Phase 4 QA, PR #22):
+# the raw upstream `openscad/openscad` image (e.g. when SCADFORGE_OPENSCAD_IMAGE
+# is set to a bare digest ref, not a locally built/retagged image) ships with
+# NO openscad entrypoint (`Entrypoint=[] Cmd=[bash]`) — only the image built
+# from docker/openscad.Dockerfile sets one, for local convenience only. Every
+# programmatic caller (this compose service, docker/ci-smoke-render.sh, and
+# the #14 scad-core runner) MUST therefore name the `openscad` executable
+# explicitly rather than relying on the image's own ENTRYPOINT/CMD — hence
+# the explicit `entrypoint: ["openscad"]` below, which pins argv[0] regardless
+# of which image SCADFORGE_OPENSCAD_IMAGE resolves to.
 
 name: scadforge
 
@@ -16,9 +27,21 @@ services:
       context: .
       dockerfile: docker/openscad.Dockerfile
     image: ${SCADFORGE_OPENSCAD_IMAGE:-scadforge-openscad:pinned}
+    # Explicit entrypoint (see note above) — do not remove and rely on the
+    # Dockerfile's ENTRYPOINT; that only exists on the locally built image,
+    # not on a raw upstream digest substituted via SCADFORGE_OPENSCAD_IMAGE.
+    entrypoint: ["openscad"]
     # Default command just proves the pinned version is reachable
     # (`docker compose up` → prints "OpenSCAD version 2026.01.19 ...").
     command: ["--version"]
+    environment:
+      # Library search path for `use <...>` / `include <...>` against the
+      # vendored-libraries mount below (BOSL2/MCAD). The #14 scad-core runner
+      # should set this same env var on its own direct `docker run` /
+      # container-exec invocations whenever it bind-mounts a libs directory
+      # at /work/libs, so library lookups behave identically in compose and
+      # in the runner's own subprocess calls.
+      - OPENSCADPATH=/work/libs
     volumes:
       # Project directories (.scad sources, .scadforge/ per-project store):
       # mount the host project root apps/server reads/writes into the same
