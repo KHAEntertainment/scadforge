@@ -81,7 +81,12 @@ interface FenceScan {
 
 function scanFences(text: string, placeholder: string): FenceScan {
   if (!text) return { text: "", removed: 0 };
-  const lines = text.split("\n");
+  // Normalize CRLF and lone-CR line endings FIRST. `.` in FENCE_LINE does not
+  // match `\r`, so a `` ```scad\r `` line would never be recognised as a fence
+  // and the whole block would pass through unstripped — a real bypass of
+  // CLAUDE.md hard rule 5, not a cosmetic bug. Normalizing also covers text
+  // that mixes endings.
+  const lines = text.replace(/\r\n?/g, "\n").split("\n");
   const out: string[] = [];
   let removed = 0;
 
