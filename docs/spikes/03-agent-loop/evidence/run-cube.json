@@ -1,0 +1,150 @@
+{
+  "runId": "2026-08-26T04-37-11-217Z",
+  "mode": "build",
+  "prompt": "a 20mm cube with a 5mm centered hole",
+  "seedFixture": null,
+  "openscad": "OpenSCAD version 2021.01",
+  "maxPasses": 2,
+  "wallMs": 20834,
+  "probeExpected": null,
+  "finalText": "Done. The model is a 20 mm cube centered at the origin with a 5 mm diameter hole passing all the way through the center. The section view confirms the hole is a true through-hole, and the mesh validates as a single watertight, manifold solid (volume 7608 mm³, matching the expected 8000 − π·2.5²·20).\n\n**Parameters exposed:**\n- `cube_size` — outer cube edge length, default 20 mm (range 5–100)\n- `hole_diameter` — centered through-hole diameter, default 5 mm (range 1–50)\n- `hole_axis` — which axis the hole runs along: X, Y, or Z (default Z)\n- `$fn` — render smoothness, default 48",
+  "session": {
+    "id": "617148d6-1637-4b16-b8c7-45ad15038bec",
+    "model": "claude-opus-5[1m]",
+    "apiKeySource": "none",
+    "tools": [
+      "mcp__scadforge__render_views",
+      "mcp__scadforge__validate_mesh",
+      "mcp__scadforge__write_scad"
+    ]
+  },
+  "plan": {
+    "pass": 0,
+    "started": 1787719033103,
+    "ended": 1787719040836,
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    },
+    "tools": [],
+    "images": 0
+  },
+  "passes": [
+    {
+      "pass": 1,
+      "started": 1787719040836,
+      "ended": 1787719053543,
+      "usage": {
+        "input_tokens": 6,
+        "output_tokens": 746,
+        "cache_creation_input_tokens": 3626,
+        "cache_read_input_tokens": 39906
+      },
+      "tools": [
+        "write_scad",
+        "render_views",
+        "validate_mesh"
+      ],
+      "images": 4
+    }
+  ],
+  "toolCalls": [
+    {
+      "pass": 1,
+      "name": "write_scad",
+      "at": 1787719041107,
+      "ok": true,
+      "rationale": "Initial model: centered 20mm cube with a 5mm through-hole, axis selectable."
+    },
+    {
+      "pass": 1,
+      "name": "render_views",
+      "at": 1787719046273,
+      "views": [
+        "iso",
+        "front",
+        "right",
+        "section"
+      ],
+      "images": 4
+    },
+    {
+      "pass": 1,
+      "name": "validate_mesh",
+      "at": 1787719046799,
+      "ok": true,
+      "components": 1
+    }
+  ],
+  "imagesDelivered": 4,
+  "result": {
+    "subtype": "success",
+    "num_turns": 4,
+    "total_cost_usd": 0.07588500000000001,
+    "usage": {
+      "input_tokens": 6,
+      "cache_creation_input_tokens": 3626,
+      "cache_read_input_tokens": 39906,
+      "output_tokens": 746,
+      "output_tokens_details": {
+        "thinking_tokens": 57
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 3626,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "not_available",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 291,
+          "cache_read_input_tokens": 19701,
+          "cache_creation_input_tokens": 2243,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 2243
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard"
+    },
+    "modelUsage": {
+      "claude-haiku-4-5-20251001": {
+        "inputTokens": 907,
+        "outputTokens": 17,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.000992,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "canonicalModel": "claude-haiku-4-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      },
+      "claude-opus-5[1m]": {
+        "inputTokens": 6,
+        "outputTokens": 746,
+        "cacheReadInputTokens": 39906,
+        "cacheCreationInputTokens": 3626,
+        "webSearchRequests": 0,
+        "costUSD": 0.074893,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "canonicalModel": "claude-opus-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "duration_ms": 19138,
+    "duration_api_ms": 14353
+  }
+}

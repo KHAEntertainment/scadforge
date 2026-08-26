@@ -1,0 +1,117 @@
+{
+  "runId": "2026-08-26T04-36-49-982Z",
+  "mode": "probe",
+  "prompt": "Call render_views with views=[\"iso\"] and imgsize=[1024,512], then reply with only the characters you see.",
+  "seedFixture": null,
+  "openscad": "OpenSCAD version 2021.01",
+  "maxPasses": 2,
+  "wallMs": 10275,
+  "probeExpected": "AYRP",
+  "finalText": "AYRP",
+  "session": {
+    "id": "d1b55538-150f-432e-b8e5-373cf9c38e23",
+    "model": "claude-opus-5[1m]",
+    "apiKeySource": "none",
+    "tools": [
+      "mcp__scadforge__render_views",
+      "mcp__scadforge__validate_mesh",
+      "mcp__scadforge__write_scad"
+    ]
+  },
+  "plan": {
+    "pass": 0,
+    "started": 1787719011909,
+    "ended": 1787719021604,
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 105,
+      "cache_creation_input_tokens": 18416,
+      "cache_read_input_tokens": 1229
+    },
+    "tools": [
+      "render_views"
+    ],
+    "images": 1
+  },
+  "passes": [],
+  "toolCalls": [
+    {
+      "pass": 0,
+      "name": "render_views",
+      "at": 1787719018583,
+      "views": [
+        "iso"
+      ],
+      "images": 1
+    }
+  ],
+  "imagesDelivered": 1,
+  "result": {
+    "subtype": "success",
+    "num_turns": 2,
+    "total_cost_usd": 0.1884195,
+    "usage": {
+      "input_tokens": 4,
+      "cache_creation_input_tokens": 18416,
+      "cache_read_input_tokens": 1229,
+      "output_tokens": 105,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 18416,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "not_available",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 6,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 18416,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_1h_input_tokens": 18416
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard"
+    },
+    "modelUsage": {
+      "claude-haiku-4-5-20251001": {
+        "inputTokens": 920,
+        "outputTokens": 16,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "canonicalModel": "claude-haiku-4-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      },
+      "claude-opus-5[1m]": {
+        "inputTokens": 4,
+        "outputTokens": 105,
+        "cacheReadInputTokens": 1229,
+        "cacheCreationInputTokens": 18416,
+        "webSearchRequests": 0,
+        "costUSD": 0.1874195,
+        "contextWindow": 1000000,
+        "maxOutputTokens": 64000,
+        "canonicalModel": "claude-opus-5",
+        "provider": "firstParty",
+        "costBasis": "list"
+      }
+    },
+    "duration_ms": 8320,
+    "duration_api_ms": 5512
+  }
+}
