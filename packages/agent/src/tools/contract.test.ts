@@ -24,13 +24,25 @@ import {
   TOOL_RESULT_IMAGE_MIME_TYPE,
   TOOL_RESULT_RULES,
   TOOL_RESULT_SCHEMAS,
+  exportResultSchema,
+  readProjectResultSchema,
   renderViewsResultSchema,
   toolFailureEnvelopeSchema,
   toolSuccessEnvelopeSchema,
   validateMeshResultSchema,
+  validationGateResultSchema,
+  validationReportSchema,
   writeScadResultSchema
 } from "./contract.js";
-import type { ToolCallResult, ToolContentBlock, ToolName } from "./contract.js";
+import type {
+  ManifoldStatusMirrorCheck,
+  ParamSchemaMirrorCheck,
+  ToolCallResult,
+  ToolContentBlock,
+  ToolName,
+  ValidationGateResultMirrorCheck,
+  ValidationReportMirrorCheck
+} from "./contract.js";
 
 /** True only when A and B are mutually assignable. */
 type MutuallyAssignable<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -353,7 +365,7 @@ describe("tool-result envelope (Spike 3 §7.1)", () => {
     expect(TOOL_RESULT_RULES.filterStderr).toBe(true);
   });
 
-  it("accepts a validate_mesh payload wrapping the frozen report", () => {
+  it("accepts a validate_mesh payload wrapping the frozen report and gate", () => {
     const parsed = validateMeshResultSchema.safeParse({
       ok: true,
       pass: 1,
@@ -367,9 +379,7 @@ describe("tool-result envelope (Spike 3 §7.1)", () => {
         components: 1,
         genus: 0
       },
-      badge: "green",
-      failures: [],
-      warnings: [],
+      gate: { ok: true, badge: "green", failures: [], warnings: [] },
       export_ms: 338,
       validate_ms: 12
     });
@@ -390,13 +400,303 @@ describe("tool-result envelope (Spike 3 §7.1)", () => {
         components: 1
         // genus omitted
       },
-      badge: "green",
-      failures: [],
-      warnings: [],
+      gate: { ok: true, badge: "green", failures: [], warnings: [] },
       export_ms: 338,
       validate_ms: 12
     });
     expect(parsed.success).toBe(false);
+  });
+
+  it("rejects a ManifoldStatus outside manifold-3d's values plus ConstructionFailed", () => {
+    const parsed = validationReportSchema.safeParse({
+      manifold: false,
+      status: "Not manifold", // the thrown message; the contract's name is ConstructionFailed
+      volume_mm3: null,
+      surface_area: null,
+      bbox: null,
+      triangle_count: 10,
+      components: null,
+      genus: null
+    });
+    expect(parsed.success).toBe(false);
+    expect(
+      validationReportSchema.safeParse({
+        manifold: false,
+        status: "ConstructionFailed",
+        volume_mm3: null,
+        surface_area: null,
+        bbox: null,
+        triangle_count: 10,
+        components: null,
+        genus: null
+      }).success
+    ).toBe(true);
+  });
+});
+
+describe("export result payload carries the validation summary (SDP §6.2)", () => {
+  const greenGate = { ok: true, badge: "green", failures: [], warnings: [] };
+
+  it("accepts a successful export with a green gate", () => {
+    const parsed = exportResultSchema.safeParse({
+      ok: true,
+      pass: 1,
+      format: "3mf",
+      file: "my-bracket-0002.3mf",
+      bytes: 24_118,
+      export_ms: 411,
+      validation: greenGate,
+      validation_overridden: false
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts a refusal that names which gate failed and why", () => {
+    // CLAUDE.md hard rule 7: export runs validate_mesh first and refuses on
+    // failure. The agent must be able to read WHICH gate refused it.
+    const parsed = exportResultSchema.safeParse({
+      ok: false,
+      pass: 1,
+      format: "3mf",
+      file: null,
+      bytes: null,
+      export_ms: 402,
+      validation: {
+        ok: false,
+        badge: "red",
+        failures: [{ code: "MULTIPLE_COMPONENTS", message: "mesh has 3 disconnected solid components" }],
+        warnings: []
+      },
+      validation_overridden: false,
+      error_code: "VALIDATION_FAILED",
+      message: "Export refused: the mesh has 3 disconnected solid components."
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.validation?.failures[0].code).toBe("MULTIPLE_COMPONENTS");
+  });
+
+  it("accepts an explicit override: red gate, exported anyway", () => {
+    const parsed = exportResultSchema.safeParse({
+      ok: true,
+      pass: 1,
+      format: "stl",
+      file: "my-bracket-0002.stl",
+      bytes: 10_484,
+      export_ms: 338,
+      validation: {
+        ok: false,
+        badge: "red",
+        failures: [{ code: "MULTIPLE_COMPONENTS", message: "mesh has 2 disconnected solid components" }],
+        warnings: ["multi-part export allowed by explicit override"]
+      },
+      validation_overridden: true
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts validation:null only for the case where the gate could not run", () => {
+    const parsed = exportResultSchema.safeParse({
+      ok: false,
+      pass: 1,
+      format: "off",
+      file: null,
+      bytes: null,
+      export_ms: 87,
+      validation: null,
+      validation_overridden: false,
+      error_code: "EXPORT_FAILED",
+      message: "OpenSCAD produced no mesh, so validation could not run."
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects an export payload with no validation field at all", () => {
+    // COUNTEREXAMPLE: this was the pre-review shape. It cannot express which
+    // gate refused an export, which scad-core's ExportRunResult and protocol's
+    // ExportResponse both can.
+    const parsed = exportResultSchema.safeParse({
+      ok: true,
+      pass: 1,
+      format: "3mf",
+      file: "my-bracket-0002.3mf",
+      bytes: 24_118,
+      export_ms: 411,
+      validation_overridden: false
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects an unknown gate failure code", () => {
+    const parsed = exportResultSchema.safeParse({
+      ok: false,
+      pass: 1,
+      format: "3mf",
+      file: null,
+      bytes: null,
+      export_ms: 402,
+      validation: {
+        ok: false,
+        badge: "red",
+        failures: [{ code: "TOO_UGLY", message: "nope" }],
+        warnings: []
+      },
+      validation_overridden: false
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects an unknown validation badge", () => {
+    const parsed = exportResultSchema.safeParse({
+      ok: true,
+      pass: 1,
+      format: "3mf",
+      file: "x.3mf",
+      bytes: 1,
+      export_ms: 1,
+      validation: { ok: true, badge: "chartreuse", failures: [], warnings: [] },
+      validation_overridden: false
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects an export payload missing validation_overridden", () => {
+    const parsed = exportResultSchema.safeParse({
+      ok: true,
+      pass: 1,
+      format: "3mf",
+      file: "x.3mf",
+      bytes: 1,
+      export_ms: 1,
+      validation: greenGate
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("returns the same gate shape as validate_mesh", () => {
+    const gate = { ok: true, badge: "green", failures: [], warnings: [] };
+    expect(validationGateResultSchema.safeParse(gate).success).toBe(true);
+    const fromExport = exportResultSchema.safeParse({
+      ok: true,
+      pass: 1,
+      format: "3mf",
+      file: "x.3mf",
+      bytes: 1,
+      export_ms: 1,
+      validation: gate,
+      validation_overridden: false
+    });
+    const fromValidateMesh = validateMeshResultSchema.safeParse({
+      ok: true,
+      pass: 1,
+      report: {
+        manifold: true,
+        status: "NoError",
+        volume_mm3: 1,
+        surface_area: 6,
+        bbox: { min: [0, 0, 0], max: [1, 1, 1] },
+        triangle_count: 12,
+        components: 1,
+        genus: 0
+      },
+      gate,
+      export_ms: null,
+      validate_ms: 3
+    });
+    expect([fromExport.success, fromValidateMesh.success]).toEqual([true, true]);
+  });
+});
+
+describe("read_project result payload uses real schemas, not unknown escape hatches", () => {
+  const fullPayload = {
+    ok: true,
+    pass: 0,
+    scad: "wall = 4; // [2:0.5:10] Bracket wall thickness\ncube([20, 20, wall]);\n",
+    params: { wall: 4 },
+    param_schema: {
+      title: "sample",
+      parameters: [
+        {
+          caption: "Bracket wall thickness",
+          group: "Pipe",
+          initial: 4.0,
+          max: 10.0,
+          min: 2.0,
+          name: "wall",
+          step: 0.5,
+          type: "number"
+        }
+      ]
+    },
+    validation: {
+      manifold: true,
+      status: "NoError",
+      volume_mm3: 1600,
+      surface_area: 1120,
+      bbox: { min: [0, 0, 0], max: [20, 20, 4] },
+      triangle_count: 12,
+      components: 1,
+      genus: 0
+    },
+    head_snapshot: "0002"
+  };
+
+  it("accepts Spike 2's param-export entry inside param_schema", () => {
+    expect(readProjectResultSchema.safeParse(fullPayload).success).toBe(true);
+  });
+
+  it("accepts a never-validated project (validation: null)", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      validation: null,
+      head_snapshot: null
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("rejects a parameter with an unknown ParamType", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      param_schema: {
+        title: "sample",
+        parameters: [{ name: "wall", type: "float", initial: 4 }]
+      }
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects a parameter missing its initial value", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      param_schema: { title: "sample", parameters: [{ name: "wall", type: "number" }] }
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects a validation report that is an arbitrary object", () => {
+    // COUNTEREXAMPLE: this was accepted by the pre-review z.record(unknown).
+    const parsed = readProjectResultSchema.safeParse({ ...fullPayload, validation: { anything: "goes" } });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("parses a dropdown parameter's options", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      param_schema: {
+        title: "sample",
+        parameters: [
+          {
+            name: "finish",
+            type: "string",
+            initial: "matte",
+            options: [
+              { name: "matte", value: "matte" },
+              { name: "gloss", value: "gloss" }
+            ]
+          }
+        ]
+      }
+    });
+    expect(parsed.success).toBe(true);
   });
 });
 
@@ -492,5 +792,32 @@ describe("protocol mirror drift guard", () => {
 
   it("keeps the mirrored tool list identical, in order", () => {
     expect([...TOOL_NAMES]).toEqual([...PROTOCOL_TOOL_NAMES]);
+  });
+});
+
+describe("scad-core zod mirror drift guard", () => {
+  it("keeps every zod mirror mutually assignable with its scad-core type", () => {
+    // These assignments do not compile if a field is added, removed, renamed or
+    // retyped on either side — which is what lets the result schemas above use
+    // real shapes instead of z.unknown() escape hatches.
+    const manifoldStatusOk: ManifoldStatusMirrorCheck = true;
+    const validationReportOk: ValidationReportMirrorCheck = true;
+    const validationGateResultOk: ValidationGateResultMirrorCheck = true;
+    const paramSchemaOk: ParamSchemaMirrorCheck = true;
+    expect([manifoldStatusOk, validationReportOk, validationGateResultOk, paramSchemaOk]).toEqual([
+      true,
+      true,
+      true,
+      true
+    ]);
+  });
+
+  it("leaves no z.unknown()/z.any() escape hatch in any result schema", () => {
+    for (const name of TOOL_NAMES) {
+      const derived = JSON.stringify(z.toJSONSchema(TOOL_RESULT_SCHEMAS[name], { io: "input" }));
+      // An unconstrained `unknown`/`any` serialises as an empty subschema `{}`.
+      expect(derived).not.toContain('"additionalProperties":{}');
+      expect(derived).not.toContain('"items":{}');
+    }
   });
 });

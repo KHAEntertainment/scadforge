@@ -27,7 +27,12 @@ import { z } from "zod";
 import { ERROR_CODES, VIEW_NAMES } from "@scadforge/protocol";
 import type { ScadForgeErrorCode, ToolName as ProtocolToolName } from "@scadforge/protocol";
 import { EXPORT_FORMATS, LIBRARY_NAMES } from "@scadforge/scad-core";
-import type { ValidationReport } from "@scadforge/scad-core";
+import type {
+  ManifoldStatus,
+  ParamSchema,
+  ValidationGateResult,
+  ValidationReport
+} from "@scadforge/scad-core";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Tool identity
@@ -116,6 +121,126 @@ export const libraryNameSchema = z.enum(LIBRARY_NAMES);
 
 /** The closed error-code union, derived from `@scadforge/protocol`'s `ERROR_CODES`. */
 export const errorCodeSchema = z.enum(ERROR_CODES);
+
+// ── zod mirrors of scad-core's CAD domain types ──────────────────────────────
+//
+// scad-core owns these as TYPES; tool results need them as runtime SCHEMAS so
+// `packages/mcp-server` can validate a payload it did not construct. Rather
+// than falling back to `z.unknown()`, each schema below is pinned to its
+// scad-core counterpart by a `MutuallyAssignable` guard in section 7 — a field
+// added, removed or retyped on either side fails `tsc`.
+
+/**
+ * manifold-3d's status values plus ScadForge's `ConstructionFailed`.
+ *
+ * scad-core defines `ManifoldStatus` as a bare union type (verbatim from
+ * Spike 4's merged proposal), so there is no runtime array to derive from.
+ * This list is pinned to it by {@link ManifoldStatusMirrorCheck}.
+ */
+export const MANIFOLD_STATUSES = [
+  "NoError",
+  "NonFiniteVertex",
+  "NotManifold",
+  "VertexOutOfBounds",
+  "PropertiesWrongLength",
+  "MissingPositionProperties",
+  "MergeVectorsDifferentLengths",
+  "MergeIndexOutOfBounds",
+  "TransformWrongLength",
+  "RunIndexWrongLength",
+  "FaceIDWrongLength",
+  "InvalidConstruction",
+  "ResultTooLarge",
+  "InvalidTangents",
+  "Cancelled",
+  "ConstructionFailed"
+] as const;
+
+/** Mirrors scad-core's `ManifoldStatus`. */
+export const manifoldStatusSchema = z.enum(MANIFOLD_STATUSES);
+
+/** Mirrors scad-core's `ParamType`. */
+export const paramTypeSchema = z.enum(["number", "boolean", "string", "vector"]);
+
+/** Mirrors scad-core's `ParamOption`. */
+export const paramOptionSchema = z.object({
+  name: z.string(),
+  value: paramValueSchema
+});
+
+/**
+ * Mirrors scad-core's `ParamDefinition` — one entry of OpenSCAD's
+ * `--export-format=param` output. Field names are OpenSCAD's, not camelCased.
+ */
+export const paramDefinitionSchema = z.object({
+  name: z.string(),
+  type: paramTypeSchema,
+  initial: paramValueSchema,
+  caption: z.string().optional(),
+  group: z.string().optional(),
+  min: z.number().optional(),
+  max: z.number().optional(),
+  step: z.number().optional(),
+  maxLength: z.number().optional(),
+  options: z.array(paramOptionSchema).optional()
+});
+
+/** Mirrors scad-core's `ParamSchema` — the full `--export-format=param` document. */
+export const paramSchemaSchema = z.object({
+  title: z.string(),
+  parameters: z.array(paramDefinitionSchema)
+});
+
+/** Mirrors scad-core's `ValidationBadge` (canonically `@scadforge/protocol`'s). */
+export const validationBadgeSchema = z.enum(["green", "amber", "red"]);
+
+/** Mirrors scad-core's `ValidationGateCode`. */
+export const validationGateCodeSchema = z.enum([
+  "NOT_MANIFOLD",
+  "DEGENERATE_VOLUME",
+  "MULTIPLE_COMPONENTS",
+  "MESH_UNREADABLE"
+]);
+
+/** Mirrors scad-core's `ValidationFailure`. */
+export const validationFailureSchema = z.object({
+  code: validationGateCodeSchema,
+  message: z.string()
+});
+
+/**
+ * Mirrors scad-core's `ValidationGateResult` — the pass/fail decision layered
+ * on top of a `ValidationReport`.
+ *
+ * This is the ONE gate shape across all three frozen surfaces: scad-core's
+ * `ValidationResult.gate` and `ExportRunResult.validation`, and — via this
+ * schema — both `validate_mesh`'s `gate` and `export`'s `validation` tool
+ * payloads. `export` must be able to tell the agent WHICH gate refused it, not
+ * just that something did (SDP §6.2: `export` returns a "validation summary").
+ */
+export const validationGateResultSchema = z.object({
+  ok: z.boolean(),
+  badge: validationBadgeSchema,
+  failures: z.array(validationFailureSchema),
+  warnings: z.array(z.string())
+});
+
+/** Mirrors scad-core's `ValidationReport` — Spike 4's merged proposal. */
+export const validationReportSchema = z.object({
+  manifold: z.boolean(),
+  status: manifoldStatusSchema,
+  volume_mm3: z.number().nullable(),
+  surface_area: z.number().nullable(),
+  bbox: z
+    .object({
+      min: z.tuple([z.number(), z.number(), z.number()]),
+      max: z.tuple([z.number(), z.number(), z.number()])
+    })
+    .nullable(),
+  triangle_count: z.number().int().min(0),
+  components: z.number().int().min(0).nullable(),
+  genus: z.number().int().nullable()
+});
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 3. Tool input raw shapes
@@ -385,16 +510,21 @@ export const syntaxCheckSchema = z.object({
   ms: z.number()
 });
 
-/** `read_project` result payload. */
+/**
+ * `read_project` result payload (SDP §6.2: "`model.scad`, `params.json`,
+ * current param schema, last validation").
+ *
+ * `param_schema` and `validation` are the real mirrored schemas, NOT
+ * `z.unknown()` escape hatches — both are pinned to their scad-core
+ * counterparts by the guards in section 7.
+ */
 export const readProjectResultSchema = toolSuccessEnvelopeSchema.extend({
   scad: z.string(),
   params: paramValuesSchema,
-  param_schema: z.object({
-    title: z.string(),
-    parameters: z.array(z.record(z.string(), z.unknown()))
-  }),
+  /** The Customizer parameter schema from `--export-format=param`. */
+  param_schema: paramSchemaSchema,
   /** The most recent `ValidationReport`, or null if the model has never been validated. */
-  validation: z.record(z.string(), z.unknown()).nullable(),
+  validation: validationReportSchema.nullable(),
   head_snapshot: z.string().nullable()
 });
 
@@ -445,39 +575,40 @@ export const renderViewsResultSchema = z.object({
   message: z.string().optional()
 });
 
-/** The `ValidationReport` fields, as zod. Mirrors scad-core's `ValidationReport`. */
-export const validationReportSchema = z.object({
-  manifold: z.boolean(),
-  status: z.string(),
-  volume_mm3: z.number().nullable(),
-  surface_area: z.number().nullable(),
-  bbox: z
-    .object({
-      min: z.tuple([z.number(), z.number(), z.number()]),
-      max: z.tuple([z.number(), z.number(), z.number()])
-    })
-    .nullable(),
-  triangle_count: z.number().int().min(0),
-  components: z.number().int().min(0).nullable(),
-  genus: z.number().int().nullable()
-});
-
 /**
- * `validate_mesh` result payload: the frozen report, plus the gate decision and
- * any non-blocking warnings.
+ * `validate_mesh` result payload: the frozen report plus the gate decision.
+ *
+ * Shape matches scad-core's `ValidationResult` (`{report, gate, export_ms,
+ * validate_ms}`) with the tool envelope's `ok`/`pass` on top. `gate` is the
+ * SAME {@link validationGateResultSchema} that `export` returns as
+ * `validation`, so the agent reads one gate shape from both tools.
  */
 export const validateMeshResultSchema = z.object({
   ok: z.boolean(),
   pass: z.number().int().min(0),
   report: validationReportSchema,
-  badge: z.enum(["green", "amber", "red"]),
-  failures: z.array(z.object({ code: z.string(), message: z.string() })),
-  warnings: z.array(z.string()),
+  gate: validationGateResultSchema,
   export_ms: z.number().nullable(),
   validate_ms: z.number()
 });
 
-/** `export` result payload. */
+/**
+ * `export` result payload.
+ *
+ * SDP §6.2 promises `export` returns "file path, size, **validation summary**",
+ * and both other frozen surfaces model that summary for the same operation —
+ * scad-core's `ExportRunResult.validation` and protocol's
+ * `ExportResponse.validation`. `validation` here carries the full
+ * {@link validationGateResultSchema}, so a refused export tells the agent WHICH
+ * gate failed and with what warnings, not merely that something did.
+ *
+ * `validation` is `null` only when the gate could not run at all (e.g. the mesh
+ * export itself failed, so there was nothing to validate). A refusal always
+ * carries a populated gate plus `error_code: "VALIDATION_FAILED"`.
+ * `validation_overridden` stays a separate boolean: it records that a red gate
+ * was deliberately bypassed (CLAUDE.md hard rule 7), which the gate result
+ * itself cannot express.
+ */
 export const exportResultSchema = z.object({
   ok: z.boolean(),
   pass: z.number().int().min(0),
@@ -486,6 +617,8 @@ export const exportResultSchema = z.object({
   file: z.string().nullable(),
   bytes: z.number().int().min(0).nullable(),
   export_ms: z.number(),
+  /** The gate decision that allowed or refused this export; null if it could not run. */
+  validation: validationGateResultSchema.nullable(),
   validation_overridden: z.boolean(),
   error_code: errorCodeSchema.optional(),
   message: z.string().optional()
@@ -549,12 +682,38 @@ export const PASS_BUDGET_ENFORCEMENT = "write_scad_handler" as const;
 // 7. Compile-time guards
 // ═════════════════════════════════════════════════════════════════════════════
 
+/** True only when `A` and `B` are mutually assignable. */
+type MutuallyAssignable<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
 /** Fails compilation if this file's `ToolName` and protocol's mirror diverge. */
-export type ToolNameMirrorCheck = [ToolName] extends [ProtocolToolName]
-  ? [ProtocolToolName] extends [ToolName]
-    ? true
-    : false
-  : false;
+export type ToolNameMirrorCheck = MutuallyAssignable<ToolName, ProtocolToolName>;
+
+/**
+ * Fail compilation if a zod mirror drifts from the scad-core type it mirrors —
+ * a field added, removed, renamed or retyped on either side flips these to
+ * `false`, and `contract.test.ts` assigns `true` to each. This is what lets the
+ * result schemas above use real shapes instead of `z.unknown()` escape hatches
+ * without protocol/scad-core and this file silently diverging.
+ */
+export type ManifoldStatusMirrorCheck = MutuallyAssignable<
+  z.infer<typeof manifoldStatusSchema>,
+  ManifoldStatus
+>;
+
+/** @see ManifoldStatusMirrorCheck */
+export type ValidationReportMirrorCheck = MutuallyAssignable<
+  z.infer<typeof validationReportSchema>,
+  ValidationReport
+>;
+
+/** @see ManifoldStatusMirrorCheck */
+export type ValidationGateResultMirrorCheck = MutuallyAssignable<
+  z.infer<typeof validationGateResultSchema>,
+  ValidationGateResult
+>;
+
+/** @see ManifoldStatusMirrorCheck */
+export type ParamSchemaMirrorCheck = MutuallyAssignable<z.infer<typeof paramSchemaSchema>, ParamSchema>;
 
 /**
  * Re-exported so `validate_mesh` handlers and MCP consumers get the frozen
