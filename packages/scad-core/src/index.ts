@@ -13,6 +13,10 @@ export const SCAD_CORE_PACKAGE_NAME = "@scadforge/scad-core";
 export * from "./types.js";
 export * from "./errors.js";
 
+// params/
+export { DEFAULT_PARAM_GROUP, parseParamSchema } from "./params/index.js";
+export type { ParseParamSchemaOptions } from "./params/index.js";
+
 // runner/
 export {
   filterOpenscadDiagnostics,
