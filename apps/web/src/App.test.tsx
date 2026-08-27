@@ -3,10 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App.js";
 
 function jsonResponse(body: unknown, ok = true) {
+  const raw = JSON.stringify(body);
   return Promise.resolve({
     ok,
     status: ok ? 200 : 500,
-    json: () => Promise.resolve(body)
+    json: () => Promise.resolve(body),
+    text: () => Promise.resolve(raw)
   } as Response);
 }
 

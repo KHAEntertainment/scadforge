@@ -71,19 +71,45 @@ export function createApiClient(options: ApiClientOptions = {}) {
   ): Promise<T> {
     const suffix = path.startsWith("/") ? path : `/${path}`;
     const url = join(baseUrl, `${API_BASE_PATH}${suffix}`);
-    const res = await fetchImpl(url, {
-      ...init,
-      headers: {
-        ...(init.body ? { "content-type": "application/json" } : {}),
-        ...init.headers
-      }
-    });
-    let body: unknown;
+
+    // The server being unreachable (wrong port, not started, proxy target
+    // down) makes `fetch` itself reject — surface that as a typed,
+    // readable error instead of letting the rejection propagate as a raw
+    // `TypeError` that downstream callers aren't expecting (Issue #36 AC).
+    let res: Response;
     try {
-      body = await res.json();
-    } catch {
-      body = null;
+      res = await fetchImpl(url, {
+        ...init,
+        headers: {
+          ...(init.body ? { "content-type": "application/json" } : {}),
+          ...init.headers
+        }
+      });
+    } catch (cause) {
+      throw new ApiClientError({
+        error_code: "INTERNAL_ERROR",
+        message: `Could not reach the ScadForge API at ${url}. Is the server running? (${
+          cause instanceof Error ? cause.message : String(cause)
+        })`
+      });
     }
+
+    // Read the raw text first: a 200 with a non-JSON body (e.g. Vite's
+    // `index.html` fallback when the dev proxy isn't forwarding `/api`) must
+    // never be treated as a successful, empty response — that previously
+    // surfaced as a silent `null` that crashed callers on destructuring
+    // (Issue #36).
+    const rawBody = await res.text();
+    let body: unknown = null;
+    let parseFailed = false;
+    if (rawBody.length > 0) {
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        parseFailed = true;
+      }
+    }
+
     if (!res.ok) {
       const err = body as Partial<ApiError> | null;
       throw new ApiClientError({
@@ -91,6 +117,14 @@ export function createApiClient(options: ApiClientOptions = {}) {
         message: err?.message ?? `Request failed with status ${res.status}`
       });
     }
+
+    if (parseFailed) {
+      throw new ApiClientError({
+        error_code: "INTERNAL_ERROR",
+        message: `Received a non-JSON response (status ${res.status}) from ${url}. This usually means the dev proxy isn't forwarding /api to the API server, or the wrong baseUrl is configured.`
+      });
+    }
+
     return body as T;
   }
 
