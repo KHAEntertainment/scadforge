@@ -30,11 +30,14 @@ export default tseslint.config(
     }
   },
   {
-    // Node-context files: root/package tooling configs and CLI scripts.
+    // Node-context files: root/package tooling configs, CLI scripts, the
+    // scad-core/libs runtimes (child processes, fs, path) and the eval
+    // harnesses under evals/, which drive a real server from a Node process.
     files: [
       "*.config.{js,ts,mjs,cjs}",
       "**/vite.config.ts",
       "scripts/**/*.mjs",
+      "evals/**/*.mjs",
       "apps/server/**/*.{ts,mjs}"
     ],
     languageOptions: {

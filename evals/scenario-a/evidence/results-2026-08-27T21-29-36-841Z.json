@@ -1,0 +1,124 @@
+{
+  "prompt": "A wall-mount bracket for a 32 mm pipe with two M4 screw slots",
+  "started": "2026-08-27T21:26:25.039Z",
+  "duration_ms": 191811,
+  "node": "v26.7.0",
+  "platform": "darwin/arm64",
+  "timings_ms": {
+    "compose up (pinned OpenSCAD)": 1487,
+    "start server": 237,
+    "create project": 9,
+    "agent turn (LIVE)": 188627,
+    "AC1 — model.scad + Customizer schema": 479,
+    "AC2 — 4 view PNGs": 5,
+    "AC3 — validation": 0,
+    "AC4 — snapshot history + diff": 2,
+    "AC5 — 3MF export": 644
+  },
+  "assertions": [
+    {
+      "id": "AC1a",
+      "description": "model.scad written with real geometry",
+      "ok": true,
+      "detail": "3773 bytes"
+    },
+    {
+      "id": "AC1b",
+      "description": "Customizer schema exposes pipe diameter, wall, slot and screw-size parameters",
+      "ok": true,
+      "detail": "18 parameters"
+    },
+    {
+      "id": "AC2",
+      "description": "all 4 view PNGs exist and are served",
+      "ok": true,
+      "detail": "snapshot 0002"
+    },
+    {
+      "id": "AC3",
+      "description": "ValidationReport.manifold === true && components === 1",
+      "ok": true,
+      "detail": "badge=amber manifold=true components=1 volume=26322.9497mm³"
+    },
+    {
+      "id": "AC4",
+      "description": "snapshot 0001+ recorded, with a unified diff against its parent",
+      "ok": true,
+      "detail": "2 snapshots; 0002 carries a 133-line diff"
+    },
+    {
+      "id": "AC5",
+      "description": "3MF exported through the validation gate and non-empty",
+      "ok": true,
+      "detail": "scenario-a-bracket-0002.3mf: 15394 bytes served"
+    }
+  ],
+  "summary": "6/6 assertions passed",
+  "turn": {
+    "project_id": "scenario-a-bracket",
+    "event_types": [
+      "turn_started",
+      "assistant_text",
+      "tool_call",
+      "tool_result",
+      "assistant_text",
+      "tool_call",
+      "snapshot_created",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "tool_result",
+      "assistant_text",
+      "turn_done"
+    ],
+    "turn_done": {
+      "type": "turn_done",
+      "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+      "status": "completed",
+      "passes_used": 1,
+      "summary": "Bracket is manifold, single component, genus 2 (the two through-slots — intentional). Renders confirm the cradle is fused to the plate and wraps past the pipe centreline.\n\n**What I built** — a wall-mount saddle bracket: a rounded back plate with a 190°-wrap semicircular cradle projecting from its front face, so the pipe drops in from the front and is caught by two small retaining lips.\n\n**Key dimensions**\n- Back plate 44 × 84 × 6 mm, 6 mm corner radius\n- Cradle bore Ø32.8 mm (32 mm pipe + 0.4 mm radial clearance), 4 mm wall, 26 mm wide\n- Pipe axis 23.4 mm off the wall; overall depth 25.2 mm; bounding box 44 × 25.2 × 84 mm\n- Two M4 slots, 4.4 mm wide with 8 mm of sliding travel, 64 mm apart vertically, each with an Ø8 × 2.2 mm counterbore in the front face for the screw head\n- Volume ≈ 26.3 cm³\n\n**Parameters exposed** — Pipe: `pipe_dia`, `pipe_clearance`, `pipe_standoff`, `wrap_angle`, `saddle_wall`, `saddle_width`. Back plate: `plate_w`, `plate_h`, `plate_t`, `plate_r`. Screw slots: `screw_dia`, `slot_clearance`, `slot_travel`, `slot_spacing`, `head_recess`, `head_dia`, `recess_depth`.\n\nPrint it back-face-down on the bed: the cradle then opens straight up, the lips are only ~5° past vertical, and the slots print as clean vertical holes. Say the word if you'd like an STL/3MF export or a two-piece version with a bolt-on strap for a full 360° clamp.",
+      "usage": {
+        "per_pass": [
+          {
+            "pass": 0,
+            "duration_ms": 162871,
+            "tool_calls": 1,
+            "images": 0,
+            "input_tokens": 2,
+            "output_tokens": 9556,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 20798
+          },
+          {
+            "pass": 1,
+            "duration_ms": 23382,
+            "tool_calls": 3,
+            "images": 4,
+            "input_tokens": 8,
+            "output_tokens": 3092,
+            "cache_read_input_tokens": 103414,
+            "cache_creation_input_tokens": 38937
+          }
+        ],
+        "by_model": {
+          "claude-haiku-4-5-20251001": {
+            "input_tokens": 915,
+            "output_tokens": 18,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0
+          },
+          "claude-opus-5[1m]": {
+            "input_tokens": 10,
+            "output_tokens": 12648,
+            "cache_read_input_tokens": 103414,
+            "cache_creation_input_tokens": 59735
+          }
+        },
+        "cost_usd": 0.9663120000000001
+      },
+      "duration_ms": 188614
+    }
+  },
+  "error": null
+}

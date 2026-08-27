@@ -13,6 +13,8 @@ import type {
   ExportResponse,
   ListProjectsResponse,
   ParamValues,
+  ParamsResponse,
+  ParamsUpdateRequest,
   ProjectManifest,
   ProjectResponse,
   RenderViewsRequest,
@@ -157,6 +159,25 @@ export function createFakeScadCoreApi(): ScadCoreApi & { _projects: Map<string, 
       if (!render) return null;
       const data = new TextEncoder().encode(`fake-png:${projectId}:${snapshotId}:${view}`);
       return { data, contentType: "image/png", bytes: data.byteLength };
+    },
+
+    async getParams(projectId: string): Promise<ParamsResponse> {
+      const project = requireProject(projectId);
+      return {
+        title: project.manifest.name,
+        parameters: [{ name: "pipe_d", type: "number", initial: 32, min: 1, max: 200 }],
+        values: project.params
+      };
+    },
+
+    async updateParams(projectId: string, request: ParamsUpdateRequest): Promise<ParamsResponse> {
+      const project = requireProject(projectId);
+      project.params = { ...project.params, ...request.values };
+      return {
+        title: project.manifest.name,
+        parameters: [{ name: "pipe_d", type: "number", initial: 32, min: 1, max: 200 }],
+        values: project.params
+      };
     },
 
     async renderViews(projectId: string, request: RenderViewsRequest): Promise<RenderViewsResponse> {

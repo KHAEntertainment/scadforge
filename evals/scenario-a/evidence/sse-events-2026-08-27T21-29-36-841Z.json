@@ -1,0 +1,207 @@
+[
+  {
+    "type": "turn_started",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "project_id": "scenario-a-bracket",
+    "max_passes": 2,
+    "started_at": "2026-08-27T21:26:26.777Z"
+  },
+  {
+    "type": "assistant_text",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "text": "I'll start by checking the current project state."
+  },
+  {
+    "type": "tool_call",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_01VUK9GxNi3zCSXk28b9Uwn2",
+    "name": "read_project",
+    "pass": 0,
+    "input_summary": null
+  },
+  {
+    "type": "tool_result",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_01VUK9GxNi3zCSXk28b9Uwn2",
+    "name": "read_project",
+    "pass": 0,
+    "ok": true,
+    "error_code": null,
+    "summary": "0 parameters, head 0001",
+    "artifacts": [],
+    "duration_ms": 647
+  },
+  {
+    "type": "assistant_text",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "text": "Empty project — I'll write the full bracket in one pass."
+  },
+  {
+    "type": "tool_call",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_011rsxw6fyKS7UYp944asfJE",
+    "name": "write_scad",
+    "pass": 1,
+    "input_summary": "Wall-mount saddle bracket for 32 mm pipe with two slotted M4 fixings"
+  },
+  {
+    "type": "snapshot_created",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "project_id": "scenario-a-bracket",
+    "snapshot": {
+      "id": "0002",
+      "parent": "0001",
+      "timestamp": "2026-08-27T21:29:09.666Z",
+      "message": "Wall-mount saddle bracket for 32 mm pipe with two slotted M4 fixings",
+      "origin": "agent",
+      "pass": 1,
+      "files": {
+        "model_scad": "model.scad",
+        "params_json": "params.json",
+        "message_md": "message.md",
+        "validation_json": null,
+        "diff_patch": "diff.patch"
+      },
+      "params": {},
+      "renders": [],
+      "validation": null,
+      "annotations": []
+    }
+  },
+  {
+    "type": "tool_result",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_011rsxw6fyKS7UYp944asfJE",
+    "name": "write_scad",
+    "pass": 1,
+    "ok": true,
+    "error_code": null,
+    "summary": "Wall-mount saddle bracket for 32 mm pipe with two slotted M4 fixings",
+    "artifacts": [
+      {
+        "kind": "snapshot",
+        "view": null,
+        "url": "/api/projects/scenario-a-bracket/snapshots/0002",
+        "bytes": null
+      }
+    ],
+    "duration_ms": 560
+  },
+  {
+    "type": "tool_call",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_01VULAh3xvpjiDxNGGhwisBm",
+    "name": "render_views",
+    "pass": 1,
+    "input_summary": "default views"
+  },
+  {
+    "type": "tool_result",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_01VULAh3xvpjiDxNGGhwisBm",
+    "name": "render_views",
+    "pass": 1,
+    "ok": true,
+    "error_code": null,
+    "summary": "4 of 4 views rendered",
+    "artifacts": [
+      {
+        "kind": "render",
+        "view": "iso",
+        "url": "/api/projects/scenario-a-bracket/snapshots/0002/views/iso",
+        "bytes": 14037
+      },
+      {
+        "kind": "render",
+        "view": "front",
+        "url": "/api/projects/scenario-a-bracket/snapshots/0002/views/front",
+        "bytes": 5809
+      },
+      {
+        "kind": "render",
+        "view": "right",
+        "url": "/api/projects/scenario-a-bracket/snapshots/0002/views/right",
+        "bytes": 6859
+      },
+      {
+        "kind": "render",
+        "view": "section",
+        "url": "/api/projects/scenario-a-bracket/snapshots/0002/views/section",
+        "bytes": 5847
+      }
+    ],
+    "duration_ms": 1966
+  },
+  {
+    "type": "tool_call",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_01WdHupnMqUeet8eBrNe8ayn",
+    "name": "validate_mesh",
+    "pass": 1,
+    "input_summary": null
+  },
+  {
+    "type": "tool_result",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "tool_call_id": "toolu_01WdHupnMqUeet8eBrNe8ayn",
+    "name": "validate_mesh",
+    "pass": 1,
+    "ok": true,
+    "error_code": null,
+    "summary": "amber: manifold=true components=1",
+    "artifacts": [],
+    "duration_ms": 453
+  },
+  {
+    "type": "assistant_text",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "text": "Bracket is manifold, single component, genus 2 (the two through-slots — intentional). Renders confirm the cradle is fused to the plate and wraps past the pipe centreline.\n\n**What I built** — a wall-mount saddle bracket: a rounded back plate with a 190°-wrap semicircular cradle projecting from its front face, so the pipe drops in from the front and is caught by two small retaining lips.\n\n**Key dimensions**\n- Back plate 44 × 84 × 6 mm, 6 mm corner radius\n- Cradle bore Ø32.8 mm (32 mm pipe + 0.4 mm radial clearance), 4 mm wall, 26 mm wide\n- Pipe axis 23.4 mm off the wall; overall depth 25.2 mm; bounding box 44 × 25.2 × 84 mm\n- Two M4 slots, 4.4 mm wide with 8 mm of sliding travel, 64 mm apart vertically, each with an Ø8 × 2.2 mm counterbore in the front face for the screw head\n- Volume ≈ 26.3 cm³\n\n**Parameters exposed** — Pipe: `pipe_dia`, `pipe_clearance`, `pipe_standoff`, `wrap_angle`, `saddle_wall`, `saddle_width`. Back plate: `plate_w`, `plate_h`, `plate_t`, `plate_r`. Screw slots: `screw_dia`, `slot_clearance`, `slot_travel`, `slot_spacing`, `head_recess`, `head_dia`, `recess_depth`.\n\nPrint it back-face-down on the bed: the cradle then opens straight up, the lips are only ~5° past vertical, and the slots print as clean vertical holes. Say the word if you'd like an STL/3MF export or a two-piece version with a bolt-on strap for a full 360° clamp."
+  },
+  {
+    "type": "turn_done",
+    "turn_id": "21b3d118-07d0-417e-99d6-a7d3c24696d9",
+    "status": "completed",
+    "passes_used": 1,
+    "summary": "Bracket is manifold, single component, genus 2 (the two through-slots — intentional). Renders confirm the cradle is fused to the plate and wraps past the pipe centreline.\n\n**What I built** — a wall-mount saddle bracket: a rounded back plate with a 190°-wrap semicircular cradle projecting from its front face, so the pipe drops in from the front and is caught by two small retaining lips.\n\n**Key dimensions**\n- Back plate 44 × 84 × 6 mm, 6 mm corner radius\n- Cradle bore Ø32.8 mm (32 mm pipe + 0.4 mm radial clearance), 4 mm wall, 26 mm wide\n- Pipe axis 23.4 mm off the wall; overall depth 25.2 mm; bounding box 44 × 25.2 × 84 mm\n- Two M4 slots, 4.4 mm wide with 8 mm of sliding travel, 64 mm apart vertically, each with an Ø8 × 2.2 mm counterbore in the front face for the screw head\n- Volume ≈ 26.3 cm³\n\n**Parameters exposed** — Pipe: `pipe_dia`, `pipe_clearance`, `pipe_standoff`, `wrap_angle`, `saddle_wall`, `saddle_width`. Back plate: `plate_w`, `plate_h`, `plate_t`, `plate_r`. Screw slots: `screw_dia`, `slot_clearance`, `slot_travel`, `slot_spacing`, `head_recess`, `head_dia`, `recess_depth`.\n\nPrint it back-face-down on the bed: the cradle then opens straight up, the lips are only ~5° past vertical, and the slots print as clean vertical holes. Say the word if you'd like an STL/3MF export or a two-piece version with a bolt-on strap for a full 360° clamp.",
+    "usage": {
+      "per_pass": [
+        {
+          "pass": 0,
+          "duration_ms": 162871,
+          "tool_calls": 1,
+          "images": 0,
+          "input_tokens": 2,
+          "output_tokens": 9556,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 20798
+        },
+        {
+          "pass": 1,
+          "duration_ms": 23382,
+          "tool_calls": 3,
+          "images": 4,
+          "input_tokens": 8,
+          "output_tokens": 3092,
+          "cache_read_input_tokens": 103414,
+          "cache_creation_input_tokens": 38937
+        }
+      ],
+      "by_model": {
+        "claude-haiku-4-5-20251001": {
+          "input_tokens": 915,
+          "output_tokens": 18,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 0
+        },
+        "claude-opus-5[1m]": {
+          "input_tokens": 10,
+          "output_tokens": 12648,
+          "cache_read_input_tokens": 103414,
+          "cache_creation_input_tokens": 59735
+        }
+      },
+      "cost_usd": 0.9663120000000001
+    },
+    "duration_ms": 188614
+  }
+]

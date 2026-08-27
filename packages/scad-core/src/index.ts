@@ -30,6 +30,8 @@ export { runParamExport } from "./runner/param-export.js";
 export { exportMeshWithValidationStl } from "./runner/mesh-export.js";
 export type { MeshExportResult } from "./runner/mesh-export.js";
 export { exportRun } from "./runner/export.js";
+export { validateModel } from "./runner/validate-model.js";
+export type { ValidateModelOptions } from "./runner/validate-model.js";
 
 // validate/
 export { parseStl } from "./validate/stl.js";
@@ -40,10 +42,23 @@ export { gateValidation } from "./validate/gate.js";
 export { validateMesh } from "./validate/validate.js";
 
 // store/
+//
+// The path helpers are exported (Issue #20 glue) because `apps/server` has to
+// serve files straight out of the store — a snapshot's PNG, an export
+// artifact, the root `model.scad` — and hand absolute paths to the OpenSCAD
+// runner. Without them every consumer would re-derive `PROJECT_LAYOUT` joins
+// by hand, which is how an on-disk layout quietly forks.
 export {
+  exportsDir,
   formatSnapshotId,
+  historyDir,
+  metaDir,
   nextSnapshotId,
-  parseSnapshotId
+  parseSnapshotId,
+  projectFilePath,
+  rootModelPath,
+  rootParamsPath,
+  snapshotDir
 } from "./store/paths.js";
 export {
   createSnapshot,
@@ -55,3 +70,11 @@ export {
   revertToSnapshot
 } from "./store/store.js";
 export type { CreateSnapshotInput, InitProjectInput } from "./store/store.js";
+export {
+  attachRendersToSnapshot,
+  attachValidationToSnapshot,
+  snapshotRenderPath,
+  snapshotValidationPath,
+  snapshotViewsDir
+} from "./store/attachments.js";
+export type { AttachRendersOptions, RenderAttachment } from "./store/attachments.js";

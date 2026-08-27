@@ -14,6 +14,7 @@ import { createProjectsRoute } from "./routes/projects.js";
 import { createChatRoute } from "./routes/chat.js";
 import { createSnapshotsRoute } from "./routes/snapshots.js";
 import { createRendersRoute } from "./routes/renders.js";
+import { createParamsRoute } from "./routes/params.js";
 import { createExportRoute } from "./routes/export.js";
 import { bodySizeLimit } from "./middleware/body-limit.js";
 import { errorBody } from "./services/errors.js";
@@ -50,6 +51,7 @@ export function createApp(deps: AppDeps) {
   );
   app.route(API_BASE_PATH, createSnapshotsRoute(deps.scadCore));
   app.route(API_BASE_PATH, createRendersRoute(deps.scadCore));
+  app.route(API_BASE_PATH, createParamsRoute(deps.scadCore));
   app.route(API_BASE_PATH, createExportRoute(deps.scadCore));
 
   app.notFound((c) => c.json(errorBody("NOT_FOUND", "Route not found."), 404));

@@ -23,6 +23,8 @@ import type {
   ExportRequest,
   ExportResponse,
   ListProjectsResponse,
+  ParamsResponse,
+  ParamsUpdateRequest,
   ProjectResponse,
   RenderViewsRequest,
   RenderViewsResponse,
@@ -57,6 +59,19 @@ export interface ScadCoreApi {
   revertSnapshot(projectId: string, snapshotId: string, request: RevertRequest): Promise<SnapshotResponse>;
   /** Returns `null` when the project, snapshot, or view file does not exist. */
   getSnapshotRenderFile(projectId: string, snapshotId: string, view: string): Promise<RenderFile | null>;
+
+  // ── params ───────────────────────────────────────────────────────────────
+  //
+  // Added at integration (Issue #20): `API_ROUTES.params` is part of the frozen
+  // contract and `apps/web`'s Params tab calls it, but no route file existed
+  // for it until `routes/params.ts`. The Customizer schema comes from the
+  // pinned CLI's `--export-format=param`, so this is a render-path call, not a
+  // file read.
+
+  /** Throws `PROJECT_NOT_FOUND`. */
+  getParams(projectId: string): Promise<ParamsResponse>;
+  /** Throws `PROJECT_NOT_FOUND`; unknown parameter names are ignored, not fatal. */
+  updateParams(projectId: string, request: ParamsUpdateRequest): Promise<ParamsResponse>;
 
   // ── renders ──────────────────────────────────────────────────────────────
   /**
