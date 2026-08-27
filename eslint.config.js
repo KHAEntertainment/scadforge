@@ -11,7 +11,11 @@ export default tseslint.config(
       "**/node_modules/**",
       "**/.turbo/**",
       "spikes/**",
-      "**/*.tsbuildinfo"
+      "**/*.tsbuildinfo",
+      // Vendored openscad-wasm Emscripten glue (Issue #31 GPL zone) — a
+      // pre-built, unauthored artifact served verbatim from apps/web/public/,
+      // not product source to lint. See apps/web/public/wasm/PROVENANCE.md.
+      "apps/web/public/wasm/**"
     ]
   },
   js.configs.recommended,
