@@ -60,10 +60,27 @@
 - [x] Spike 3 Agent SDK loop (Issue #5, PR #12, GO-WITH-CAVEATS)
 - [x] Spike 4 manifold-3d validation (Issue #6, PR #7, GO)
 
+### M1 Core Loop (milestone closed 2026-08-27, 8/8 issues)
+- [x] Interface contracts FROZEN — protocol, scad-core types, 7 tool schemas (#13, PR #21)
+- [x] scad-core runtime — CLI runner, project store, validation, export (#14, PR #27)
+- [x] Pinned OpenSCAD docker image + compose + CI smoke render (#15, PR #22)
+- [x] Agent runtime — ModelProvider seam, prompts, tool handlers, 2-pass loop (#16, PR #26)
+- [x] Server — Hono routes, SSE, DI seams (#17, PR #25)
+- [x] Web shell — chat, three.js viewer, snapshots, export (#18, PR #23)
+- [x] libs — vendored BOSL2/MCAD + 1175-symbol lookup index (#19, PR #24)
+- [x] Integration + **Scenario A end-to-end 6/6** (#20, PR #29)
+
+## M1 empirical findings (binding on later work)
+- **OpenSCAD CLI**: base image has NO ENTRYPOINT — always name `openscad` explicitly. `--export-format` applies to EVERY `-o` target in one invocation (a naive `-o out.3mf -o out.stl --export-format=binstl` writes STL bytes into the .3mf) — use two invocations for non-STL formats. Bare `--render` is swallowed by boost::program_options when last before the positional path — always `--render=true`. Library mount convention: libs at `/work/libs` + `OPENSCADPATH=/work/libs`.
+- **Snapshot store concurrency**: ids are claimed by atomic non-recursive `mkdir` + EEXIST retry, which is safe ACROSS PROCESSES (required for M4, where GUI server and MCP server share one `.scadforge/` tree). Typed `CONFLICT` (→409) on exhaustion; never a silent overwrite. Open edge case: #28 (SIGKILL between claim and cleanup orphans a claim dir).
+- **Path→URL seam**: `artifactUrl`/`exportFileName`/`readImageBase64` are implemented host-side in `apps/server`; `packages/agent` stays HTTP-free (required for the M4 stdio MCP host) and GPL-free (the GPL `packages/libs` binding lives in the server).
+- **Model cost**: `SCADFORGE_MODEL` unset → SDK defaults to Opus; a single-pass Scenario A turn cost **$0.97** vs Spike 3's $0.08–0.14 on a cheaper model. Set the default explicitly before the M3 eval harness runs 10–20 prompts per change.
+- **Contract friction logged (no frozen edits)**: (1) `ChatTurnRequest.images` has no path into the agent — text-only in M1, needed for v2 photo input; (2) `ToolResultEvent` is summary-only so SSE consumers can't read a `ValidationReport` from the stream (harness reads the persisted manifest); (3) `writeScadResultSchema` can't express a failed syntax check (superset workaround parses); (4) no error code distinguishes green-validation early-stop from genuine `PASS_BUDGET_EXHAUSTED`.
+
 ## Current Status
-- **Last updated**: 2026-08-26
-- **M0 complete.** All spikes GO; Architecture Decision Checkpoint recorded above.
-- **Current iteration goal**: M1 Core Loop — contract freeze first, then 6-worker parallel wave, closing with Scenario A end-to-end
+- **Last updated**: 2026-08-27
+- **M0 and M1 complete.** Scenario A proven end-to-end: NL prompt → parametric .scad (18 Customizer params) → 4 server renders → manifold single-component mesh → snapshot with diff → 3MF export. Workspace suite: 491 tests.
+- **Next iteration**: M2 Parametric + Live (WASM preview, Customizer sliders, params plumbing, History diff/revert) — DAG pending user confirmation
 - **Execution plan**: `~/.claude/plans/greenfield-project-ai-scad-is-delegated-coral.md` (approved 2026-08-25)
-- **Known tech debt**: #10 license-gate hardening (peerDependencies + real pnpm-list CI path); BOSL2 56-file fetch packaging (M2); prod validate_mesh needs clean malformed-input errors (QA finding, fold into scad-core issue)
+- **Known tech debt**: #10 license-gate hardening (peerDeps, real pnpm-list CI path, apps/* scope); #28 orphaned snapshot claim dir; BOSL2 56-file fetch packaging (M2); explicit model default (see cost finding above)
 - **Open PRs**: none
