@@ -26,8 +26,25 @@ export interface AnnotationResult {
   options?: ParamOption[];
 }
 
-const RANGE_STEP_RE = /^(-?(?:\d+\.?\d*|\.\d+))\s*:\s*(-?(?:\d+\.?\d*|\.\d+))\s*:\s*(-?(?:\d+\.?\d*|\.\d+))$/;
-const RANGE_RE = /^(-?(?:\d+\.?\d*|\.\d+))\s*:\s*(-?(?:\d+\.?\d*|\.\d+))$/;
+// NUMBER_PART: intentionally NOT `\d+\.?\d*` (nor `\d+\.\d*|\d+`). That shape
+// lets the engine split a long run of digits between the `\d+` and the
+// trailing `\d*` at every possible boundary, and — because there is no
+// literal character forcing a decision between them — backtracking across
+// those boundaries is O(n) PER outer number, compounding across the 2-3
+// number slots in one bracket into O(n^2) (confirmed empirically: a 32k-digit
+// run inside a trailing-comment bracket took ~3.6s to fail-and-fall-through
+// to the options-list path; profile is quadratic, ~15-30 min projected at
+// 500k digits — see `annotation.perf.test.ts`). Anchoring the fractional part
+// behind a REQUIRED literal `.` removes the ambiguity: for a pure digit run,
+// `\d+` greedily consumes it in one pass and `(?:\.\d+)?` is a single O(1)
+// check (next char is a literal `.` or it isn't), so any backtracking here is
+// linear in the digit run's length, not quadratic. (This does mean a bare
+// trailing-dot literal like `10.` — no digits after the dot — is no longer
+// recognized as numeric; that form doesn't appear anywhere in this project's
+// fixtures/tests, and dropping it is the safe side of this trade-off.)
+const NUMBER_PART = "-?\\d+(?:\\.\\d+)?";
+const RANGE_STEP_RE = new RegExp(`^(${NUMBER_PART})\\s*:\\s*(${NUMBER_PART})\\s*:\\s*(${NUMBER_PART})$`);
+const RANGE_RE = new RegExp(`^(${NUMBER_PART})\\s*:\\s*(${NUMBER_PART})$`);
 const BARE_INT_RE = /^\d+$/;
 
 /** Verbatim caption from a preceding standalone `//` (or `/* *\/`) comment line — never interpreted. */

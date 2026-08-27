@@ -17,7 +17,15 @@ export interface ParsedLiteral {
   value: ParamValue;
 }
 
-const NUMBER_RE = /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+// Deliberately NOT `\d+\.?\d*` — that shape lets a long digit run be split
+// between `\d+` and the trailing `\d*` at every boundary with nothing to
+// disambiguate the split, which is quadratic-time to fail on a long
+// malformed/adversarial string (see the identical fix + writeup in
+// `annotation.ts`'s `NUMBER_PART`, and `literal.perf.test.ts`). Requiring a
+// literal `.` before any fractional digits makes matching (and failing)
+// linear. Trade-off: a bare trailing-dot literal (`10.`, no digits after the
+// dot) is no longer recognized — not used anywhere in this project.
+const NUMBER_RE = /^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 
 /** True iff `text` (already trimmed) is a bare numeric literal. */
 export function isNumberLiteral(text: string): boolean {

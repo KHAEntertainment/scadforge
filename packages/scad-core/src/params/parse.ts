@@ -21,6 +21,7 @@
 
 import type { ParamDefinition, ParamSchema } from "../types.js";
 import { parsePrecedingCaption, parseTrailingAnnotation } from "./annotation.js";
+import { CRLF_ANNOTATION_WARNING, sourceHasCrlf, stripAnnotationFields } from "./crlf.js";
 import { scanTopLevel } from "./scan.js";
 import type { ScanEvent } from "./scan.js";
 
@@ -63,6 +64,14 @@ function buildParamDefinition(
  * annotation than intended", never an exception (see `annotation.ts`/
  * `scan.ts` for the specific fallbacks, and `fuzz.test.ts` for the property
  * test proving this over the vendored BOSL2/MCAD corpus).
+ *
+ * CRLF: when `source` contains a CRLF line ending anywhere, every
+ * parameter's annotation-derived fields (caption/min/max/step/maxLength/
+ * options) are stripped before returning — see `crlf.ts` for why (the real
+ * CLI's own CRLF handling is confirmed unreliable, and this keeps this
+ * parser from ever promising interactivity the renderer won't honor). Use
+ * {@link parseParamSchemaWithDiagnostics} when the caller wants to surface
+ * that as a user-facing warning.
  */
 export function parseParamSchema(source: string, options?: ParseParamSchemaOptions): ParamSchema {
   const events = scanTopLevel(source);
@@ -91,5 +100,28 @@ export function parseParamSchema(source: string, options?: ParseParamSchemaOptio
     }
   }
 
-  return { title: options?.title ?? "", parameters };
+  const finalParameters = sourceHasCrlf(source) ? parameters.map(stripAnnotationFields) : parameters;
+  return { title: options?.title ?? "", parameters: finalParameters };
+}
+
+export interface ParseParamSchemaWithDiagnosticsResult {
+  schema: ParamSchema;
+  /** Empty when there is nothing to report. Currently only ever contains {@link CRLF_ANNOTATION_WARNING}. */
+  warnings: string[];
+}
+
+/**
+ * Same parse as {@link parseParamSchema}, plus a structured `warnings` array
+ * for callers that want to surface degradation to the user (e.g. the CRLF
+ * annotation-stripping above). `parseParamSchema` itself stays warning-free
+ * so it remains a drop-in `(source) => ParamSchema` for existing callers.
+ */
+export function parseParamSchemaWithDiagnostics(
+  source: string,
+  options?: ParseParamSchemaOptions
+): ParseParamSchemaWithDiagnosticsResult {
+  const schema = parseParamSchema(source, options);
+  const warnings: string[] = [];
+  if (sourceHasCrlf(source)) warnings.push(CRLF_ANNOTATION_WARNING);
+  return { schema, warnings };
 }

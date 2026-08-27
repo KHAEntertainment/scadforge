@@ -14,8 +14,14 @@ export * from "./types.js";
 export * from "./errors.js";
 
 // params/
-export { DEFAULT_PARAM_GROUP, parseParamSchema } from "./params/index.js";
-export type { ParseParamSchemaOptions } from "./params/index.js";
+export {
+  CRLF_ANNOTATION_WARNING,
+  DEFAULT_PARAM_GROUP,
+  parseParamSchema,
+  parseParamSchemaWithDiagnostics,
+  sourceHasCrlf
+} from "./params/index.js";
+export type { ParseParamSchemaOptions, ParseParamSchemaWithDiagnosticsResult } from "./params/index.js";
 
 // runner/
 export {
