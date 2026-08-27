@@ -7,9 +7,45 @@
 // rewrites or deletes an existing one. No database (PROJECT_CONTEXT.md
 // "Do not introduce a database").
 //
+// ── CONCURRENCY POLICY (binding for #17's routes and the M4 MCP server) ─────
+//
+// `createSnapshot` MUST be safe when called concurrently against the SAME
+// `.scadforge/` tree — not just from two Promises in one Node process, but
+// from two SEPARATE OS processes (the GUI server and, from M4 onward, the
+// stdio MCP server, both writing the same project directory). An in-process
+// mutex/lock cannot provide that guarantee, so snapshot id allocation is
+// NOT "read project.json's head, compute next id, write files" (that read
+// -modify-write has a race: two callers can read the same head and both
+// compute the same next id, and `mkdir(dir, {recursive:true})` does NOT
+// throw on an existing directory, so the second writer's files silently land
+// on top of the first's — the exact defect QA reported).
+//
+// Instead, the directory name IS the lock: `claimNextSnapshotId` calls
+// `mkdir(historyDir/<id>)` NON-recursively (no `recursive: true`), which is
+// atomic at the filesystem/OS level — POSIX guarantees exactly one caller
+// (in-process or cross-process, same machine) gets ENOERR for a given path;
+// every other concurrent caller gets `EEXIST` and must retry with a freshly
+// re-read head. This makes the id sequence gapless-and-collision-free without
+// any external lock manager, and it composes correctly with the trailing
+// `project.json.head` write: a caller can only ever compute id N+1 after it
+// has observed head=N on disk, which is only true once the writer that
+// claimed N has fully committed `project.json` — so the final head writes
+// are transitively ordered by the same directory-claim race, never racing
+// each other out of order.
+//
+// If a caller cannot claim ANY id within `SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS`
+// (pathological contention, or a filesystem that cannot honor exclusive
+// mkdir), `createSnapshot` fails with the frozen `CONFLICT` error code
+// (`@scadforge/protocol` `ERROR_CODES`) rather than ever silently overwriting
+// another snapshot. `apps/server`'s routes should map `CONFLICT` to HTTP 409
+// (already the frozen mapping in `HTTP_STATUS_BY_ERROR_CODE`); the MCP server
+// should surface it as a normal tool failure envelope (`{ok:false,
+// error_code:'CONFLICT', message}`) and let the caller retry the whole
+// `write_scad`/`set_params` call.
+//
 // SPDX-License-Identifier: Apache-2.0
 
-import { copyFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createTwoFilesPatch } from "diff";
 import {
@@ -138,131 +174,198 @@ export interface CreateSnapshotInput {
   buildRenderUrl?: (snapshotId: SnapshotId, view: RenderRef["view"], file: string) => string;
 }
 
+/** Max attempts to claim a snapshot id before failing with `CONFLICT` (see the concurrency policy above). */
+export const SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS = 50;
+
+function isEexist(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "EEXIST";
+}
+
+/** A short, jittered delay so retries don't spin the event loop in a tight loop under contention. */
+function backoffDelay(attempt: number): Promise<void> {
+  const ms = Math.min(5 + attempt * 5, 100) + Math.floor(Math.random() * 10);
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+/**
+ * Atomically claims the next snapshot id for `projectDir` — see the
+ * CONCURRENCY POLICY comment at the top of this file. Returns the claimed
+ * `id` and the `parent` it was computed from, with the snapshot directory
+ * already created (empty) and exclusively owned by this call.
+ */
+async function claimNextSnapshotId(projectDir: string): Promise<{ id: SnapshotId; parent: SnapshotId | null }> {
+  for (let attempt = 0; attempt < SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS; attempt++) {
+    const project = await readProjectManifestOrNull(projectDir);
+    const parent = project?.head ?? null;
+    const id = nextSnapshotId(parent);
+    const dir = snapshotDir(projectDir, id);
+    try {
+      // NON-recursive, exclusive create: this is the lock. `{ recursive: true }`
+      // would succeed silently even when `dir` already exists, which is the
+      // defect this fix closes -- see the header comment.
+      await mkdir(dir);
+      return { id, parent };
+    } catch (err) {
+      if (isEexist(err)) {
+        if (attempt < SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS - 1) await backoffDelay(attempt);
+        continue; // another writer (this process or another) claimed `id` first; re-read head and retry
+      }
+      throw err;
+    }
+  }
+  throw new ScadForgeError(
+    "CONFLICT",
+    `could not allocate a snapshot id in '${projectDir}' after ${SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS} attempts (high write contention)`
+  );
+}
+
 /**
  * Creates the next numbered snapshot: writes `model.scad`/`params.json`/
  * `message.md`, a unified diff against the parent snapshot (null for the
  * first), copies any renders, persists the validation report verbatim (if
  * given), writes `manifest.json`, and updates the project's root
  * `model.scad`/`params.json` and `project.json.head`.
+ *
+ * Safe under concurrent callers, including from separate OS processes
+ * sharing the same `.scadforge/` tree -- see the CONCURRENCY POLICY comment
+ * at the top of this file. Fails with a typed `CONFLICT` error rather than
+ * ever silently overwriting another snapshot.
  */
 export async function createSnapshot(projectDir: string, input: CreateSnapshotInput): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const project = await readProjectManifestOrNull(projectDir);
-      const parent = project?.head ?? null;
-      const id = nextSnapshotId(parent);
+      const { id, parent } = await claimNextSnapshotId(projectDir);
       const dir = snapshotDir(projectDir, id);
-      const viewsDirPath = join(dir, PROJECT_LAYOUT.snapshot.viewsDir);
-      await mkdir(viewsDirPath, { recursive: true });
-
-      // model.scad
-      await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), input.content, "utf8");
-
-      // params.json (Customizer preset format, matching the project root convention)
-      const paramsFile: ParamsFile = {
-        fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
-        parameterSets: { [PARAMS_ACTIVE_PRESET]: input.params }
-      };
-      await writeFile(join(dir, PROJECT_LAYOUT.snapshot.paramsFile), JSON.stringify(paramsFile, null, 2), "utf8");
-
-      // message.md
-      await writeFile(join(dir, PROJECT_LAYOUT.snapshot.messageFile), input.message ?? "", "utf8");
-
-      // diff.patch vs parent (null for the first snapshot)
-      let diffPatchRel: string | null = null;
-      if (parent !== null) {
-        const parentContent = await readFile(
-          join(snapshotDir(projectDir, parent), PROJECT_LAYOUT.snapshot.modelFile),
-          "utf8"
-        ).catch(() => "");
-        const patch = createTwoFilesPatch(
-          `${parent}/model.scad`,
-          `${id}/model.scad`,
-          parentContent,
-          input.content
-        );
-        await writeFile(join(dir, PROJECT_LAYOUT.snapshot.diffFile), patch, "utf8");
-        diffPatchRel = PROJECT_LAYOUT.snapshot.diffFile;
+      try {
+        return await writeSnapshotFiles(projectDir, dir, id, parent, input);
+      } catch (err) {
+        // The id was claimed but the write didn't complete -- clean up the
+        // partial directory so it never lingers as a corrupt/unlistable
+        // snapshot (best-effort; the real error below is what's reported).
+        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        throw err;
       }
-
-      // validation.json (verbatim ValidationReport) + the manifest's lightweight summary
-      let validationJsonRel: string | null = null;
-      let validationSummary: ValidationSummary | null = null;
-      if (input.validation) {
-        await writeFile(
-          join(dir, PROJECT_LAYOUT.snapshot.validationFile),
-          JSON.stringify(input.validation.report, null, 2),
-          "utf8"
-        );
-        validationJsonRel = PROJECT_LAYOUT.snapshot.validationFile;
-        validationSummary = {
-          badge: input.validation.gate.badge,
-          manifold: input.validation.report.manifold,
-          components: input.validation.report.components,
-          volume_mm3: input.validation.report.volume_mm3,
-          warning_count: input.validation.gate.warnings.length
-        };
-      }
-
-      // renders
-      const renders: RenderRef[] = [];
-      for (const r of input.renders ?? []) {
-        const file = `${PROJECT_LAYOUT.snapshot.viewsDir}/${r.view}.png`;
-        const dest = join(dir, file);
-        await copyFile(r.sourcePath, dest);
-        const { size } = await stat(dest);
-        // width/height are not re-derived here (the frozen camera contract
-        // fixes them per DEFAULT_IMAGE_SIZE / the request's imgsize override);
-        // callers that need exact per-file dimensions read them from the
-        // RenderResult that produced r.sourcePath.
-        renders.push({
-          view: r.view,
-          file,
-          url: input.buildRenderUrl ? input.buildRenderUrl(id, r.view, file) : `/${file}`,
-          width: 0,
-          height: 0,
-          bytes: size,
-          render_ms: r.render_ms
-        });
-      }
-
-      const manifest: SnapshotManifest = {
-        id,
-        parent,
-        timestamp: new Date().toISOString(),
-        message: input.message,
-        origin: input.origin,
-        pass: input.pass,
-        files: {
-          model_scad: PROJECT_LAYOUT.snapshot.modelFile,
-          params_json: PROJECT_LAYOUT.snapshot.paramsFile,
-          message_md: PROJECT_LAYOUT.snapshot.messageFile,
-          validation_json: validationJsonRel,
-          diff_patch: diffPatchRel
-        },
-        params: input.params,
-        renders,
-        validation: validationSummary,
-        annotations: []
-      };
-      await writeFile(join(dir, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(manifest, null, 2), "utf8");
-
-      // Update root model.scad / params.json to the current state.
-      await writeFile(rootModelPath(projectDir), input.content, "utf8");
-      await writeFile(rootParamsPath(projectDir), JSON.stringify(paramsFile, null, 2), "utf8");
-
-      // Update project.json head.
-      if (project) {
-        project.head = id;
-        project.updated = manifest.timestamp;
-        await writeProjectManifest(projectDir, project);
-      }
-
-      return manifest;
     },
     "INTERNAL_ERROR",
     "failed to create snapshot"
   );
+}
+
+async function writeSnapshotFiles(
+  projectDir: string,
+  dir: string,
+  id: SnapshotId,
+  parent: SnapshotId | null,
+  input: CreateSnapshotInput
+): Promise<SnapshotManifest> {
+  const project = await readProjectManifestOrNull(projectDir);
+  const viewsDirPath = join(dir, PROJECT_LAYOUT.snapshot.viewsDir);
+  await mkdir(viewsDirPath, { recursive: true });
+
+  // model.scad
+  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), input.content, "utf8");
+
+  // params.json (Customizer preset format, matching the project root convention)
+  const paramsFile: ParamsFile = {
+    fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
+    parameterSets: { [PARAMS_ACTIVE_PRESET]: input.params }
+  };
+  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.paramsFile), JSON.stringify(paramsFile, null, 2), "utf8");
+
+  // message.md
+  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.messageFile), input.message ?? "", "utf8");
+
+  // diff.patch vs parent (null for the first snapshot)
+  let diffPatchRel: string | null = null;
+  if (parent !== null) {
+    const parentContent = await readFile(
+      join(snapshotDir(projectDir, parent), PROJECT_LAYOUT.snapshot.modelFile),
+      "utf8"
+    ).catch(() => "");
+    const patch = createTwoFilesPatch(
+      `${parent}/model.scad`,
+      `${id}/model.scad`,
+      parentContent,
+      input.content
+    );
+    await writeFile(join(dir, PROJECT_LAYOUT.snapshot.diffFile), patch, "utf8");
+    diffPatchRel = PROJECT_LAYOUT.snapshot.diffFile;
+  }
+
+  // validation.json (verbatim ValidationReport) + the manifest's lightweight summary
+  let validationJsonRel: string | null = null;
+  let validationSummary: ValidationSummary | null = null;
+  if (input.validation) {
+    await writeFile(
+      join(dir, PROJECT_LAYOUT.snapshot.validationFile),
+      JSON.stringify(input.validation.report, null, 2),
+      "utf8"
+    );
+    validationJsonRel = PROJECT_LAYOUT.snapshot.validationFile;
+    validationSummary = {
+      badge: input.validation.gate.badge,
+      manifold: input.validation.report.manifold,
+      components: input.validation.report.components,
+      volume_mm3: input.validation.report.volume_mm3,
+      warning_count: input.validation.gate.warnings.length
+    };
+  }
+
+  // renders
+  const renders: RenderRef[] = [];
+  for (const r of input.renders ?? []) {
+    const file = `${PROJECT_LAYOUT.snapshot.viewsDir}/${r.view}.png`;
+    const dest = join(dir, file);
+    await copyFile(r.sourcePath, dest);
+    const { size } = await stat(dest);
+    // width/height are not re-derived here (the frozen camera contract
+    // fixes them per DEFAULT_IMAGE_SIZE / the request's imgsize override);
+    // callers that need exact per-file dimensions read them from the
+    // RenderResult that produced r.sourcePath.
+    renders.push({
+      view: r.view,
+      file,
+      url: input.buildRenderUrl ? input.buildRenderUrl(id, r.view, file) : `/${file}`,
+      width: 0,
+      height: 0,
+      bytes: size,
+      render_ms: r.render_ms
+    });
+  }
+
+  const manifest: SnapshotManifest = {
+    id,
+    parent,
+    timestamp: new Date().toISOString(),
+    message: input.message,
+    origin: input.origin,
+    pass: input.pass,
+    files: {
+      model_scad: PROJECT_LAYOUT.snapshot.modelFile,
+      params_json: PROJECT_LAYOUT.snapshot.paramsFile,
+      message_md: PROJECT_LAYOUT.snapshot.messageFile,
+      validation_json: validationJsonRel,
+      diff_patch: diffPatchRel
+    },
+    params: input.params,
+    renders,
+    validation: validationSummary,
+    annotations: []
+  };
+  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(manifest, null, 2), "utf8");
+
+  // Update root model.scad / params.json to the current state.
+  await writeFile(rootModelPath(projectDir), input.content, "utf8");
+  await writeFile(rootParamsPath(projectDir), JSON.stringify(paramsFile, null, 2), "utf8");
+
+  // Update project.json head.
+  if (project) {
+    project.head = id;
+    project.updated = manifest.timestamp;
+    await writeProjectManifest(projectDir, project);
+  }
+
+  return manifest;
 }
 
 export async function readSnapshotManifest(projectDir: string, id: SnapshotId): Promise<SnapshotManifest> {

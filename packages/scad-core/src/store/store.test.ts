@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -223,4 +223,80 @@ describe("project store (filesystem, temp dir)", () => {
     expect(snap.message).toBe("plain one-line summary");
     expect(snap.pass).toBe(1);
   });
+
+  // ── CONCURRENCY (issue #14 / PR #27: claimNextSnapshotId's exclusive-mkdir
+  // claim + retry, see the CONCURRENCY POLICY comment in store.ts) ──
+
+  it("N concurrent createSnapshot calls on the same project yield N distinct ids -- every payload readable, no collision/overwrite", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    const N = 12;
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        createSnapshot(projectDir, {
+          content: `cube(${i + 2});\n`,
+          params: { n: i },
+          message: `concurrent snapshot #${i}`,
+          origin: "manual",
+          pass: null
+        })
+      )
+    );
+
+    // No two concurrent callers collided on the same id.
+    const ids = results.map((r) => r.id);
+    expect(new Set(ids).size).toBe(N);
+
+    // Every one of the N payloads is intact and independently readable --
+    // the defect this fix closes was one writer's files silently landing on
+    // top of another's, which would show up here as lost/mismatched content.
+    for (let i = 0; i < N; i++) {
+      const r = results[i]!;
+      const persisted = await readSnapshotManifest(projectDir, r.id);
+      expect(persisted.message).toBe(`concurrent snapshot #${i}`);
+      expect(persisted.params).toEqual({ n: i });
+      const modelContent = await readFile(join(snapshotDir(projectDir, r.id), persisted.files.model_scad), "utf8");
+      expect(modelContent).toBe(`cube(${i + 2});\n`);
+    }
+
+    // Gapless: the initial snapshot plus all N concurrent ones, each id used
+    // exactly once.
+    const allSnapshots = await listSnapshots(projectDir);
+    expect(allSnapshots).toHaveLength(N + 1);
+    expect(new Set(allSnapshots.map((s) => s.id)).size).toBe(N + 1);
+
+    // project.json.head lands on whichever id was allocated last -- i.e. it
+    // is a real id from this run, not stale/duplicated.
+    const project = await readProjectManifest(projectDir);
+    expect(new Set(ids).has(project.head as string)).toBe(true);
+  });
+
+  it("exhausting SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS surfaces the typed CONFLICT error instead of silently overwriting", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    // Simulate pathological contention that never clears: pre-claim the
+    // directory the next createSnapshot call would need. Because
+    // project.json.head never changes in this test, every retry inside
+    // claimNextSnapshotId recomputes the SAME next id and hits EEXIST every
+    // time -- the loop must deterministically exhaust
+    // SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS and fail with the typed CONFLICT error
+    // rather than ever falling back to overwriting the pre-existing directory.
+    const contestedDir = snapshotDir(projectDir, "0002");
+    await mkdir(contestedDir, { recursive: true });
+    await writeFile(join(contestedDir, "sentinel.txt"), "pre-existing, must survive", "utf8");
+
+    await expect(
+      createSnapshot(projectDir, {
+        content: "cube(2);\n",
+        params: {},
+        message: "should conflict, not overwrite",
+        origin: "manual",
+        pass: null
+      })
+    ).rejects.toMatchObject({ error_code: "CONFLICT" });
+
+    // The pre-existing (contested) directory's contents were never touched.
+    const sentinel = await readFile(join(contestedDir, "sentinel.txt"), "utf8");
+    expect(sentinel).toBe("pre-existing, must survive");
+  }, 20000);
 });
