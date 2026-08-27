@@ -35,6 +35,9 @@ importers:
       '@scadforge/agent':
         specifier: workspace:*
         version: link:../../packages/agent
+      '@scadforge/libs':
+        specifier: workspace:*
+        version: link:../../packages/libs
       '@scadforge/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol

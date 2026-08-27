@@ -20,6 +20,10 @@ build/
 # OS / editor
 .DS_Store
 *.log
+# ...except acceptance-run transcripts, which are a deliberate committed
+# artifact (Issue #20 AC: "full transcript + timings committed under
+# evals/scenario-a/evidence/").
+!evals/*/evidence/*.log
 
 # ScadForge runtime project data in sample/test projects
 .scadforge/exports/

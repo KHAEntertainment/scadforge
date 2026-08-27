@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// PLACEHOLDER implementations of `ScadCoreApi` and `AgentProvider` so
-// `apps/server` boots and serves `/api/health` on its own, before Issue #20
-// wires in the real `packages/scad-core` (#14) and `packages/agent` (#16)
-// implementations. Every method fails with a typed, well-formed error rather
-// than throwing something unexpected — the process must never crash just
-// because integration hasn't happened yet.
+// EXPLICITLY-UNAVAILABLE implementations of `ScadCoreApi` and `AgentProvider`.
 //
-// Not used by any test — tests inject their own fakes (see
-// `src/test/fakes.ts`) so route behavior is exercised, not this stub.
+// Issue #20 has wired the real implementations in (`services/scad-core-impl.ts`
+// and `services/agent-impl.ts`, composed in `index.ts`), so nothing in the
+// shipping server reaches these any more. They are kept — rather than deleted —
+// because `createApp` is a pure DI function that must be constructible without
+// Docker, without OpenSCAD and without model credentials: a harness that wants
+// to exercise, say, the export routes with a real scad-core but no agent can
+// pass `notWiredAgentProvider` and get a typed, well-formed refusal instead of
+// a crash or a live API call.
+//
+// Not used by any route test — those inject their own fakes (`src/test/fakes.ts`)
+// so route behavior is exercised, not this stub.
 
 import { RouteError } from "./errors.js";
 import type { ScadCoreApi } from "./scad-core-api.js";
 import type { AgentProvider } from "./agent-provider.js";
 
-const NOT_WIRED_MESSAGE =
-  "scad-core is not wired into this server yet (see Issue #20: integration of #14/#16 with #17).";
+const NOT_WIRED_MESSAGE = "This server instance was constructed without a scad-core implementation.";
 
 function notWired(): never {
   throw new RouteError("INTERNAL_ERROR", NOT_WIRED_MESSAGE);
@@ -30,6 +33,8 @@ export const notWiredScadCoreApi: ScadCoreApi = {
   getSnapshotDiff: async () => notWired(),
   revertSnapshot: async () => notWired(),
   getSnapshotRenderFile: async () => notWired(),
+  getParams: async () => notWired(),
+  updateParams: async () => notWired(),
   renderViews: async () => notWired(),
   runExport: async () => notWired(),
   getExportFile: async () => notWired()
@@ -37,6 +42,6 @@ export const notWiredScadCoreApi: ScadCoreApi = {
 
 export const notWiredAgentProvider: AgentProvider = {
   runTurn: async () => {
-    throw new RouteError("AGENT_ERROR", "The agent runtime is not wired into this server yet (see Issue #20).");
+    throw new RouteError("AGENT_ERROR", "This server instance was constructed without an agent runtime.");
   }
 };
