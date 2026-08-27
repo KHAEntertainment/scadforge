@@ -4,6 +4,7 @@ import { createApiClient } from "./lib/apiClient.js";
 import { useProject } from "./hooks/useProject.js";
 import { useChat } from "./hooks/useChat.js";
 import { useSnapshots } from "./hooks/useSnapshots.js";
+import { useLiveModelSource } from "./hooks/useLiveModelSource.js";
 import { StatusStrip } from "./components/StatusStrip.js";
 import { ChatPanel } from "./components/ChatPanel.js";
 import { Workspace } from "./components/Workspace.js";
@@ -21,6 +22,7 @@ export function App() {
 
   const chat = useChat(client, projectId);
   const snapshots = useSnapshots(client, projectId);
+  const liveSource = useLiveModelSource(client, projectId, chat.state.headSnapshot?.id ?? null);
 
   const pngUrls = useMemo<Partial<Record<ViewName, string | null>>>(() => {
     const renders = chat.state.headSnapshot?.renders ?? [];
@@ -41,7 +43,14 @@ export function App() {
           disabled={projectLoading || !projectId}
         />
         <Workspace
-          preview={<PreviewTab stlUrl={chat.state.latestMeshUrl} pngUrls={pngUrls} />}
+          preview={
+            <PreviewTab
+              stlUrl={chat.state.latestMeshUrl}
+              pngUrls={pngUrls}
+              liveScad={liveSource.scad}
+              liveParams={liveSource.params}
+            />
+          }
           history={
             <HistoryTab
               client={client}

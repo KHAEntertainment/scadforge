@@ -19,7 +19,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -191,6 +191,49 @@ function checkPackage(pkgDir) {
   return { ok: violations.length === 0, violations };
 }
 
+/**
+ * Issue #31 AC: "no GPL import escapes apps/web/src/wasm/**". The GPL zone
+ * (openscad-wasm glue, BOSL2-for-wasm bundling) is only ever a licensing
+ * problem if it reaches one of the four GPL-free-enforced packages above —
+ * source in `apps/web` itself is already GPL-3.0-or-later (see its
+ * package.json), so this check's job is narrowly: do any of
+ * `ENFORCED_PACKAGES`' own `.ts`/`.tsx` sources import the wasm zone or the
+ * openscad-wasm glue directly? A plain recursive text scan is enough — no
+ * TS parser needed — because a real import escaping the zone must appear as
+ * a literal `from "..."`/`require("...")` specifier somewhere in the file.
+ */
+const WASM_ZONE_IMPORT_PATTERN = /(?:from|require\()\s*["'][^"']*(?:apps\/web\/src\/wasm|openscad-wasm|openscad\.wasm)[^"']*["']/;
+
+/** @param {string} dir @param {string[]} out @returns {string[]} */
+function collectSourceFiles(dir, out = []) {
+  if (!existsSync(dir)) return out;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === "node_modules" || entry.name === "dist" || entry.name.startsWith(".")) continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collectSourceFiles(full, out);
+    } else if (/\.(ts|tsx|mts|cts|js|mjs|cjs)$/.test(entry.name)) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+/** @returns {{ ok: boolean, violations: string[] }} */
+function checkNoWasmZoneEscape() {
+  const violations = [];
+  for (const pkgDir of ENFORCED_PACKAGES) {
+    const files = collectSourceFiles(join(repoRoot, pkgDir));
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      if (WASM_ZONE_IMPORT_PATTERN.test(text)) {
+        violations.push(file.slice(repoRoot.length + 1));
+      }
+    }
+  }
+  return { ok: violations.length === 0, violations };
+}
+
 function runGate() {
   let anyFailure = false;
   const report = [];
@@ -211,6 +254,17 @@ function runGate() {
     } else {
       report.push(`OK   ${pkgDir}: no GPL/AGPL dependencies detected`);
     }
+  }
+
+  const escapeResult = checkNoWasmZoneEscape();
+  if (!escapeResult.ok) {
+    anyFailure = true;
+    report.push("FAIL wasm-zone-escape: GPL wasm-zone import found outside apps/web/src/wasm/** —");
+    for (const file of escapeResult.violations) {
+      report.push(`  - ${file}`);
+    }
+  } else {
+    report.push("OK   wasm-zone-escape: no GPL-free package imports apps/web/src/wasm/** or openscad-wasm");
   }
 
   console.log(report.join("\n"));
@@ -390,6 +444,39 @@ function runSelfTest() {
       "missing package.json reported as structured error",
       missingPkgResult.ok === false && typeof missingPkgResult.error === "string"
     ]);
+
+    // (i) — Issue #31 AC — wasm-zone-escape pattern flags a real import of
+    // the GPL zone / openscad-wasm glue from an enforced package's source.
+    results.push([
+      "wasm-zone import pattern flags apps/web/src/wasm import",
+      WASM_ZONE_IMPORT_PATTERN.test('import { x } from "../../../apps/web/src/wasm/index.js";')
+    ]);
+    results.push([
+      "wasm-zone import pattern flags a direct openscad-wasm reference",
+      WASM_ZONE_IMPORT_PATTERN.test('const mod = require("openscad-wasm");')
+    ]);
+    results.push([
+      "wasm-zone import pattern does not flag an unrelated import",
+      WASM_ZONE_IMPORT_PATTERN.test('import { z } from "@scadforge/scad-core";') === false
+    ]);
+
+    // (j) — a real scan of this repo's actual ENFORCED_PACKAGES sources
+    // finds zero escapes today (regression guard: this assertion is the one
+    // that would fail if a future PR actually introduced the violation).
+    const realScanResult = checkNoWasmZoneEscape();
+    results.push(["current ENFORCED_PACKAGES sources have no wasm-zone escape", realScanResult.ok === true]);
+
+    // (k) collectSourceFiles on a nonexistent directory returns [] instead
+    // of throwing (counterexample: an enforced package dir that doesn't exist).
+    let collectThrew = false;
+    let collectResult;
+    try {
+      collectResult = collectSourceFiles(join(scratch, "does-not-exist"), []);
+    } catch {
+      collectThrew = true;
+    }
+    results.push(["collectSourceFiles on a missing directory does not throw", collectThrew === false]);
+    results.push(["collectSourceFiles on a missing directory returns empty", Array.isArray(collectResult) && collectResult.length === 0]);
 
     console.log("License-gate self-test results:");
     let allPassed = true;
