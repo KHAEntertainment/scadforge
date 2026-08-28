@@ -48,14 +48,16 @@ import {
   exportsDir,
   initProject,
   listSnapshots,
+  mergeParamsAtomic,
   readSnapshotManifest,
   recordExport,
   renderViews as runRenderViews,
+  resolveSnapshotMeshPath,
+  resolveSnapshotRenderPath,
   revertToSnapshot,
   rootModelPath,
   runParamExport,
   snapshotDir,
-  snapshotMeshPath,
   snapshotRenderPath
 } from "@scadforge/scad-core";
 import type { RenderAttachment, RenderedView } from "@scadforge/scad-core";
@@ -68,6 +70,7 @@ import {
   readParams,
   readProject,
   readScad,
+  stageSnapshotModel,
   writeRootParams,
   type ServerRuntime
 } from "./runtime.js";
@@ -110,9 +113,22 @@ export interface RenderAndAttachResult {
 }
 
 /**
- * Renders the project's current `model.scad` and attaches the resulting PNGs
- * to its head snapshot (see scad-core's `store/renders.ts` for why attaching
- * to an existing snapshot is not a history rewrite).
+ * Renders a project's model and, when the render describes the CURRENT head
+ * snapshot's own persisted content, attaches the resulting PNGs to it (see
+ * `packages/scad-core/src/store/attachments.ts` for why attaching derived
+ * renders is not a history rewrite -- they land in a sibling `derived/` tree,
+ * never inside `history/<id>/`).
+ *
+ * Issue #45: the head snapshot id is pinned BEFORE rendering, and — unless
+ * the caller supplied an explicit `params` override (a hypothetical preview
+ * that does not describe any snapshot's own persisted params) — the render
+ * runs against THAT PINNED snapshot's own staged `model.scad`/`params.json`,
+ * never `rootModelPath(dir)` ("whatever the project's current root state
+ * is"). This is immune to a concurrent `write_scad`/`set_params` moving head
+ * to a newer snapshot mid-render, and to `params.json` having been updated
+ * without a snapshot (`PUT .../params` with `snapshot:false`). A preview
+ * render (explicit `params`) is still returned to the caller, but is never
+ * attached to history and its result reports `snapshot: null`.
  *
  * Rendering into a temp directory first and only then attaching means a
  * partial render never leaves half a view set inside the snapshot.
@@ -124,21 +140,24 @@ export async function renderAndAttach(
 ): Promise<RenderAndAttachResult> {
   const dir = runtime.dirFor(projectId);
   const project = await readProject(dir);
+  const head = project.head;
+  const isPreview = request.params !== undefined;
+
   const outDir = await mkdtemp(join(tmpdir(), "scadforge-render-"));
+  const staged = head && !isPreview ? await stageSnapshotModel(dir, head) : null;
   try {
     const result = await runRenderViews(
       {
-        scadPath: rootModelPath(dir),
+        scadPath: staged?.scadPath ?? rootModelPath(dir),
         outDir,
         views: request.views,
-        params: request.params,
+        params: staged ? staged.params : request.params,
         imgsize: request.imgsize
       },
       { libraryPaths: runtime.libraryPaths }
     );
 
-    const head = project.head;
-    if (head) {
+    if (head && !isPreview) {
       const attachments: RenderAttachment[] = result.views
         .filter((view): view is RenderedView & { path: string } => view.ok && view.path !== null)
         .map((view) => ({
@@ -160,8 +179,9 @@ export async function renderAndAttach(
         }
       }
     }
-    return { result, snapshot: head };
+    return { result, snapshot: isPreview ? null : head };
   } finally {
+    await staged?.cleanup();
     await rm(outDir, { recursive: true, force: true }).catch(() => {});
   }
 }
@@ -293,15 +313,29 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
 
     async getSnapshotRenderFile(projectId, snapshotId, view): Promise<RenderFile | null> {
       const dir = runtime.dirFor(projectId);
-      return readFileOrNull(snapshotRenderPath(dir, snapshotId, view as ViewName));
+      // Read-time fallback (Issue #45 follow-up): a project that predates
+      // this fix has its renders physically in `history/<id>/views/`, not
+      // `derived/<id>/`. `resolveSnapshotRenderPath` checks derived first,
+      // then falls back to history -- read-only, never migrates the legacy
+      // file, so it never touches `history/`.
+      const path = await resolveSnapshotRenderPath(dir, snapshotId, view as ViewName);
+      if (!path) return null;
+      return readFileOrNull(path);
     },
 
     async getSnapshotMeshFile(projectId, snapshotId): Promise<RenderFile | null> {
       const dir = runtime.dirFor(projectId);
-      // Deliberately a plain file read, exactly like the PNG lookup above: a
-      // missing mesh is `null`, never a throw. The route turns that into a
-      // 404 the viewer renders as "no mesh for this snapshot yet".
-      return readFileOrNull(snapshotMeshPath(dir, snapshotId));
+      // Read-time fallback (Issue #45/#41 reconciliation): a snapshot
+      // validated between #50's merge and this reconciliation landing has
+      // its mesh physically at `history/<id>/mesh.stl`, not
+      // `derived/<id>/`. `resolveSnapshotMeshPath` checks derived first, then
+      // falls back to history -- read-only, never migrates the legacy file.
+      // A genuinely missing mesh is `null` either way, never a throw; the
+      // route turns that into a 404 the viewer renders as "no mesh for this
+      // snapshot yet".
+      const path = await resolveSnapshotMeshPath(dir, snapshotId);
+      if (!path) return null;
+      return readFileOrNull(path);
     },
 
     // ── params ───────────────────────────────────────────────────────────────
@@ -311,13 +345,14 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
     async updateParams(projectId, request: ParamsUpdateRequest): Promise<ParamsResponse> {
       const dir = runtime.dirFor(projectId);
       await readProject(dir);
-      // Single code path (Issue #32): the same validation + merge
-      // `set_params` uses (`runtime.ts`'s `planParamUpdate`). An unknown
-      // name, an out-of-range value, or a value of the wrong type is a hard
-      // failure here — never a silent coerce, never a silent drop (unlike
-      // the agent tool, whose frozen result shape can only report rejections
-      // via `unknown_params`, this REST route's frozen `ApiError` shape can
-      // say exactly what was wrong with each one).
+      // Single code path (Issue #32): the same validation `set_params` uses
+      // (`runtime.ts`'s `planParamUpdate`). An unknown name, an out-of-range
+      // value, or a value of the wrong type is a hard failure here — never a
+      // silent coerce, never a silent drop (unlike the agent tool, whose
+      // frozen result shape can only report rejections via `unknown_params`,
+      // this REST route's frozen `ApiError` shape can say exactly what was
+      // wrong with each one). Validation depends only on `request.values` and
+      // the schema, so it can happen before the params lock is even acquired.
       const plan = await planParamUpdate(dir, runtime, request.values);
       if (plan.rejected.length > 0) {
         throw new RouteError(
@@ -325,21 +360,27 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
           plan.rejected.map((r) => r.message).join(" ")
         );
       }
-      const merged = plan.merged;
       const message = `Set ${Object.keys(request.values).length} parameter(s)`;
 
-      if (request.snapshot !== false) {
-        // The snapshot carries the CURRENT source unchanged — a parameter
-        // write is not a model edit, and passing anything else here would
-        // silently truncate `model.scad`.
-        const content = await readScad(dir);
-        await asRouteResult(
-          () => createSnapshot(dir, { content, params: merged, message, origin: "manual", pass: null }),
-          "failed to snapshot the parameter update"
-        );
-      } else {
-        await asRouteResult(() => writeRootParams(dir, merged), "failed to persist parameters");
-      }
+      // `mergeParamsAtomic` (Issue #44) reads the CURRENT root `params.json`
+      // and writes the result WHILE HOLDING the cross-process params lock, so
+      // this can never race a concurrent `set_params` (or another REST
+      // update) merging a DISJOINT key onto the same file.
+      await asRouteResult(
+        () =>
+          mergeParamsAtomic(dir, plan.accepted, async (merged) => {
+            if (request.snapshot !== false) {
+              // The snapshot carries the CURRENT source unchanged — a
+              // parameter write is not a model edit, and passing anything
+              // else here would silently truncate `model.scad`.
+              const content = await readScad(dir);
+              await createSnapshot(dir, { content, params: merged, message, origin: "manual", pass: null });
+            } else {
+              await writeRootParams(dir, merged);
+            }
+          }),
+        "failed to persist the parameter update"
+      );
       return paramsResponse(projectId);
     },
 
@@ -377,20 +418,31 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       const project = await readProject(dir);
       const outDir = exportsDir(dir);
 
-      const result = await asRouteResult(
-        () =>
-          exportRun(
+      // Pin the head snapshot id BEFORE running the (slow) export, and --
+      // unless the caller passed an explicit `params` override -- export THAT
+      // PINNED snapshot's own staged `model.scad`/`params.json`, never
+      // `rootModelPath(dir)` (Issue #45's AC5: the exported artifact and its
+      // `ExportRecord.snapshot` must describe the SAME snapshot, immune to a
+      // concurrent `write_scad`/`set_params` moving head mid-export).
+      const isPreview = request.params !== undefined;
+      const staged = project.head && !isPreview ? await stageSnapshotModel(dir, project.head) : null;
+
+      const result = await asRouteResult(async () => {
+        try {
+          return await exportRun(
             {
-              scadPath: rootModelPath(dir),
+              scadPath: staged?.scadPath ?? rootModelPath(dir),
               outDir,
               format: request.format,
-              params: request.params,
+              params: staged ? staged.params : request.params,
               allowValidationFailure: request.allow_validation_failure === true
             },
             { libraryPaths: runtime.libraryPaths }
-          ),
-        "export failed"
-      );
+          );
+        } finally {
+          await staged?.cleanup();
+        }
+      }, "export failed");
 
       if (!result.ok || !result.path) {
         throw new RouteError(

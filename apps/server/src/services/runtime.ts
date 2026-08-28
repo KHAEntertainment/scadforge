@@ -6,7 +6,9 @@
 // writes `.scadforge/` goes through here so the two never drift apart on
 // where a file lives or how a failure is typed.
 
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CLAUDE_AGENT_SDK_PROVIDER_ID, resolveMaxPasses } from "@scadforge/agent";
 import { bosl2Path, mcadPath } from "@scadforge/libs";
 import {
@@ -14,13 +16,15 @@ import {
   PARAMS_FILE_FORMAT_VERSION,
   ScadForgeError,
   readProjectManifest,
+  readSnapshotManifest,
   rootModelPath,
   rootParamsPath,
   runParamExport,
+  snapshotDir,
   validateParamValues
 } from "@scadforge/scad-core";
 import type { ParamRejection, ParamSchema, ParamValues, ParamsFile } from "@scadforge/scad-core";
-import type { ProjectManifest, ProviderConfig } from "@scadforge/protocol";
+import type { ProjectManifest, ProviderConfig, SnapshotId } from "@scadforge/protocol";
 import { RouteError } from "./errors.js";
 import { projectDir, resolveProjectsRoot } from "./project-paths.js";
 
@@ -110,6 +114,51 @@ export async function readParams(dir: string): Promise<ParamValues> {
 }
 
 /**
+ * Reads snapshot `id`'s OWN persisted `model.scad` — NEVER the project's
+ * current root `model.scad` (Issue #45). Re-validating or re-rendering a
+ * specific snapshot must describe THAT snapshot's own content, even when the
+ * project's root state (and head) have since moved on to a newer snapshot.
+ */
+export async function readSnapshotScad(dir: string, id: SnapshotId): Promise<string> {
+  const manifest = await asRouteResult(() => readSnapshotManifest(dir, id), `failed to read snapshot '${id}'`);
+  return readFile(join(snapshotDir(dir, id), manifest.files.model_scad), "utf8");
+}
+
+/** Reads snapshot `id`'s OWN persisted parameter values — see {@link readSnapshotScad}. */
+export async function readSnapshotParams(dir: string, id: SnapshotId): Promise<ParamValues> {
+  const manifest = await asRouteResult(() => readSnapshotManifest(dir, id), `failed to read snapshot '${id}'`);
+  const raw = await readFile(join(snapshotDir(dir, id), manifest.files.params_json), "utf8");
+  const parsed = JSON.parse(raw) as ParamsFile;
+  return (parsed.parameterSets?.[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
+}
+
+/** A snapshot's own model + params, staged into a throwaway temp file for OpenSCAD to read. */
+export interface StagedSnapshotModel {
+  /** Absolute path to a temp copy of the snapshot's own `model.scad`. */
+  scadPath: string;
+  /** The snapshot's own persisted parameter values. */
+  params: ParamValues;
+  /** Removes the temp staging directory. Safe to call more than once. */
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Stages snapshot `id`'s OWN `model.scad`/`params.json` into a fresh temp
+ * file, so a caller running a (possibly slow) OpenSCAD invocation against it
+ * is immune to a concurrent `write_scad`/`set_params` changing the project's
+ * root files or even the snapshot's own directory mid-flight (Issue #45:
+ * pinning the snapshot id is necessary but not sufficient without also
+ * pinning the bytes actually handed to OpenSCAD).
+ */
+export async function stageSnapshotModel(dir: string, id: SnapshotId): Promise<StagedSnapshotModel> {
+  const [content, params] = await Promise.all([readSnapshotScad(dir, id), readSnapshotParams(dir, id)]);
+  const stageDir = await mkdtemp(join(tmpdir(), "scadforge-snapshot-stage-"));
+  const scadPath = join(stageDir, "model.scad");
+  await writeFile(scadPath, content, "utf8");
+  return { scadPath, params, cleanup: () => rm(stageDir, { recursive: true, force: true }).catch(() => {}) };
+}
+
+/**
  * Writes the project's root `params.json` WITHOUT creating a snapshot — the
  * `snapshot: false` path of `PUT /api/projects/:id/params`. Uses the same
  * one-preset Customizer file shape the store writes, so a later snapshot reads
@@ -143,36 +192,45 @@ export async function readParamSchema(dir: string, runtime: ServerRuntime): Prom
   }
 }
 
-/** The result of validating and merging a partial params update onto the project's current values. */
+/** The result of validating a partial params update against the live Customizer schema. */
 export interface ParamUpdatePlan {
-  /** The full parameter bag after the update — `current` with every ACCEPTED value from `values` applied. */
-  merged: ParamValues;
-  /** Empty when every supplied value validated. Never merged into `merged`. */
+  /** The subset of `values` that validated (declared, right type, in range). */
+  accepted: ParamValues;
+  /** Empty when every supplied value validated. Never applied. */
   rejected: ParamRejection[];
 }
 
 /**
- * THE single code path (Issue #32) that turns a caller-supplied partial
- * `values` bag into the full merged params.json contents, validated against
- * the project's live Customizer schema via `validateParamValues`
- * (`@scadforge/scad-core`). Both `routes/params.ts` (through
- * `scad-core-impl.ts`'s `updateParams`) and the agent's `set_params` tool
- * (through `agent-scad-core.ts`'s `setParams`) call this — neither re-derives
- * the merge or the validation rules itself, so a value the REST route
- * accepts and a value the agent accepts can never disagree.
+ * THE single code path (Issue #32) that validates a caller-supplied partial
+ * `values` bag against the project's live Customizer schema via
+ * `validateParamValues` (`@scadforge/scad-core`). Both `routes/params.ts`
+ * (through `scad-core-impl.ts`'s `updateParams`) and the agent's `set_params`
+ * tool (through `agent-scad-core.ts`'s `setParams`) call this — neither
+ * re-derives the validation rules itself, so a value the REST route accepts
+ * and a value the agent accepts can never disagree.
+ *
+ * Deliberately does NOT read or merge onto the project's CURRENT
+ * `params.json` (Issue #44): whether a value is accepted depends only on
+ * `values` and the schema, never on `current`, so that read can wait until
+ * immediately before the write, inside `@scadforge/scad-core`'s
+ * `mergeParamsAtomic` — the params LOCK's cross-process mutex. Merging here
+ * instead (the old code) computed `merged` from a `current` read that raced
+ * every other concurrent writer's own read-merge-write of the SAME file: two
+ * updates to disjoint keys could each merge onto a stale `current` and the
+ * writer that persisted last would silently discard the other's change.
  *
  * Callers still decide what to DO with `rejected`: the REST route treats any
- * rejection as a hard `VALIDATION_FAILED` (never a silent coerce); the
- * agent's frozen `set_params` result shape has no field for a per-value
- * error, so it folds every rejection into `unknown_params` and applies only
- * `merged` (which already excludes them) — see each call site.
+ * rejection as a hard `VALIDATION_FAILED` BEFORE ever touching `params.json`
+ * (never a silent coerce); the agent's frozen `set_params` result shape has
+ * no field for a per-value error, so it folds every rejection into
+ * `unknown_params` and passes only `accepted` on to `mergeParamsAtomic` — see
+ * each call site.
  */
 export async function planParamUpdate(
   dir: string,
   runtime: ServerRuntime,
   values: ParamValues
 ): Promise<ParamUpdatePlan> {
-  const [schema, current] = await Promise.all([readParamSchema(dir, runtime), readParams(dir)]);
-  const { accepted, rejected } = validateParamValues(schema, values);
-  return { merged: { ...current, ...accepted }, rejected };
+  const schema = await readParamSchema(dir, runtime);
+  return validateParamValues(schema, values);
 }

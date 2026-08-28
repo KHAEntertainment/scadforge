@@ -32,6 +32,7 @@ import {
   createSnapshot,
   exportRun,
   exportsDir,
+  mergeParamsAtomic,
   recordExport,
   rootModelPath,
   runParamExport,
@@ -51,7 +52,7 @@ import type {
 } from "@scadforge/scad-core";
 import type { ExportRecord } from "@scadforge/protocol";
 import { renderAndAttach } from "./scad-core-impl.js";
-import { planParamUpdate, readParams, readProject, readScad, type ServerRuntime } from "./runtime.js";
+import { planParamUpdate, readParams, readProject, readScad, stageSnapshotModel, type ServerRuntime } from "./runtime.js";
 import { exportFileUrl, renderFileUrl, snapshotMeshUrl, snapshotUrl } from "./urls.js";
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */
@@ -120,14 +121,22 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // a rejected write that is never persisted leaves the model unable to
       // read back what it just tried, and the syntax check is a full container
       // round trip that must not gate durability.
-      const params = await readParams(dir);
-      const snapshot = await createSnapshot(dir, {
-        content: request.content,
-        params,
-        message: request.message,
-        origin: "agent",
-        pass: request.pass
-      });
+      //
+      // Params are carried forward UNCHANGED (`accepted: {}`), but still go
+      // through `mergeParamsAtomic` (Issue #44): reading "current params" and
+      // writing them back into this snapshot must hold the SAME cross-process
+      // params lock every other params writer uses, or this content-only edit
+      // could still race a concurrent `set_params`/REST params update and
+      // silently regress its just-committed change.
+      const snapshot = await mergeParamsAtomic(dir, {}, (params) =>
+        createSnapshot(dir, {
+          content: request.content,
+          params,
+          message: request.message,
+          origin: "agent",
+          pass: request.pass
+        })
+      );
       options.onSnapshot?.(snapshot);
 
       const syntax_check = await runSyntaxCheck(rootModelPath(dir), { libraryPaths: runtime.libraryPaths });
@@ -135,25 +144,32 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
     },
 
     async setParams(params: ParamValues, pass: number): Promise<SetParamsOutcome> {
-      // Single code path (Issue #32): the exact same validation + merge the
-      // REST route uses (`scad-core-impl.ts`'s `updateParams`, both via
+      // Single code path (Issue #32): the exact same validation the REST
+      // route uses (`scad-core-impl.ts`'s `updateParams`, both via
       // `runtime.ts`'s `planParamUpdate`). The frozen `set_params` result
       // shape (`contract.ts`) has no per-value error field, so every
       // rejection — unknown name, wrong type, out of range — folds into
-      // `unknown_params`; only `plan.merged` (which already excludes them)
-      // is applied and snapshotted, never a silent coerce of a bad value.
+      // `unknown_params`; only `plan.accepted` (which already excludes them)
+      // is applied, never a silent coerce of a bad value.
       const plan = await planParamUpdate(dir, runtime, params);
       const unknown_params = plan.rejected.map((r) => r.name);
 
-      const snapshot = await createSnapshot(dir, {
-        content: await readScad(dir),
-        params: plan.merged,
-        message: `Set ${Object.keys(params).length - unknown_params.length} parameter(s)`,
-        origin: "manual",
-        pass
-      });
+      // `mergeParamsAtomic` (Issue #44) reads the CURRENT root `params.json`
+      // and creates the snapshot WHILE HOLDING the cross-process params lock,
+      // so this can never race a concurrent REST params update (or another
+      // `set_params`/`write_scad` call) merging a DISJOINT key onto the same
+      // file.
+      const snapshot = await mergeParamsAtomic(dir, plan.accepted, async (merged) =>
+        createSnapshot(dir, {
+          content: await readScad(dir),
+          params: merged,
+          message: `Set ${Object.keys(params).length - unknown_params.length} parameter(s)`,
+          origin: "manual",
+          pass
+        })
+      );
       options.onSnapshot?.(snapshot);
-      return { params: plan.merged, unknown_params, snapshot };
+      return { params: snapshot.params, unknown_params, snapshot };
     },
 
     async renderViews(request: AgentRenderRequest): Promise<RenderResult> {
@@ -166,54 +182,98 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
     },
 
     async validateMesh(request: AgentValidateRequest): Promise<ValidationResult> {
-      // Read the head BEFORE validating: `validateModel` renders the binary
-      // STL this snapshot's 3D preview will be served from, and it can only
-      // keep that render if it is told where to put it (Issue #41). Asking
-      // afterwards would mean the mesh had already gone with the work dir.
+      // Pin the target snapshot BEFORE running the (container round-trip,
+      // potentially slow) validation, and validate THAT snapshot's own
+      // persisted `model.scad`/`params.json` -- never `rootModelPath(dir)` /
+      // "whatever is head now" (Issue #45). A `write_scad` or `set_params`
+      // call that lands while this validation is still in flight moves
+      // `project.head` to a NEWER snapshot; re-reading head only at the end
+      // (the old code) would then attach a report describing stale content
+      // onto the wrong snapshot -- exactly the observed defect (a snapshot's
+      // manifest changing to a validation result that does not describe its
+      // own `model.scad`).
+      //
+      // An explicit `params` override is a hypothetical/preview validation
+      // ("what if these values?") that does NOT describe the target
+      // snapshot's own persisted state, so its result is returned but never
+      // written into history.
       const project = await readProject(dir);
-      const head = project.head;
+      const targetId = project.head;
+      const isPreview = request.params !== undefined;
 
-      const result = await validateModel(rootModelPath(dir), {
-        params: request.params,
-        gate: { allowMultiPart: request.allowMultiPart === true },
-        libraryPaths: runtime.libraryPaths,
-        // Adds `mesh.stl` to the snapshot directory and nothing else — no
-        // manifest field, no rewrite of any existing file (see the note in
-        // scad-core's `attachments.ts`).
-        persistMeshTo: head ? snapshotMeshPath(dir, head) : undefined
-      });
+      const staged = targetId && !isPreview ? await stageSnapshotModel(dir, targetId) : null;
+      let result: ValidationResult;
+      try {
+        result = await validateModel(staged?.scadPath ?? rootModelPath(dir), {
+          params: staged?.params ?? request.params,
+          gate: { allowMultiPart: request.allowMultiPart === true },
+          libraryPaths: runtime.libraryPaths,
+          // The validation mesh is also kept for the 3D viewer (Issue #41,
+          // reconciled with #45): `persistMeshTo` reuses THIS SAME render --
+          // never a second OpenSCAD pass -- at the PINNED snapshot's DERIVED
+          // mesh path (`snapshotMeshPath` now resolves to
+          // `derived/<id>/mesh.stl`, not `history/<id>/mesh.stl`: adding a
+          // file into an existing snapshot's `history/` directory still
+          // mutates that snapshot under the write-once rule, even though no
+          // pre-existing file changes -- the mesh is a derived artifact,
+          // recomputable from the snapshot's own model+params, exactly like
+          // a render or a validation report). Only for a real (non-preview)
+          // validation of a pinned snapshot -- a preview's mesh describes no
+          // snapshot's own content, so it is never persisted, matching the
+          // same rule the attach below follows.
+          persistMeshTo: targetId && !isPreview ? snapshotMeshPath(dir, targetId) : undefined
+        });
+      } finally {
+        await staged?.cleanup();
+      }
       lastValidation = result.report;
 
-      // Persist the verdict onto the snapshot it describes. Without this the
-      // report would live only in this turn's memory: the History badge, the
-      // `ExportResponse.validation` field and any later inspection of what a
-      // given revision actually measured would all be permanently null.
-      if (head) {
+      // Persist the verdict onto the PINNED snapshot -- never a snapshot id
+      // re-read after the (slow) work above, and never for a preview run with
+      // overridden params (it doesn't describe any snapshot's own content).
+      // Without this the report would live only in this turn's memory: the
+      // History badge, the `ExportResponse.validation` field and any later
+      // inspection of what a given revision actually measured would all be
+      // permanently null.
+      if (targetId && !isPreview) {
         // A validation run whose bookkeeping fails must not fail the tool —
         // the model still needs to see the report it just paid for.
-        await attachValidationToSnapshot(dir, head, result).catch(() => {});
+        await attachValidationToSnapshot(dir, targetId, result).catch(() => {});
       }
       return result;
     },
 
     async exportModel(request: AgentExportRequest): Promise<ExportRunResult> {
+      // Pin the head snapshot id BEFORE running the (slow) export, and --
+      // unless the caller passed an explicit `params` override -- export THAT
+      // PINNED snapshot's own staged `model.scad`/`params.json`, never
+      // `rootModelPath(dir)` (Issue #45's AC5: exporting must describe the
+      // snapshot it's recorded against, immune to a concurrent
+      // `write_scad`/`set_params` moving head mid-export).
       const project = await readProject(dir);
+      const snapshotId = project.head ?? "0000";
+      const isPreview = request.params !== undefined;
+      const staged = project.head && !isPreview ? await stageSnapshotModel(dir, project.head) : null;
       const outDir = exportsDir(dir);
-      const result = await exportRun(
-        {
-          scadPath: rootModelPath(dir),
-          outDir,
-          format: request.format,
-          params: request.params,
-          allowValidationFailure: request.allowValidationFailure === true
-        },
-        { libraryPaths: runtime.libraryPaths }
-      );
+      let result: ExportRunResult;
+      try {
+        result = await exportRun(
+          {
+            scadPath: staged?.scadPath ?? rootModelPath(dir),
+            outDir,
+            format: request.format,
+            params: staged ? staged.params : request.params,
+            allowValidationFailure: request.allowValidationFailure === true
+          },
+          { libraryPaths: runtime.libraryPaths }
+        );
+      } finally {
+        await staged?.cleanup();
+      }
       if (!result.ok || !result.path) return result;
 
       // Same stable naming and ledger entry the REST export produces, so an
       // agent-driven export and a UI-driven one are indistinguishable on disk.
-      const snapshotId = project.head ?? "0000";
       const file = `${project.id}-${snapshotId}.${result.format}`;
       const finalPath = join(outDir, file);
       await rename(result.path, finalPath);
@@ -243,32 +303,39 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
         case "snapshot":
           return snapshotUrl(projectId, ref);
         case "render": {
-          // `ref` is the PNG's absolute path inside the snapshot's `views/`
-          // directory (renderAndAttach re-points it there). Recover the
-          // snapshot id and the view from the layout rather than threading
-          // them through the tool-result plumbing.
+          // `ref` is the PNG's absolute path inside the snapshot's rendered
+          // views (`renderAndAttach` re-points it there via
+          // `snapshotRenderPath`). That physically lives under
+          // `.scadforge/derived/<id>/views/` (Issue #45: a render attached
+          // after creation is never written into `history/<id>/views/`, so
+          // that directory stays immutable) -- recognize either segment name
+          // so this keeps working regardless of which tree the path is under.
           const rel = relative(dir, ref).split(/[\\/]/);
-          const historyIndex = rel.indexOf("history");
+          const rootIndex = Math.max(rel.indexOf("history"), rel.indexOf("derived"));
           const view = basename(ref, ".png") as ViewName;
-          if (historyIndex === -1 || rel.length <= historyIndex + 1) return null;
-          return renderFileUrl(projectId, rel[historyIndex + 1], view);
+          if (rootIndex === -1 || rel.length <= rootIndex + 1) return null;
+          return renderFileUrl(projectId, rel[rootIndex + 1], view);
         }
         case "export":
           return exportFileUrl(projectId, basename(ref));
         case "mesh": {
           // Since Issue #41 a validation mesh CAN be durable: `validateMesh`
-          // above asks `validateModel` to keep it at the head snapshot's
-          // `mesh.stl`. Recover the snapshot id from the layout exactly as
-          // the `render` case does.
+          // above asks `validateModel` to keep it at the pinned snapshot's
+          // mesh path -- `.scadforge/derived/<id>/mesh.stl` (Issue #45: never
+          // `history/<id>/mesh.stl`, which would mutate an existing
+          // snapshot's directory) -- with a read-time fallback to the
+          // `history/<id>/mesh.stl` a pre-reconciliation (#50) validation may
+          // have left. Recover the snapshot id from the layout exactly as the
+          // `render` case does, recognizing either segment name.
           //
           // A mesh still living in a temp work dir (any path outside this
-          // project's `history/`) remains unservable and returns null — the
-          // honest answer, and the reason this is a path check rather than an
-          // unconditional URL.
+          // project's `history/`/`derived/`) remains unservable and returns
+          // null — the honest answer, and the reason this is a path check
+          // rather than an unconditional URL.
           const rel = relative(dir, ref).split(/[\\/]/);
-          const historyIndex = rel.indexOf("history");
-          if (historyIndex === -1 || rel.length <= historyIndex + 1) return null;
-          return snapshotMeshUrl(projectId, rel[historyIndex + 1]);
+          const rootIndex = Math.max(rel.indexOf("history"), rel.indexOf("derived"));
+          if (rootIndex === -1 || rel.length <= rootIndex + 1) return null;
+          return snapshotMeshUrl(projectId, rel[rootIndex + 1]);
         }
       }
     },

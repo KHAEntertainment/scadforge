@@ -1,5 +1,6 @@
 // @scadforge/scad-core — attaching DERIVED artifacts (rendered PNGs, a
-// validation report) to an EXISTING snapshot.
+// validation report) to an EXISTING snapshot, WITHOUT ever rewriting that
+// snapshot's own immutable files (Issue #45).
 //
 // GLUE (Issue #20). `createSnapshot` can take renders and a validation report
 // at creation time, but the real flow does not work that way: `write_scad`
@@ -13,27 +14,51 @@
 // would have no badge and no thumbnails, and `ExportResponse.validation` would
 // always be null.
 //
-// ── Why this does NOT break append-only history ─────────────────────────────
+// ── Issue #45 (was): this used to write directly into
+// `history/<id>/manifest.json` / `validation.json` / `views/*.png` — i.e.
+// rewrite a historical snapshot's own files after creation. That IS a
+// history rewrite, full stop: it is exactly how a snapshot's recorded
+// validation was observed changing ~7 minutes after the snapshot was
+// created, for a `model.scad` that never changed. The prior header comment's
+// argument ("re-rendering/re-validating the same source reproduces the same
+// result, so this isn't really a rewrite") does not hold once the caller —
+// racing against a concurrent `write_scad`, or simply validating with
+// different params — is no longer guaranteed to be looking at THIS
+// snapshot's own persisted `model.scad`/`params.json`. See
+// `apps/server/src/services/agent-scad-core.ts` and `scad-core-impl.ts` for
+// the corresponding fix (pin the target snapshot id and read ITS OWN files
+// BEFORE running OpenSCAD, never the project's current root state).
 //
-// `protocol/snapshot.ts`'s append-only rule is about the MODEL timeline: a
-// snapshot's `model.scad`, `params.json`, `diff.patch`, `parent` and `id` are
-// immutable, and a revert copies forward rather than rewriting. Renders and
-// validation are derived FACTS ABOUT that source, not history: re-rendering or
-// re-validating `0002` with the pinned image reproduces the same result (Spike
-// 2 verified render determinism), so attaching them later cannot change what
-// the snapshot means. These functions only ever add/replace `manifest.renders`
-// / `manifest.validation` and files under the snapshot's `views/` directory or
-// its `validation.json`; they touch no other manifest field and no other file.
+// ── The fix: `history/<id>/` is now write-once ───────────────────────────
+//
+// These functions no longer touch `history/<id>/manifest.json`,
+// `validation.json` or `views/*.png` at all. They write into a SIBLING,
+// non-frozen tree instead: `.scadforge/derived/<id>/` (see `derived.ts`).
+// `store.ts`'s `readSnapshotManifest` merges that enrichment into the
+// `SnapshotManifest` it returns, so every consumer still sees `.renders` /
+// `.validation` populated — the wire shape is unchanged, only where the bytes
+// physically live. `history/<id>/` is therefore checksummable and provably
+// unchanged for the lifetime of the project (see `attachments.test.ts` and
+// `store.test.ts`'s byte-identical regression tests).
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { PROJECT_LAYOUT } from "@scadforge/protocol";
 import type { RenderRef, SnapshotId, SnapshotManifest } from "@scadforge/protocol";
 import type { ValidationResult, ViewName } from "../types.js";
 import { withTypedError } from "../errors.js";
 import { snapshotDir } from "./paths.js";
+import {
+  readDerivedEnrichment,
+  snapshotDerivedDir,
+  snapshotDerivedRenderPath,
+  snapshotDerivedValidationReportPath,
+  snapshotDerivedViewsDir,
+  writeDerivedRenders,
+  writeDerivedValidation
+} from "./derived.js";
 
 /** One rendered PNG to attach. */
 export interface RenderAttachment {
@@ -55,21 +80,96 @@ export interface AttachRendersOptions {
   buildRenderUrl?: (snapshotId: SnapshotId, view: ViewName, file: string) => string;
 }
 
-/** Path of a snapshot's PNG for one view — the canonical `views/<view>.png` convention. */
+/**
+ * Physical path of a snapshot's PNG for one view — the DERIVED (post-creation
+ * attach) location. A snapshot's `history/<id>/views/` stays whatever it was
+ * at creation (normally empty; see the header comment) and is never the
+ * target of a later render attach.
+ *
+ * This is the WRITE-time / just-attached location, used by
+ * `attachRendersToSnapshot` itself and by callers re-pointing at a render
+ * they just attached in this same call (guaranteed to exist there). For
+ * READING a render that might pre-date this fix, use
+ * {@link resolveSnapshotRenderPath} instead.
+ */
 export function snapshotRenderPath(projectDir: string, snapshotId: SnapshotId, view: ViewName): string {
+  return snapshotDerivedRenderPath(projectDir, snapshotId, view);
+}
+
+/** The snapshot's derived `views/` directory — where `attachRendersToSnapshot` copies PNGs. */
+export function snapshotViewsDir(projectDir: string, snapshotId: SnapshotId): string {
+  return snapshotDerivedViewsDir(projectDir, snapshotId);
+}
+
+/** History (creation-time) path for a snapshot's rendered PNG. Populated for a LEGACY snapshot whose renders were attached by the pre-Issue-#45 code directly into `history/<id>/views/`, or for the rare snapshot created with `CreateSnapshotInput.renders` already supplied. */
+function snapshotHistoryRenderPath(projectDir: string, snapshotId: SnapshotId, view: ViewName): string {
   return join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.viewsDir, `${view}.png`);
 }
 
-/** The snapshot's `views/` directory. */
-export function snapshotViewsDir(projectDir: string, snapshotId: SnapshotId): string {
-  return join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.viewsDir);
+/** History (creation-time) path for a snapshot's persisted `ValidationReport`. See {@link snapshotHistoryRenderPath}. */
+function snapshotHistoryValidationPath(projectDir: string, snapshotId: SnapshotId): string {
+  return join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.validationFile);
+}
+
+async function existsFile(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Copies `attachments` into `snapshotId`'s `views/` directory and upserts the
- * matching {@link RenderRef} entries into its manifest, keyed by view (a
- * re-render of an already-attached view replaces that view's entry rather than
- * duplicating it). Returns the updated manifest.
+ * Resolves the PHYSICAL path to READ a snapshot's rendered PNG for `view`
+ * from — the DERIVED (post-Issue-#45) location if present, else falling back
+ * to `history/<id>/views/<view>.png` for a project that predates this fix
+ * (whose renders the pre-fix code attached directly into `history/`).
+ * Read-only: never writes, never migrates the legacy file forward, so an
+ * existing project's on-disk layout is untouched either way. Returns `null`
+ * when the render exists in neither location.
+ */
+export async function resolveSnapshotRenderPath(
+  projectDir: string,
+  snapshotId: SnapshotId,
+  view: ViewName
+): Promise<string | null> {
+  const derived = snapshotDerivedRenderPath(projectDir, snapshotId, view);
+  if (await existsFile(derived)) return derived;
+  const legacy = snapshotHistoryRenderPath(projectDir, snapshotId, view);
+  if (await existsFile(legacy)) return legacy;
+  return null;
+}
+
+/** Same read-time fallback as {@link resolveSnapshotRenderPath}, for a snapshot's persisted `ValidationReport` bytes. */
+export async function resolveSnapshotValidationPath(
+  projectDir: string,
+  snapshotId: SnapshotId
+): Promise<string | null> {
+  const derived = snapshotDerivedValidationReportPath(projectDir, snapshotId);
+  if (await existsFile(derived)) return derived;
+  const legacy = snapshotHistoryValidationPath(projectDir, snapshotId);
+  if (await existsFile(legacy)) return legacy;
+  return null;
+}
+
+/** Reads a snapshot's raw (immutable) manifest without going through `store.ts`'s derived-merge, to avoid a circular import. */
+async function readRawManifest(projectDir: string, snapshotId: SnapshotId): Promise<SnapshotManifest> {
+  const manifestPath = join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.manifestFile);
+  const raw = await readFile(manifestPath, "utf8").catch(() => {
+    throw new Error(`snapshot '${snapshotId}' not found`);
+  });
+  return JSON.parse(raw) as SnapshotManifest;
+}
+
+/**
+ * Copies `attachments` into `snapshotId`'s DERIVED `views/` directory
+ * (`.scadforge/derived/<id>/views/`, never `history/<id>/views/`) and upserts
+ * the matching {@link RenderRef} entries into its derived render index, keyed
+ * by view (a re-render of an already-attached view replaces that view's entry
+ * rather than duplicating it). Returns the snapshot's manifest with this
+ * enrichment merged in. `history/<id>/manifest.json` is never opened for
+ * writing by this function.
  *
  * Rejects only with a typed `ScadForgeError`.
  */
@@ -81,16 +181,16 @@ export async function attachRendersToSnapshot(
 ): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const dir = snapshotDir(projectDir, snapshotId);
-      const manifestPath = join(dir, PROJECT_LAYOUT.snapshot.manifestFile);
-      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as SnapshotManifest;
+      const manifest = await readRawManifest(projectDir, snapshotId);
 
-      await mkdir(snapshotViewsDir(projectDir, snapshotId), { recursive: true });
+      const viewsDir = snapshotDerivedViewsDir(projectDir, snapshotId);
+      await mkdir(viewsDir, { recursive: true });
 
-      const byView = new Map<string, RenderRef>(manifest.renders.map((r) => [r.view, r]));
+      const existing = await readDerivedEnrichment(projectDir, snapshotId);
+      const byView = new Map<string, RenderRef>((existing.renders ?? manifest.renders).map((r) => [r.view, r]));
       for (const attachment of attachments) {
         const file = `${PROJECT_LAYOUT.snapshot.viewsDir}/${attachment.view}.png`;
-        const dest = join(dir, file);
+        const dest = snapshotDerivedRenderPath(projectDir, snapshotId, attachment.view);
         if (attachment.sourcePath !== dest) await copyFile(attachment.sourcePath, dest);
         const { size } = await stat(dest);
         byView.set(attachment.view, {
@@ -104,8 +204,10 @@ export async function attachRendersToSnapshot(
         });
       }
 
-      manifest.renders = [...byView.values()];
-      await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+      const renders = [...byView.values()];
+      await writeDerivedRenders(projectDir, snapshotId, renders);
+
+      manifest.renders = renders;
       return manifest;
     },
     "SNAPSHOT_NOT_FOUND",
@@ -114,15 +216,13 @@ export async function attachRendersToSnapshot(
 }
 
 /**
- * Persists a {@link ValidationResult} onto `snapshotId`: writes the full
- * `ValidationReport` verbatim to the snapshot's `validation.json` (the
- * authoritative record — Spike 4's contract) and updates the manifest's
- * lightweight {@link ValidationSummary} plus its `files.validation_json`
- * pointer, which is what the History list renders a badge from.
- *
- * Mirrors exactly what `createSnapshot` writes for its own `validation`
- * input, so a snapshot validated at creation and one validated afterwards are
- * indistinguishable on disk.
+ * Persists a {@link ValidationResult} for `snapshotId`: writes the full
+ * `ValidationReport` verbatim to `.scadforge/derived/<id>/validation.json`
+ * (never `history/<id>/validation.json`) and a {@link ValidationSummary} the
+ * History list renders a badge from. Returns the snapshot's manifest with
+ * this enrichment merged in. `history/<id>/manifest.json` and
+ * `history/<id>/validation.json` are never opened for writing by this
+ * function.
  *
  * Rejects only with a typed `ScadForgeError`.
  */
@@ -133,25 +233,24 @@ export async function attachValidationToSnapshot(
 ): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const dir = snapshotDir(projectDir, snapshotId);
-      const manifestPath = join(dir, PROJECT_LAYOUT.snapshot.manifestFile);
-      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as SnapshotManifest;
+      const manifest = await readRawManifest(projectDir, snapshotId);
 
-      await writeFile(
-        join(dir, PROJECT_LAYOUT.snapshot.validationFile),
-        JSON.stringify(validation.report, null, 2),
-        "utf8"
-      );
-
-      manifest.files.validation_json = PROJECT_LAYOUT.snapshot.validationFile;
-      manifest.validation = {
+      const summary = {
         badge: validation.gate.badge,
         manifold: validation.report.manifold,
         components: validation.report.components,
         volume_mm3: validation.report.volume_mm3,
         warning_count: validation.gate.warnings.length
       };
-      await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+      await writeDerivedValidation(projectDir, snapshotId, validation.report, summary);
+
+      // `files.validation_json` is a logical pointer (SDP §8): nothing joins
+      // it against `snapshotDir` to physically locate the file (that's what
+      // `snapshotValidationPath` is for, and it now resolves to the derived
+      // location) so recording the frozen file-name convention here is still
+      // accurate for readers that only care "was there ever a validation".
+      manifest.files = { ...manifest.files, validation_json: PROJECT_LAYOUT.snapshot.validationFile };
+      manifest.validation = summary;
       return manifest;
     },
     "SNAPSHOT_NOT_FOUND",
@@ -159,29 +258,75 @@ export async function attachValidationToSnapshot(
   );
 }
 
-/** Absolute path of a snapshot's persisted `ValidationReport`. */
+/**
+ * Absolute path of a snapshot's persisted `ValidationReport` — the DERIVED
+ * (post-creation attach) location. This is the WRITE-time location; for
+ * READING a validation report that might pre-date this fix, use
+ * {@link resolveSnapshotValidationPath} instead.
+ */
 export function snapshotValidationPath(projectDir: string, snapshotId: SnapshotId): string {
-  return join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.validationFile);
+  return snapshotDerivedValidationReportPath(projectDir, snapshotId);
 }
 
-// ── the snapshot mesh (ScadForge Issue #41) ──────────────────────────────────
+// ── the snapshot mesh (ScadForge Issue #41, reconciled with Issue #45) ───────
 //
 // `PROJECT_LAYOUT.snapshot` is part of the FROZEN contract and has no `mesh`
 // entry, so the file name lives here rather than being smuggled into
-// protocol. Two consequences, both deliberate:
+// protocol.
 //
 //   1. `SnapshotManifest` gains NO mesh field — a snapshot's mesh is
 //      discovered by its presence at this well-known path, not by a manifest
-//      pointer. Persisting a mesh therefore writes exactly one NEW file and
-//      rewrites nothing, which is what keeps it clear of Issue #45 (a
-//      re-validation path rewriting historical manifests).
+//      pointer.
 //   2. A snapshot legitimately may have no mesh (nothing ever validated it).
 //      Callers must treat "absent" as normal, not as an error.
+//
+// Issue #41's original merge (PR #50) persisted the mesh at
+// `history/<id>/mesh.stl` — its own reasoning was "this adds exactly one NEW
+// file and rewrites nothing, so it's clear of #45". That reasoning does not
+// hold: adding a file into an existing snapshot's `history/` directory still
+// MUTATES that directory (its own regression test's own `history/`
+// byte-for-byte comparisons would have needed to special-case `mesh.stl`
+// forever, which is exactly the kind of exception #45's write-once rule
+// forbids). It also rendered `rootModelPath(dir)` — the project's CURRENT
+// root — rather than the target snapshot's own persisted content, recreating
+// #45's exact defect for meshes (a snapshot's served geometry silently
+// drifting from what it actually contains). Reconciled here alongside #45:
+// the mesh is a DERIVED artifact (recomputable from the snapshot's own model
+// + params, exactly like a render or a validation report) and now lives in
+// the SAME sibling `.scadforge/derived/<id>/` tree, keyed off the snapshot id
+// that was pinned and staged BEFORE validating (see
+// `apps/server/src/services/agent-scad-core.ts`'s `validateMesh`).
 
-/** File name of a snapshot's persisted binary STL, inside its snapshot directory. */
+/** File name of a snapshot's persisted binary STL, inside its DERIVED directory. */
 export const SNAPSHOT_MESH_FILE = "mesh.stl";
 
-/** Absolute path of a snapshot's persisted binary STL (may not exist — see above). */
+/**
+ * Absolute path to WRITE (or read a just-persisted) snapshot's binary STL —
+ * the DERIVED location (may not exist — see the header comment). For READING
+ * a mesh that might pre-date this reconciliation (persisted by #50 directly
+ * into `history/<id>/mesh.stl`), use {@link resolveSnapshotMeshPath} instead.
+ */
 export function snapshotMeshPath(projectDir: string, snapshotId: SnapshotId): string {
+  return join(snapshotDerivedDir(projectDir, snapshotId), SNAPSHOT_MESH_FILE);
+}
+
+/** History (pre-reconciliation) path for a snapshot's persisted binary STL. See {@link snapshotHistoryRenderPath}. */
+function snapshotHistoryMeshPath(projectDir: string, snapshotId: SnapshotId): string {
   return join(snapshotDir(projectDir, snapshotId), SNAPSHOT_MESH_FILE);
+}
+
+/**
+ * Resolves the PHYSICAL path to READ a snapshot's persisted binary STL from —
+ * the DERIVED location if present, else falling back to
+ * `history/<id>/mesh.stl` for a snapshot validated between #50's merge and
+ * this reconciliation landing. Read-only: never writes, never migrates the
+ * legacy file. Returns `null` when the mesh exists in neither location (the
+ * ordinary case for a snapshot nothing has validated).
+ */
+export async function resolveSnapshotMeshPath(projectDir: string, snapshotId: SnapshotId): Promise<string | null> {
+  const derived = snapshotMeshPath(projectDir, snapshotId);
+  if (await existsFile(derived)) return derived;
+  const legacy = snapshotHistoryMeshPath(projectDir, snapshotId);
+  if (await existsFile(legacy)) return legacy;
+  return null;
 }

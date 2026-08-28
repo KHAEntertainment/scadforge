@@ -73,6 +73,8 @@ import {
   rootParamsPath,
   snapshotDir
 } from "./paths.js";
+import { readDerivedEnrichment } from "./derived.js";
+import { withParamsLock } from "./params-lock.js";
 
 // ── ProjectManifest (project.json) ──────────────────────────────────────────
 
@@ -378,7 +380,33 @@ export async function readSnapshotManifest(projectDir: string, id: SnapshotId): 
           });
         }
       );
-      return JSON.parse(raw) as SnapshotManifest;
+      const manifest = JSON.parse(raw) as SnapshotManifest;
+
+      // `history/<id>/manifest.json` itself is written exactly once, at
+      // creation, and never opened for writing again (Issue #45). Renders and
+      // validation attached AFTER creation live in the sibling `derived/<id>/`
+      // tree (`attachments.ts`) and are merged in here, in memory, so every
+      // caller still sees `.renders` / `.validation` populated -- the on-disk
+      // history is what's actually immutable, not the shape callers see.
+      //
+      // LEGACY PROJECTS (predate this fix): the pre-fix code wrote renders/
+      // validation directly into `manifest.json` itself, so `manifest` (just
+      // parsed above) ALREADY carries them for such a snapshot. There is no
+      // `derived/<id>/` tree for it, so `readDerivedEnrichment` returns both
+      // fields `null` and the `if` guards below leave the legacy data in
+      // `manifest.renders`/`manifest.validation` completely untouched --
+      // manifest-level reads need no fallback. Only the PHYSICAL BYTES (the
+      // PNG/`validation.json` a render/validation entry points at) can still
+      // be missing from `derived/`, which is what `resolveSnapshotRenderPath`
+      // / `resolveSnapshotValidationPath` (`attachments.ts`) fall back to
+      // `history/<id>/` for.
+      const derived = await readDerivedEnrichment(projectDir, id);
+      if (derived.renders !== null) manifest.renders = derived.renders;
+      if (derived.validation !== null) {
+        manifest.validation = derived.validation;
+        manifest.files = { ...manifest.files, validation_json: PROJECT_LAYOUT.snapshot.validationFile };
+      }
+      return manifest;
     },
     "SNAPSHOT_NOT_FOUND",
     `failed to read snapshot '${id}'`
@@ -415,6 +443,14 @@ export async function listSnapshots(projectDir: string): Promise<SnapshotManifes
  * BRAND NEW snapshot (origin `'revert'`), parented on the CURRENT head — never
  * rewrites or removes `targetId` or any snapshot in between (append-only,
  * protocol/snapshot.ts header comment).
+ *
+ * A revert REPLACES root `params.json` wholesale with `targetId`'s own full
+ * bag (never a merge onto "current" — that's what makes it a revert), so it
+ * cannot go through `mergeParamsAtomic` (whose whole point is merging new
+ * values ONTO current). It still needs the SAME params lock (Issue #44): a
+ * revert's `createSnapshot` call also writes root `params.json`/`model.scad`/
+ * `project.json`, and without the lock it could interleave with a concurrent
+ * `set_params`/params-update's own read-merge-write of the same files.
  */
 export async function revertToSnapshot(projectDir: string, targetId: SnapshotId): Promise<SnapshotManifest> {
   return withTypedError(
@@ -428,13 +464,15 @@ export async function revertToSnapshot(projectDir: string, targetId: SnapshotId)
       const paramsFile = JSON.parse(paramsRaw) as ParamsFile;
       const params = (paramsFile.parameterSets[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
 
-      return createSnapshot(projectDir, {
-        content: modelContent,
-        params,
-        message: `Revert to ${targetId}`,
-        origin: "revert",
-        pass: null
-      });
+      return withParamsLock(projectDir, () =>
+        createSnapshot(projectDir, {
+          content: modelContent,
+          params,
+          message: `Revert to ${targetId}`,
+          origin: "revert",
+          pass: null
+        })
+      );
     },
     "SNAPSHOT_NOT_FOUND",
     `failed to revert to snapshot '${targetId}'`
@@ -459,6 +497,54 @@ export async function recordExport(projectDir: string, record: ExportRecord): Pr
     },
     "INTERNAL_ERROR",
     "failed to record export"
+  );
+}
+
+// ── params.json read-merge-write (Issue #44) ────────────────────────────────
+
+async function readRootParamsOrEmpty(projectDir: string): Promise<ParamValues> {
+  try {
+    const parsed = JSON.parse(await readFile(rootParamsPath(projectDir), "utf8")) as ParamsFile;
+    return (parsed.parameterSets?.[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * THE single choke point for every writer that needs to merge new values onto
+ * the CURRENT root `params.json` — a standalone params-only update
+ * (`snapshot:false`), a `set_params`-driven snapshot, or a plain `write_scad`
+ * carrying params forward unchanged (`accepted: {}`). Acquires the params
+ * lock (`params-lock.ts`), reads the CURRENT persisted values, computes
+ * `merged = {...current, ...accepted}`, and calls `persist(merged)` — all
+ * while still holding the lock, so `persist`'s own writes (whether
+ * `createSnapshot`, which also touches root `params.json`/`model.scad`/
+ * `project.json`, or a bare params-only write) can never race a concurrent
+ * caller's read-merge-write of the SAME file (Issue #44: two updates to
+ * DISJOINT keys must both survive, never a last-write-wins lost update).
+ *
+ * `persist` must not itself call `mergeParamsAtomic`/acquire the params lock
+ * (the lock is not reentrant) — pass it the pre-fetched Customizer schema
+ * validation result (`accepted`/`rejected`) computed BEFORE calling this, so
+ * the only work done while holding the lock is filesystem I/O (keeps lock
+ * hold time short — rapid successive writes, e.g. a slider drag, must not
+ * degrade per Issue #44's AC).
+ */
+export async function mergeParamsAtomic<T>(
+  projectDir: string,
+  accepted: ParamValues,
+  persist: (merged: ParamValues) => Promise<T>
+): Promise<T> {
+  return withTypedError(
+    () =>
+      withParamsLock(projectDir, async () => {
+        const current = await readRootParamsOrEmpty(projectDir);
+        const merged = { ...current, ...accepted };
+        return persist(merged);
+      }),
+    "INTERNAL_ERROR",
+    "failed to update params"
   );
 }
 
