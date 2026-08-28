@@ -21,7 +21,10 @@ import type {
   ListProjectsResponse,
   ListSnapshotsResponse,
   ProjectResponse,
-  CreateProjectRequest
+  CreateProjectRequest,
+  RevertRequest,
+  SnapshotDiffResponse,
+  SnapshotResponse
 } from "@scadforge/protocol";
 
 /** Thrown for any non-2xx response. Carries the frozen `{error_code, message}` body. */
@@ -153,6 +156,29 @@ export function createApiClient(options: ApiClientOptions = {}) {
     listSnapshots(projectId: string): Promise<ListSnapshotsResponse> {
       return request<ListSnapshotsResponse>(
         fillRoute(API_ROUTES.snapshots.list, { projectId })
+      );
+    },
+
+    /** `GET /snapshots/:snapshotId/diff` — empty string for the first snapshot (frozen contract). */
+    getSnapshotDiff(projectId: string, snapshotId: string): Promise<SnapshotDiffResponse> {
+      return request<SnapshotDiffResponse>(
+        fillRoute(API_ROUTES.snapshots.diff, { projectId, snapshotId })
+      );
+    },
+
+    /**
+     * `POST /snapshots/:snapshotId/revert` — history is append-only: this
+     * creates a NEW snapshot carrying `snapshotId`'s content forward. Throws
+     * `ApiClientError` with `error_code: "CONFLICT"` (409) under write
+     * contention (M1 store concurrency policy) — never a silent overwrite.
+     */
+    revertSnapshot(projectId: string, snapshotId: string, body: RevertRequest = {}): Promise<SnapshotResponse> {
+      return request<SnapshotResponse>(
+        fillRoute(API_ROUTES.snapshots.revert, { projectId, snapshotId }),
+        {
+          method: "POST",
+          body: JSON.stringify(body)
+        }
       );
     },
 

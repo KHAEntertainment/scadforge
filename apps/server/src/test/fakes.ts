@@ -136,6 +136,13 @@ export function createFakeScadCoreApi(): ScadCoreApi & { _projects: Map<string, 
 
     async revertSnapshot(projectId: string, snapshotId: string, request: RevertRequest): Promise<SnapshotResponse> {
       const { project, snapshot } = requireSnapshot(projectId, snapshotId);
+      // Test-only escape hatch (mirrors runExport's `__forceValidationFailure`
+      // above): lets a route test exercise the M1 store concurrency policy's
+      // typed CONFLICT -> 409 mapping for revert without needing real
+      // cross-process filesystem contention.
+      if (request.message === "__forceConflict__") {
+        throw new RouteError("CONFLICT", "could not allocate a snapshot id (fake: forced conflict).");
+      }
       const newId = padSnapshotId(project.snapshots.length + 1);
       const reverted: SnapshotManifest = {
         ...snapshot,
