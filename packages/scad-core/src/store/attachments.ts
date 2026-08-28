@@ -52,6 +52,7 @@ import { withTypedError } from "../errors.js";
 import { snapshotDir } from "./paths.js";
 import {
   readDerivedEnrichment,
+  snapshotDerivedDir,
   snapshotDerivedRenderPath,
   snapshotDerivedValidationReportPath,
   snapshotDerivedViewsDir,
@@ -265,4 +266,67 @@ export async function attachValidationToSnapshot(
  */
 export function snapshotValidationPath(projectDir: string, snapshotId: SnapshotId): string {
   return snapshotDerivedValidationReportPath(projectDir, snapshotId);
+}
+
+// ── the snapshot mesh (ScadForge Issue #41, reconciled with Issue #45) ───────
+//
+// `PROJECT_LAYOUT.snapshot` is part of the FROZEN contract and has no `mesh`
+// entry, so the file name lives here rather than being smuggled into
+// protocol.
+//
+//   1. `SnapshotManifest` gains NO mesh field — a snapshot's mesh is
+//      discovered by its presence at this well-known path, not by a manifest
+//      pointer.
+//   2. A snapshot legitimately may have no mesh (nothing ever validated it).
+//      Callers must treat "absent" as normal, not as an error.
+//
+// Issue #41's original merge (PR #50) persisted the mesh at
+// `history/<id>/mesh.stl` — its own reasoning was "this adds exactly one NEW
+// file and rewrites nothing, so it's clear of #45". That reasoning does not
+// hold: adding a file into an existing snapshot's `history/` directory still
+// MUTATES that directory (its own regression test's own `history/`
+// byte-for-byte comparisons would have needed to special-case `mesh.stl`
+// forever, which is exactly the kind of exception #45's write-once rule
+// forbids). It also rendered `rootModelPath(dir)` — the project's CURRENT
+// root — rather than the target snapshot's own persisted content, recreating
+// #45's exact defect for meshes (a snapshot's served geometry silently
+// drifting from what it actually contains). Reconciled here alongside #45:
+// the mesh is a DERIVED artifact (recomputable from the snapshot's own model
+// + params, exactly like a render or a validation report) and now lives in
+// the SAME sibling `.scadforge/derived/<id>/` tree, keyed off the snapshot id
+// that was pinned and staged BEFORE validating (see
+// `apps/server/src/services/agent-scad-core.ts`'s `validateMesh`).
+
+/** File name of a snapshot's persisted binary STL, inside its DERIVED directory. */
+export const SNAPSHOT_MESH_FILE = "mesh.stl";
+
+/**
+ * Absolute path to WRITE (or read a just-persisted) snapshot's binary STL —
+ * the DERIVED location (may not exist — see the header comment). For READING
+ * a mesh that might pre-date this reconciliation (persisted by #50 directly
+ * into `history/<id>/mesh.stl`), use {@link resolveSnapshotMeshPath} instead.
+ */
+export function snapshotMeshPath(projectDir: string, snapshotId: SnapshotId): string {
+  return join(snapshotDerivedDir(projectDir, snapshotId), SNAPSHOT_MESH_FILE);
+}
+
+/** History (pre-reconciliation) path for a snapshot's persisted binary STL. See {@link snapshotHistoryRenderPath}. */
+function snapshotHistoryMeshPath(projectDir: string, snapshotId: SnapshotId): string {
+  return join(snapshotDir(projectDir, snapshotId), SNAPSHOT_MESH_FILE);
+}
+
+/**
+ * Resolves the PHYSICAL path to READ a snapshot's persisted binary STL from —
+ * the DERIVED location if present, else falling back to
+ * `history/<id>/mesh.stl` for a snapshot validated between #50's merge and
+ * this reconciliation landing. Read-only: never writes, never migrates the
+ * legacy file. Returns `null` when the mesh exists in neither location (the
+ * ordinary case for a snapshot nothing has validated).
+ */
+export async function resolveSnapshotMeshPath(projectDir: string, snapshotId: SnapshotId): Promise<string | null> {
+  const derived = snapshotMeshPath(projectDir, snapshotId);
+  if (await existsFile(derived)) return derived;
+  const legacy = snapshotHistoryMeshPath(projectDir, snapshotId);
+  if (await existsFile(legacy)) return legacy;
+  return null;
 }

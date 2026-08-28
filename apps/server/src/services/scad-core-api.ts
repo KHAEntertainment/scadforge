@@ -59,6 +59,14 @@ export interface ScadCoreApi {
   revertSnapshot(projectId: string, snapshotId: string, request: RevertRequest): Promise<SnapshotResponse>;
   /** Returns `null` when the project, snapshot, or view file does not exist. */
   getSnapshotRenderFile(projectId: string, snapshotId: string, view: string): Promise<RenderFile | null>;
+  /**
+   * The snapshot's persisted binary STL, for the three.js viewer (Issue #41).
+   *
+   * Returns `null` when the project or snapshot does not exist AND when the
+   * snapshot simply has no mesh — a snapshot that was never validated has
+   * none, and that is an ordinary state, not a failure.
+   */
+  getSnapshotMeshFile(projectId: string, snapshotId: string): Promise<RenderFile | null>;
 
   // ── params ───────────────────────────────────────────────────────────────
   //

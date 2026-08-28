@@ -22,7 +22,7 @@ import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PROJECT_LAYOUT } from "@scadforge/protocol";
 import type { SnapshotManifest } from "@scadforge/protocol";
-import { initProject, readSnapshotManifest, snapshotDir } from "@scadforge/scad-core";
+import { initProject, parseStl, readSnapshotManifest, snapshotDir } from "@scadforge/scad-core";
 import { createAgentScadCore } from "./agent-scad-core.js";
 import { createScadCoreApi } from "./scad-core-impl.js";
 import { createServerRuntime } from "./runtime.js";
@@ -277,5 +277,64 @@ describe.skipIf(!dockerAvailable())("@docker Issue #45: snapshots are immutable 
     const freshFile = await rest.getSnapshotRenderFile("bracket", "0001", "front"); // new, from derived/
     expect(freshFile).not.toBeNull();
     expect(freshFile!.bytes).toBeGreaterThan(0);
+  }, 60_000);
+
+  // ── Mesh persistence, reconciled with Issue #41 (PR #50) ─────────────────
+  //
+  // #50 persisted the validation mesh at `history/<id>/mesh.stl`, rendered
+  // from `rootModelPath(dir)` -- the exact #45 defect, re-created for meshes.
+  // Reconciled: the mesh is a DERIVED artifact (`derived/<id>/mesh.stl`),
+  // rendered from the PINNED snapshot's own staged model/params, in the SAME
+  // container invocation `validate_mesh` already pays for (no second render).
+
+  it("the persisted mesh reflects the HEAD SNAPSHOT'S OWN geometry after an unsnapshotted params divergence, and history/ stays byte-identical", async () => {
+    const { runtime, dir } = await seedProject(); // snapshot 0001: params {} -> the .scad source's own literal default, size=20
+    const rest = createScadCoreApi(runtime);
+    const agentCore = createAgentScadCore({ runtime, projectId: "bracket" });
+
+    // Diverge the CURRENT root params from 0001's own (still `{}`) WITHOUT
+    // creating a new snapshot -- the one legitimate way root and head-
+    // snapshot state can differ (see the UNSNAPSHOTTED test above).
+    await rest.updateParams("bracket", { values: { size: 45 }, snapshot: false });
+    expect((await rest.getParams("bracket")).values).toEqual({ size: 45 });
+
+    const before = await checksumSnapshotDir(dir, "0001");
+    // No override -> validates (and persists a mesh for) 0001's OWN size=20,
+    // never root's diverged size=45.
+    const validation = await agentCore.validateMesh({});
+    const after = await checksumSnapshotDir(dir, "0001");
+    // Persisting a mesh must not touch a single byte of history/0001/ -- it
+    // is a NEW file in derived/, exactly like a render or validation.json.
+    expect(after).toEqual(before);
+
+    const meshFile = await rest.getSnapshotMeshFile("bracket", "0001");
+    expect(meshFile).not.toBeNull();
+    const triangles = parseStl(Buffer.from(meshFile!.data));
+
+    // Structural check (the one #50's own QA used): the served bytes are
+    // exactly the mesh that was validated, not a different render or a
+    // truncated copy.
+    expect(triangles.length).toBe(validation.report.triangle_count);
+
+    // Geometric check: the mesh's own bounding box reflects size=20 (0001's
+    // OWN persisted params), never size=45 (root's diverged, unsnapshotted
+    // value) and never some other stale render.
+    const maxCoord = Math.max(...triangles.flatMap((t) => t.flatMap((v) => v)));
+    expect(maxCoord).toBeCloseTo(20, 1);
+    expect(maxCoord).not.toBeCloseTo(45, 1);
+  }, 60_000);
+
+  it("a preview validation (explicit params override) never persists a mesh for any snapshot", async () => {
+    const { runtime, dir } = await seedProject();
+    const rest = createScadCoreApi(runtime);
+    const agentCore = createAgentScadCore({ runtime, projectId: "bracket" });
+
+    const before = await checksumSnapshotDir(dir, "0001");
+    await agentCore.validateMesh({ params: { size: 49 } });
+    const after = await checksumSnapshotDir(dir, "0001");
+    expect(after).toEqual(before);
+
+    const meshFile = await rest.getSnapshotMeshFile("bracket", "0001");
+    expect(meshFile).toBeNull();
   }, 60_000);
 });

@@ -148,3 +148,140 @@ describe("WasmPreviewClient", () => {
     expect(statuses.length).toBe(countBefore);
   });
 });
+
+/**
+ * Regression suite for the "Illegal invocation" crash (real-browser only).
+ *
+ * Every test above injects `setTimeoutFn`/`clearTimeoutFn`, so none of them
+ * exercise the DEFAULT timer functions the app actually ships with. That
+ * mattered: the client stores the globals on the instance and invokes them as
+ * `this.setTimeoutFn(...)`, and a browser's native setTimeout/clearTimeout are
+ * branded Window methods that reject any receiver but the global. jsdom's are
+ * plain functions that happily accept the client as `this`, so no jsdom test
+ * could ever catch it — clicking Preview → "Live" threw immediately in Chrome
+ * and, with no error boundary above it, blanked the entire app.
+ *
+ * These stand-ins reproduce the browser's receiver check so this class of bug
+ * fails here instead of in the browser. They are installed as the real globals
+ * (not passed as overrides) so the client takes its default path.
+ */
+describe("WasmPreviewClient default timer functions (browser-branded globals)", () => {
+  interface Scheduled {
+    id: number;
+    fn: () => void;
+    cancelled: boolean;
+  }
+
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  let scheduled: Scheduled[];
+  let nextTimerId: number;
+
+  /** Mirrors WebIDL: a bare call (`this === undefined`) is fine, `obj.method()` is not. */
+  function assertGlobalReceiver(receiver: unknown, name: string) {
+    if (receiver !== undefined && receiver !== globalThis) {
+      throw new TypeError(`Illegal invocation: ${name} called with a non-global receiver`);
+    }
+  }
+
+  function brandedSetTimeout(this: unknown, fn: () => void): number {
+    assertGlobalReceiver(this, "setTimeout");
+    const entry: Scheduled = { id: nextTimerId++, fn, cancelled: false };
+    scheduled.push(entry);
+    return entry.id;
+  }
+
+  function brandedClearTimeout(this: unknown, id?: number): void {
+    assertGlobalReceiver(this, "clearTimeout");
+    const entry = scheduled.find((e) => e.id === id);
+    if (entry) entry.cancelled = true;
+  }
+
+  /**
+   * Fires the timers pending at call time. Snapshotted first, so a timer a
+   * callback schedules (startRender's timeout) waits for the next call rather
+   * than running in the same pass.
+   */
+  function runScheduled() {
+    for (const entry of [...scheduled]) {
+      if (entry.cancelled) continue;
+      entry.cancelled = true; // one-shot, like a real timeout
+      entry.fn();
+    }
+  }
+
+  function makeBrandedClient() {
+    const workers: FakeWorker[] = [];
+    // No setTimeoutFn/clearTimeoutFn overrides — that is the whole point.
+    const client = new WasmPreviewClient({
+      createWorker: () => {
+        const w = new FakeWorker();
+        workers.push(w);
+        return w as unknown as Worker;
+      }
+    });
+    return { client, workers };
+  }
+
+  beforeEach(() => {
+    scheduled = [];
+    nextTimerId = 1;
+    globalThis.setTimeout = brandedSetTimeout as unknown as typeof setTimeout;
+    globalThis.clearTimeout = brandedClearTimeout as unknown as typeof clearTimeout;
+  });
+
+  afterEach(() => {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.clearTimeout = realClearTimeout;
+  });
+
+  it("sanity: the branded stand-ins reject a non-global receiver the way a browser does", () => {
+    const holder = { fn: globalThis.setTimeout };
+    expect(() => holder.fn(() => {}, 0)).toThrow(/Illegal invocation/);
+    expect(() => globalThis.setTimeout(() => {}, 0)).not.toThrow(); // bare call is fine
+  });
+
+  it("render() schedules its debounce through the default globals without an Illegal invocation crash", () => {
+    const { client, workers } = makeBrandedClient();
+
+    // Pre-fix this threw `TypeError: Illegal invocation` synchronously here,
+    // inside useWasmPreview's effect, unmounting the whole React root.
+    expect(() => client.render("cube(1);", {})).not.toThrow();
+    expect(scheduled).toHaveLength(1); // the debounce timer
+
+    // Firing the debounce runs startRender, which clears + sets the timeout timer.
+    expect(() => runScheduled()).not.toThrow();
+    expect(workers).toHaveLength(1);
+    expect(workers[0].posted).toHaveLength(1);
+  });
+
+  it("a superseding render(), a worker reply, and dispose() all clear timers through the default globals", () => {
+    const { client, workers } = makeBrandedClient();
+
+    client.render("cube(1);", {});
+    expect(() => client.render("cube(2);", {})).not.toThrow(); // clearTimeout on the debounce timer
+    runScheduled();
+    expect(workers).toHaveLength(1);
+    const requestId = (workers[0].posted[0] as { requestId: string }).requestId;
+
+    // handleWorkerMessage clears the timeout timer.
+    expect(() =>
+      workers[0].reply({ type: "result", requestId, ok: true, stl: new ArrayBuffer(4), ms: 10, stdout: "", wasmHeapBytes: 100 })
+    ).not.toThrow();
+    expect(client.getStatus().kind).toBe("ok");
+
+    client.render("cube(3);", {});
+    expect(() => client.dispose()).not.toThrow(); // clears both debounce + timeout timers
+  });
+
+  it("the render timeout path fires through the default globals", () => {
+    const { client, workers } = makeBrandedClient();
+    client.render("cube(1);", {});
+    runScheduled(); // debounce -> startRender, which schedules the timeout
+    expect(client.getStatus().kind).toBe("pending");
+
+    expect(() => runScheduled()).not.toThrow(); // timeout callback
+    expect(client.getStatus().kind).toBe("timeout");
+    expect(workers[0].terminated).toBe(true);
+  });
+});

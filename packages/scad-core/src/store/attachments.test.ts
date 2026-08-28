@@ -9,8 +9,10 @@ import { snapshotDir } from "./paths.js";
 import {
   attachRendersToSnapshot,
   attachValidationToSnapshot,
+  resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   resolveSnapshotValidationPath,
+  snapshotMeshPath,
   snapshotRenderPath,
   snapshotValidationPath,
   snapshotViewsDir
@@ -310,5 +312,56 @@ describe("legacy fallback: reading a snapshot that predates the derived/ tree", 
     expect(manifest.validation?.volume_mm3).toBe(999);
     const after = await readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "utf8");
     expect(after).toBe(before);
+  });
+});
+
+// ── Legacy mesh fallback (Issue #41/#45 reconciliation) ─────────────────────
+//
+// PR #50 (Issue #41, merged before this reconciliation landed) persisted a
+// snapshot's validation mesh directly at `history/<id>/mesh.stl`. A project
+// validated in that window has its mesh there, with no `derived/<id>/` tree
+// for it at all -- `resolveSnapshotMeshPath` must still find it, read-only,
+// never migrating the file forward.
+describe("legacy mesh fallback: reading a mesh persisted by pre-reconciliation #50 code", () => {
+  const LEGACY_MESH = Buffer.from("legacy binary stl bytes, stand-in only");
+
+  async function seedLegacyMesh(id: string): Promise<void> {
+    await writeFile(join(snapshotDir(projectDir, id), "mesh.stl"), LEGACY_MESH);
+  }
+
+  it("resolveSnapshotMeshPath falls back to history/<id>/mesh.stl when no derived/ tree exists", async () => {
+    await seedLegacyMesh("0001");
+    const resolved = await resolveSnapshotMeshPath(projectDir, "0001");
+    expect(resolved).toBe(join(snapshotDir(projectDir, "0001"), "mesh.stl"));
+    await expect(readFile(resolved!)).resolves.toEqual(LEGACY_MESH);
+  });
+
+  it("prefers the DERIVED mesh once one has been written there", async () => {
+    await seedLegacyMesh("0001");
+    const derivedPath = snapshotMeshPath(projectDir, "0001"); // the WRITE-time (derived) location
+    const FRESH_MESH = Buffer.from("fresh derived mesh bytes");
+    await mkdir(join(derivedPath, ".."), { recursive: true });
+    await writeFile(derivedPath, FRESH_MESH);
+
+    const resolved = await resolveSnapshotMeshPath(projectDir, "0001");
+    expect(resolved).toBe(derivedPath);
+    await expect(readFile(resolved!)).resolves.toEqual(FRESH_MESH);
+  });
+
+  it("returns null (never throws) when no mesh exists in either location", async () => {
+    expect(await resolveSnapshotMeshPath(projectDir, "0001")).toBeNull();
+  });
+
+  it("never writes into history/ -- the legacy snapshot's mesh.stl and manifest stay byte-identical after resolving", async () => {
+    await seedLegacyMesh("0001");
+    const meshBefore = await readFile(join(snapshotDir(projectDir, "0001"), "mesh.stl"));
+    const manifestBefore = await readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "utf8");
+
+    await resolveSnapshotMeshPath(projectDir, "0001");
+
+    expect(await readFile(join(snapshotDir(projectDir, "0001"), "mesh.stl"))).toEqual(meshBefore);
+    expect(await readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "utf8")).toBe(
+      manifestBefore
+    );
   });
 });

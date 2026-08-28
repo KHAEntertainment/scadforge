@@ -168,6 +168,19 @@ export function createFakeScadCoreApi(): ScadCoreApi & { _projects: Map<string, 
       return { data, contentType: "image/png", bytes: data.byteLength };
     },
 
+    async getSnapshotMeshFile(projectId: string, snapshotId: string): Promise<RenderFile | null> {
+      const project = projects.get(projectId);
+      if (!project) return null;
+      const snapshot = project.snapshots.find((s) => s.id === snapshotId);
+      if (!snapshot) return null;
+      // Mirrors the real rule (scad-core `attachments.ts`): a mesh exists iff
+      // something validated that snapshot, since validation is what renders
+      // the STL. A never-validated snapshot has no mesh and yields a 404.
+      if (!snapshot.validation) return null;
+      const data = new TextEncoder().encode(`fake-stl:${projectId}:${snapshotId}`);
+      return { data, contentType: "model/stl", bytes: data.byteLength };
+    },
+
     async getParams(projectId: string): Promise<ParamsResponse> {
       const project = requireProject(projectId);
       return {

@@ -52,6 +52,7 @@ import {
   readSnapshotManifest,
   recordExport,
   renderViews as runRenderViews,
+  resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   revertToSnapshot,
   rootModelPath,
@@ -318,6 +319,21 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       // then falls back to history -- read-only, never migrates the legacy
       // file, so it never touches `history/`.
       const path = await resolveSnapshotRenderPath(dir, snapshotId, view as ViewName);
+      if (!path) return null;
+      return readFileOrNull(path);
+    },
+
+    async getSnapshotMeshFile(projectId, snapshotId): Promise<RenderFile | null> {
+      const dir = runtime.dirFor(projectId);
+      // Read-time fallback (Issue #45/#41 reconciliation): a snapshot
+      // validated between #50's merge and this reconciliation landing has
+      // its mesh physically at `history/<id>/mesh.stl`, not
+      // `derived/<id>/`. `resolveSnapshotMeshPath` checks derived first, then
+      // falls back to history -- read-only, never migrates the legacy file.
+      // A genuinely missing mesh is `null` either way, never a throw; the
+      // route turns that into a 404 the viewer renders as "no mesh for this
+      // snapshot yet".
+      const path = await resolveSnapshotMeshPath(dir, snapshotId);
       if (!path) return null;
       return readFileOrNull(path);
     },

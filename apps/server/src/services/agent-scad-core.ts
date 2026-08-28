@@ -37,6 +37,7 @@ import {
   rootModelPath,
   runParamExport,
   runSyntaxCheck,
+  snapshotMeshPath,
   validateModel
 } from "@scadforge/scad-core";
 import type {
@@ -52,7 +53,7 @@ import type {
 import type { ExportRecord } from "@scadforge/protocol";
 import { renderAndAttach } from "./scad-core-impl.js";
 import { planParamUpdate, readParams, readProject, readScad, stageSnapshotModel, type ServerRuntime } from "./runtime.js";
-import { exportFileUrl, renderFileUrl, snapshotUrl } from "./urls.js";
+import { exportFileUrl, renderFileUrl, snapshotMeshUrl, snapshotUrl } from "./urls.js";
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */
 const EMPTY_PARAM_SCHEMA: ParamSchema = { title: "", parameters: [] };
@@ -206,7 +207,21 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
         result = await validateModel(staged?.scadPath ?? rootModelPath(dir), {
           params: staged?.params ?? request.params,
           gate: { allowMultiPart: request.allowMultiPart === true },
-          libraryPaths: runtime.libraryPaths
+          libraryPaths: runtime.libraryPaths,
+          // The validation mesh is also kept for the 3D viewer (Issue #41,
+          // reconciled with #45): `persistMeshTo` reuses THIS SAME render --
+          // never a second OpenSCAD pass -- at the PINNED snapshot's DERIVED
+          // mesh path (`snapshotMeshPath` now resolves to
+          // `derived/<id>/mesh.stl`, not `history/<id>/mesh.stl`: adding a
+          // file into an existing snapshot's `history/` directory still
+          // mutates that snapshot under the write-once rule, even though no
+          // pre-existing file changes -- the mesh is a derived artifact,
+          // recomputable from the snapshot's own model+params, exactly like
+          // a render or a validation report). Only for a real (non-preview)
+          // validation of a pinned snapshot -- a preview's mesh describes no
+          // snapshot's own content, so it is never persisted, matching the
+          // same rule the attach below follows.
+          persistMeshTo: targetId && !isPreview ? snapshotMeshPath(dir, targetId) : undefined
         });
       } finally {
         await staged?.cleanup();
@@ -303,10 +318,25 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
         }
         case "export":
           return exportFileUrl(projectId, basename(ref));
-        case "mesh":
-          // Validation meshes are throwaway intermediates in a temp work dir
-          // (`validateModel` removes them); there is nothing to serve.
-          return null;
+        case "mesh": {
+          // Since Issue #41 a validation mesh CAN be durable: `validateMesh`
+          // above asks `validateModel` to keep it at the pinned snapshot's
+          // mesh path -- `.scadforge/derived/<id>/mesh.stl` (Issue #45: never
+          // `history/<id>/mesh.stl`, which would mutate an existing
+          // snapshot's directory) -- with a read-time fallback to the
+          // `history/<id>/mesh.stl` a pre-reconciliation (#50) validation may
+          // have left. Recover the snapshot id from the layout exactly as the
+          // `render` case does, recognizing either segment name.
+          //
+          // A mesh still living in a temp work dir (any path outside this
+          // project's `history/`/`derived/`) remains unservable and returns
+          // null — the honest answer, and the reason this is a path check
+          // rather than an unconditional URL.
+          const rel = relative(dir, ref).split(/[\\/]/);
+          const rootIndex = Math.max(rel.indexOf("history"), rel.indexOf("derived"));
+          if (rootIndex === -1 || rel.length <= rootIndex + 1) return null;
+          return snapshotMeshUrl(projectId, rel[rootIndex + 1]);
+        }
       }
     },
 
