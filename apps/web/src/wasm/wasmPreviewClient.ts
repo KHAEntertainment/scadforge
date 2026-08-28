@@ -83,8 +83,15 @@ export class WasmPreviewClient {
     this.debounceMs = options.debounceMs ?? 300;
     this.timeoutMs = options.timeoutMs ?? 8000;
     this.createWorker = options.createWorker ?? defaultCreateWorker;
-    this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
-    this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
+    // `.bind(globalThis)` is load-bearing, not stylistic: these are stored on
+    // the instance and later invoked as `this.setTimeoutFn(...)`, i.e. with the
+    // client as the receiver. A browser's native setTimeout/clearTimeout are
+    // branded Window methods and throw `TypeError: Illegal invocation` for any
+    // receiver other than the global. jsdom's are plain functions and tolerate
+    // it, so this only ever blew up in a real browser (it unmounted the whole
+    // React root the moment Preview's "Live" button was clicked).
+    this.setTimeoutFn = options.setTimeoutFn ?? setTimeout.bind(globalThis);
+    this.clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout.bind(globalThis);
   }
 
   getStatus(): WasmPreviewStatus {
