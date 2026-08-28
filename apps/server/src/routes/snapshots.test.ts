@@ -62,6 +62,34 @@ describe("GET /api/projects/:projectId/snapshots/:snapshotId", () => {
   });
 });
 
+describe("GET /api/projects/:projectId/snapshots/:snapshotId/diff", () => {
+  it("returns an empty diff for the first snapshot, per the frozen contract", async () => {
+    const app = makeApp();
+    const project = await createProject(app);
+    const snapshotId = project.head.id;
+    const res = await app.request(`/api/projects/${project.project.id}/snapshots/${snapshotId}/diff`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({ id: snapshotId, parent: null, diff: "" });
+  });
+
+  it("returns SNAPSHOT_NOT_FOUND for an unknown snapshot id", async () => {
+    const app = makeApp();
+    const project = await createProject(app);
+    const res = await app.request(`/api/projects/${project.project.id}/snapshots/9999/diff`);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error_code: "SNAPSHOT_NOT_FOUND" });
+  });
+
+  it("rejects a path-traversal snapshot id as INVALID_REQUEST", async () => {
+    const app = makeApp();
+    const project = await createProject(app);
+    const res = await app.request(`/api/projects/${project.project.id}/snapshots/..%2F..%2Fsecret/diff`);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error_code: "INVALID_REQUEST" });
+  });
+});
+
 describe("POST /api/projects/:projectId/snapshots/:snapshotId/revert", () => {
   it("appends a new revert snapshot (append-only history)", async () => {
     const app = makeApp();
@@ -77,8 +105,54 @@ describe("POST /api/projects/:projectId/snapshots/:snapshotId/revert", () => {
     expect(body.snapshot.origin).toBe("revert");
     expect(body.snapshot.id).not.toBe(snapshotId);
 
+    // Append-only: the reverted-from snapshot must still exist, intact, alongside the new one.
     const list = await app.request(`/api/projects/${project.project.id}/snapshots`);
     const listBody = await list.json();
     expect(listBody.snapshots).toHaveLength(2);
+    const original = await app.request(`/api/projects/${project.project.id}/snapshots/${snapshotId}`);
+    expect(original.status).toBe(200);
+    expect((await original.json()).snapshot.id).toBe(snapshotId);
+  });
+
+  it("returns SNAPSHOT_NOT_FOUND for an unknown target snapshot", async () => {
+    const app = makeApp();
+    const project = await createProject(app);
+    const res = await app.request(`/api/projects/${project.project.id}/snapshots/9999/revert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ error_code: "SNAPSHOT_NOT_FOUND" });
+  });
+
+  it("rejects a non-string `message` as INVALID_REQUEST", async () => {
+    const app = makeApp();
+    const project = await createProject(app);
+    const snapshotId = project.head.id;
+    const res = await app.request(`/api/projects/${project.project.id}/snapshots/${snapshotId}/revert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: 42 })
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error_code: "INVALID_REQUEST" });
+  });
+
+  it("counterexample: under write contention, revert surfaces the typed CONFLICT as 409 rather than silently overwriting (M1 store concurrency policy)", async () => {
+    const app = makeApp();
+    const project = await createProject(app);
+    const snapshotId = project.head.id;
+    const res = await app.request(`/api/projects/${project.project.id}/snapshots/${snapshotId}/revert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: "__forceConflict__" })
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error_code: "CONFLICT" });
+
+    // No new snapshot was appended — the conflict must not leave a partial/duplicate entry.
+    const list = await app.request(`/api/projects/${project.project.id}/snapshots`);
+    expect((await list.json()).snapshots).toHaveLength(1);
   });
 });

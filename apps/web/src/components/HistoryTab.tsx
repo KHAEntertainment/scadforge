@@ -1,7 +1,7 @@
 import type { SnapshotManifest } from "@scadforge/protocol";
 import type { ApiClient } from "../lib/apiClient.js";
 import { ExportButton } from "./ExportButton.js";
-import { SnapshotList } from "./SnapshotList.js";
+import { HistoryPanel } from "./history/HistoryPanel.js";
 
 export interface HistoryTabProps {
   client: ApiClient;
@@ -13,14 +13,24 @@ export interface HistoryTabProps {
 }
 
 /**
- * SDP §9 History tab. Diff/revert UI is out of scope for Issue #18 (M2) — this
- * is the snapshot list + export action only.
+ * SDP §9 History tab: snapshot list with thumbnails/badges, diff vs parent,
+ * and "Revert to this" (Issue #34), plus the existing export action (Issue
+ * #18). Revert and export both refresh the shared snapshot list via
+ * `onExported` (the callback name predates revert; it simply means "the
+ * snapshot list may have changed, refetch it").
  */
 export function HistoryTab({ client, projectId, snapshots, loading, error, onExported }: HistoryTabProps) {
   return (
     <div className="history-tab">
       <ExportButton client={client} projectId={projectId} onExported={onExported} />
-      <SnapshotList snapshots={snapshots} loading={loading} error={error} />
+      <HistoryPanel
+        client={client}
+        projectId={projectId}
+        snapshots={snapshots}
+        loading={loading}
+        error={error}
+        onChanged={onExported}
+      />
     </div>
   );
 }

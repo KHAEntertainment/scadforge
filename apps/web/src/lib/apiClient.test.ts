@@ -73,3 +73,56 @@ describe("apiClient request()", () => {
     await expect(client.listProjects()).resolves.toBeNull();
   });
 });
+
+describe("apiClient snapshots (Issue #34)", () => {
+  it("getSnapshotDiff hits the frozen diff route and returns the parsed body verbatim, including the first-snapshot empty string", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL) => {
+      expect(String(url)).toBe("/api/projects/p1/snapshots/0001/diff");
+      return jsonResponse({ id: "0001", parent: null, diff: "" });
+    });
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.getSnapshotDiff("p1", "0001")).resolves.toEqual({ id: "0001", parent: null, diff: "" });
+  });
+
+  it("revertSnapshot POSTs to the frozen revert route with a JSON body", async () => {
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      expect(String(url)).toBe("/api/projects/p1/snapshots/0001/revert");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({});
+      return jsonResponse({
+        snapshot: {
+          id: "0002",
+          parent: "0001",
+          timestamp: "2026-08-27T00:00:00.000Z",
+          message: "Revert to 0001",
+          origin: "revert",
+          pass: null,
+          files: { model_scad: "model.scad", params_json: "params.json", message_md: "message.md", validation_json: null, diff_patch: "diff.patch" },
+          params: {},
+          renders: [],
+          validation: null,
+          annotations: []
+        },
+        scad: "// reverted"
+      });
+    });
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const result = await client.revertSnapshot("p1", "0001");
+    expect(result.snapshot.id).toBe("0002");
+    expect(result.snapshot.origin).toBe("revert");
+  });
+
+  it("counterexample: revertSnapshot surfaces a 409 CONFLICT as a typed ApiClientError, never a silent success", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ error_code: "CONFLICT", message: "could not allocate a snapshot id" }, 409)
+    );
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.revertSnapshot("p1", "0001")).rejects.toMatchObject({
+      error_code: "CONFLICT",
+      message: "could not allocate a snapshot id"
+    });
+  });
+});
