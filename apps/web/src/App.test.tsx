@@ -47,6 +47,9 @@ describe("App", () => {
       if (url.includes("/snapshots")) {
         return jsonResponse({ snapshots: [] });
       }
+      if (url.endsWith("/params")) {
+        return jsonResponse({ title: "untitled", parameters: [], values: {} });
+      }
       return jsonResponse({ error_code: "NOT_FOUND", message: "unhandled in test" }, false);
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -56,6 +59,7 @@ describe("App", () => {
     expect(screen.getByLabelText("Chat")).toBeInTheDocument();
     expect(screen.getByLabelText("Workspace")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Preview" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Params" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
 
     await waitFor(() => expect(screen.getByTestId("openscad-version")).toHaveTextContent("2026.01.19"));

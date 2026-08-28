@@ -20,6 +20,8 @@ import type {
   HealthResponse,
   ListProjectsResponse,
   ListSnapshotsResponse,
+  ParamsResponse,
+  ParamsUpdateRequest,
   ProjectResponse,
   CreateProjectRequest,
   RevertRequest,
@@ -213,6 +215,25 @@ export function createApiClient(options: ApiClientOptions = {}) {
     async exportModel(projectId: string, body: ExportRequest): Promise<ExportResponse> {
       return request<ExportResponse>(fillRoute(API_ROUTES.exports.create, { projectId }), {
         method: "POST",
+        body: JSON.stringify(body)
+      });
+    },
+
+    /** `GET /api/projects/:projectId/params` — the Customizer schema + current values (Issue #33). */
+    getParams(projectId: string): Promise<ParamsResponse> {
+      return request<ParamsResponse>(fillRoute(API_ROUTES.params.get, { projectId }));
+    },
+
+    /**
+     * `PUT /api/projects/:projectId/params` — partial update, merged and
+     * validated server-side via the single `planParamUpdate` code path
+     * (Issue #32). Resolves with the full merged `ParamsResponse`; rejects
+     * with `ApiClientError{error_code:"VALIDATION_FAILED"}` if any supplied
+     * value was rejected (no silent coerce, no partial apply).
+     */
+    updateParams(projectId: string, body: ParamsUpdateRequest): Promise<ParamsResponse> {
+      return request<ParamsResponse>(fillRoute(API_ROUTES.params.update, { projectId }), {
+        method: "PUT",
         body: JSON.stringify(body)
       });
     },
