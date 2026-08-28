@@ -13,6 +13,16 @@ export const SCAD_CORE_PACKAGE_NAME = "@scadforge/scad-core";
 export * from "./types.js";
 export * from "./errors.js";
 
+// params/
+export {
+  CRLF_ANNOTATION_WARNING,
+  DEFAULT_PARAM_GROUP,
+  parseParamSchema,
+  parseParamSchemaWithDiagnostics,
+  sourceHasCrlf
+} from "./params/index.js";
+export type { ParseParamSchemaOptions, ParseParamSchemaWithDiagnosticsResult } from "./params/index.js";
+
 // runner/
 export {
   filterOpenscadDiagnostics,
