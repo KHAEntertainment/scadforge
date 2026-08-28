@@ -52,6 +52,7 @@ import {
   readSnapshotManifest,
   recordExport,
   renderViews as runRenderViews,
+  resolveSnapshotRenderPath,
   revertToSnapshot,
   rootModelPath,
   runParamExport,
@@ -311,7 +312,14 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
 
     async getSnapshotRenderFile(projectId, snapshotId, view): Promise<RenderFile | null> {
       const dir = runtime.dirFor(projectId);
-      return readFileOrNull(snapshotRenderPath(dir, snapshotId, view as ViewName));
+      // Read-time fallback (Issue #45 follow-up): a project that predates
+      // this fix has its renders physically in `history/<id>/views/`, not
+      // `derived/<id>/`. `resolveSnapshotRenderPath` checks derived first,
+      // then falls back to history -- read-only, never migrates the legacy
+      // file, so it never touches `history/`.
+      const path = await resolveSnapshotRenderPath(dir, snapshotId, view as ViewName);
+      if (!path) return null;
+      return readFileOrNull(path);
     },
 
     // ── params ───────────────────────────────────────────────────────────────

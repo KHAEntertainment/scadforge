@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -9,6 +9,8 @@ import { snapshotDir } from "./paths.js";
 import {
   attachRendersToSnapshot,
   attachValidationToSnapshot,
+  resolveSnapshotRenderPath,
+  resolveSnapshotValidationPath,
   snapshotRenderPath,
   snapshotValidationPath,
   snapshotViewsDir
@@ -222,5 +224,91 @@ describe("attachValidationToSnapshot", () => {
     await expect(attachValidationToSnapshot(projectDir, "9999", GREEN_VALIDATION)).rejects.toMatchObject({
       error_code: "SNAPSHOT_NOT_FOUND"
     });
+  });
+});
+
+// ── Legacy fallback (post-review follow-up on Issue #45) ────────────────────
+//
+// A project created by the PRE-FIX code has its renders/validation.json
+// physically INSIDE `history/<id>/views/` and `history/<id>/validation.json`
+// -- there is no `derived/<id>/` tree at all for it. `resolveSnapshotRenderPath`
+// / `resolveSnapshotValidationPath` must still find those files (read-time
+// fallback), and doing so must NEVER write into `history/` (no migration).
+describe("legacy fallback: reading a snapshot that predates the derived/ tree", () => {
+  const LEGACY_PNG = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
+  const LEGACY_VALIDATION = {
+    manifold: true,
+    status: "NoError",
+    volume_mm3: 999,
+    surface_area: 100,
+    bbox: { min: [0, 0, 0], max: [1, 1, 1] },
+    triangle_count: 12,
+    components: 1,
+    genus: 0
+  };
+
+  /** Hand-writes a legacy-shaped snapshot: renders/validation baked straight into `history/<id>/`, exactly what the pre-fix `attachRendersToSnapshot`/`attachValidationToSnapshot` produced, and NO `derived/<id>/` tree. */
+  async function seedLegacySnapshot(id: string): Promise<void> {
+    const dir = snapshotDir(projectDir, id);
+    const viewsDir = join(dir, PROJECT_LAYOUT.snapshot.viewsDir);
+    await mkdir(viewsDir, { recursive: true });
+    await writeFile(join(viewsDir, "iso.png"), LEGACY_PNG);
+    await writeFile(join(dir, PROJECT_LAYOUT.snapshot.validationFile), JSON.stringify(LEGACY_VALIDATION, null, 2), "utf8");
+
+    const manifestPath = join(dir, PROJECT_LAYOUT.snapshot.manifestFile);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as SnapshotManifest;
+    manifest.renders = [
+      { view: "iso", file: "views/iso.png", url: "/views/iso.png", width: 1024, height: 768, bytes: LEGACY_PNG.byteLength, render_ms: 42 }
+    ];
+    manifest.validation = { badge: "green", manifold: true, components: 1, volume_mm3: 999, warning_count: 0 };
+    manifest.files = { ...manifest.files, validation_json: PROJECT_LAYOUT.snapshot.validationFile };
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  }
+
+  it("resolveSnapshotRenderPath falls back to history/<id>/views/ when no derived/ tree exists", async () => {
+    await seedLegacySnapshot("0001");
+    const resolved = await resolveSnapshotRenderPath(projectDir, "0001", "iso");
+    expect(resolved).toBe(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.viewsDir, "iso.png"));
+    await expect(readFile(resolved!)).resolves.toEqual(LEGACY_PNG);
+  });
+
+  it("resolveSnapshotValidationPath falls back to history/<id>/validation.json when no derived/ tree exists", async () => {
+    await seedLegacySnapshot("0001");
+    const resolved = await resolveSnapshotValidationPath(projectDir, "0001");
+    expect(resolved).toBe(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.validationFile));
+    const persisted = JSON.parse(await readFile(resolved!, "utf8"));
+    expect(persisted).toEqual(LEGACY_VALIDATION);
+  });
+
+  it("prefers the DERIVED location over the legacy one once a fresh attach has happened", async () => {
+    await seedLegacySnapshot("0001");
+    // A fresh re-render lands in derived/, not history/.
+    await attachRendersToSnapshot(projectDir, "0001", [
+      { view: "iso", sourcePath: pngPath, render_ms: 7, width: 640, height: 480 }
+    ]);
+    const resolved = await resolveSnapshotRenderPath(projectDir, "0001", "iso");
+    expect(resolved).toBe(snapshotRenderPath(projectDir, "0001", "iso"));
+    await expect(readFile(resolved!)).resolves.toEqual(PNG_BYTES); // the FRESH bytes, not the legacy ones
+  });
+
+  it("returns null (never throws) when the render/validation exists in neither location", async () => {
+    // `beforeEach` already created snapshot 0001 (via `initProject`) with no
+    // renders/validation attached at all -- neither derived/ nor history/
+    // has anything for it.
+    expect(await resolveSnapshotRenderPath(projectDir, "0001", "front")).toBeNull();
+    expect(await resolveSnapshotValidationPath(projectDir, "0001")).toBeNull();
+  });
+
+  it("reading via the fallback never writes into history/ -- the legacy snapshot's directory stays byte-identical", async () => {
+    await seedLegacySnapshot("0001");
+    const before = await readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "utf8");
+    await resolveSnapshotRenderPath(projectDir, "0001", "iso");
+    await resolveSnapshotValidationPath(projectDir, "0001");
+    // Read through the real store surface too (what `apps/server` actually calls).
+    const manifest = await readSnapshotManifest(projectDir, "0001");
+    expect(manifest.renders).toHaveLength(1);
+    expect(manifest.validation?.volume_mm3).toBe(999);
+    const after = await readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "utf8");
+    expect(after).toBe(before);
   });
 });

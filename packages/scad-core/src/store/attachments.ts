@@ -84,6 +84,12 @@ export interface AttachRendersOptions {
  * attach) location. A snapshot's `history/<id>/views/` stays whatever it was
  * at creation (normally empty; see the header comment) and is never the
  * target of a later render attach.
+ *
+ * This is the WRITE-time / just-attached location, used by
+ * `attachRendersToSnapshot` itself and by callers re-pointing at a render
+ * they just attached in this same call (guaranteed to exist there). For
+ * READING a render that might pre-date this fix, use
+ * {@link resolveSnapshotRenderPath} instead.
  */
 export function snapshotRenderPath(projectDir: string, snapshotId: SnapshotId, view: ViewName): string {
   return snapshotDerivedRenderPath(projectDir, snapshotId, view);
@@ -92,6 +98,58 @@ export function snapshotRenderPath(projectDir: string, snapshotId: SnapshotId, v
 /** The snapshot's derived `views/` directory — where `attachRendersToSnapshot` copies PNGs. */
 export function snapshotViewsDir(projectDir: string, snapshotId: SnapshotId): string {
   return snapshotDerivedViewsDir(projectDir, snapshotId);
+}
+
+/** History (creation-time) path for a snapshot's rendered PNG. Populated for a LEGACY snapshot whose renders were attached by the pre-Issue-#45 code directly into `history/<id>/views/`, or for the rare snapshot created with `CreateSnapshotInput.renders` already supplied. */
+function snapshotHistoryRenderPath(projectDir: string, snapshotId: SnapshotId, view: ViewName): string {
+  return join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.viewsDir, `${view}.png`);
+}
+
+/** History (creation-time) path for a snapshot's persisted `ValidationReport`. See {@link snapshotHistoryRenderPath}. */
+function snapshotHistoryValidationPath(projectDir: string, snapshotId: SnapshotId): string {
+  return join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.validationFile);
+}
+
+async function existsFile(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolves the PHYSICAL path to READ a snapshot's rendered PNG for `view`
+ * from — the DERIVED (post-Issue-#45) location if present, else falling back
+ * to `history/<id>/views/<view>.png` for a project that predates this fix
+ * (whose renders the pre-fix code attached directly into `history/`).
+ * Read-only: never writes, never migrates the legacy file forward, so an
+ * existing project's on-disk layout is untouched either way. Returns `null`
+ * when the render exists in neither location.
+ */
+export async function resolveSnapshotRenderPath(
+  projectDir: string,
+  snapshotId: SnapshotId,
+  view: ViewName
+): Promise<string | null> {
+  const derived = snapshotDerivedRenderPath(projectDir, snapshotId, view);
+  if (await existsFile(derived)) return derived;
+  const legacy = snapshotHistoryRenderPath(projectDir, snapshotId, view);
+  if (await existsFile(legacy)) return legacy;
+  return null;
+}
+
+/** Same read-time fallback as {@link resolveSnapshotRenderPath}, for a snapshot's persisted `ValidationReport` bytes. */
+export async function resolveSnapshotValidationPath(
+  projectDir: string,
+  snapshotId: SnapshotId
+): Promise<string | null> {
+  const derived = snapshotDerivedValidationReportPath(projectDir, snapshotId);
+  if (await existsFile(derived)) return derived;
+  const legacy = snapshotHistoryValidationPath(projectDir, snapshotId);
+  if (await existsFile(legacy)) return legacy;
+  return null;
 }
 
 /** Reads a snapshot's raw (immutable) manifest without going through `store.ts`'s derived-merge, to avoid a circular import. */
@@ -199,7 +257,12 @@ export async function attachValidationToSnapshot(
   );
 }
 
-/** Absolute path of a snapshot's persisted `ValidationReport` — the DERIVED (post-creation attach) location. */
+/**
+ * Absolute path of a snapshot's persisted `ValidationReport` — the DERIVED
+ * (post-creation attach) location. This is the WRITE-time location; for
+ * READING a validation report that might pre-date this fix, use
+ * {@link resolveSnapshotValidationPath} instead.
+ */
 export function snapshotValidationPath(projectDir: string, snapshotId: SnapshotId): string {
   return snapshotDerivedValidationReportPath(projectDir, snapshotId);
 }

@@ -388,6 +388,18 @@ export async function readSnapshotManifest(projectDir: string, id: SnapshotId): 
       // tree (`attachments.ts`) and are merged in here, in memory, so every
       // caller still sees `.renders` / `.validation` populated -- the on-disk
       // history is what's actually immutable, not the shape callers see.
+      //
+      // LEGACY PROJECTS (predate this fix): the pre-fix code wrote renders/
+      // validation directly into `manifest.json` itself, so `manifest` (just
+      // parsed above) ALREADY carries them for such a snapshot. There is no
+      // `derived/<id>/` tree for it, so `readDerivedEnrichment` returns both
+      // fields `null` and the `if` guards below leave the legacy data in
+      // `manifest.renders`/`manifest.validation` completely untouched --
+      // manifest-level reads need no fallback. Only the PHYSICAL BYTES (the
+      // PNG/`validation.json` a render/validation entry points at) can still
+      // be missing from `derived/`, which is what `resolveSnapshotRenderPath`
+      // / `resolveSnapshotValidationPath` (`attachments.ts`) fall back to
+      // `history/<id>/` for.
       const derived = await readDerivedEnrichment(projectDir, id);
       if (derived.renders !== null) manifest.renders = derived.renders;
       if (derived.validation !== null) {

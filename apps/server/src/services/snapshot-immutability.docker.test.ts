@@ -15,11 +15,13 @@
 // that is NOT the target snapshot's own persisted `model.scad`/`params.json`.
 
 import { createHash } from "node:crypto";
-import { readdir, readFile, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, readdir, readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PROJECT_LAYOUT } from "@scadforge/protocol";
+import type { SnapshotManifest } from "@scadforge/protocol";
 import { initProject, readSnapshotManifest, snapshotDir } from "@scadforge/scad-core";
 import { createAgentScadCore } from "./agent-scad-core.js";
 import { createScadCoreApi } from "./scad-core-impl.js";
@@ -193,5 +195,87 @@ describe.skipIf(!dockerAvailable())("@docker Issue #45: snapshots are immutable 
     // The preview's size=49 result must NOT have been recorded against 0001
     // (whose own params are `{}`, i.e. the source's own size=20 default).
     expect(snap1.validation).toBeNull();
+  }, 60_000);
+
+  // ── Legacy fallback (post-review follow-up) ────────────────────────────
+  //
+  // A project created by the PRE-FIX code (like the owner's real demo
+  // project) has renders/validation physically INSIDE `history/<id>/views/`
+  // and `history/<id>/validation.json` -- there is no `derived/<id>/` tree.
+  // Serving those must still work (read-time fallback), and a NEW render/
+  // validate on that same legacy project must land in `derived/`, never
+  // touch the legacy `history/<id>/` bytes.
+  const LEGACY_PNG = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
+
+  async function seedLegacySnapshot(dir: string, id: string): Promise<void> {
+    const historyDir = snapshotDir(dir, id);
+    const viewsDir = join(historyDir, PROJECT_LAYOUT.snapshot.viewsDir);
+    await mkdir(viewsDir, { recursive: true });
+    await writeFile(join(viewsDir, "iso.png"), LEGACY_PNG);
+    await writeFile(
+      join(historyDir, PROJECT_LAYOUT.snapshot.validationFile),
+      JSON.stringify({ manifold: true, status: "NoError", volume_mm3: 8000, surface_area: 2400, bbox: { min: [0, 0, 0], max: [20, 20, 20] }, triangle_count: 12, components: 1, genus: 0 }, null, 2),
+      "utf8"
+    );
+    const manifestPath = join(historyDir, PROJECT_LAYOUT.snapshot.manifestFile);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as SnapshotManifest;
+    manifest.renders = [
+      { view: "iso", file: "views/iso.png", url: "/api/legacy/iso.png", width: 1024, height: 768, bytes: LEGACY_PNG.byteLength, render_ms: 500 }
+    ];
+    manifest.validation = { badge: "green", manifold: true, components: 1, volume_mm3: 8000, warning_count: 0 };
+    manifest.files = { ...manifest.files, validation_json: PROJECT_LAYOUT.snapshot.validationFile };
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  }
+
+  it("serves a LEGACY project's pre-existing render (no derived/ tree) via getSnapshotRenderFile, never 404s", async () => {
+    const { runtime, dir } = await seedProject();
+    await seedLegacySnapshot(dir, "0001");
+
+    const rest = createScadCoreApi(runtime);
+    const file = await rest.getSnapshotRenderFile("bracket", "0001", "iso");
+    expect(file).not.toBeNull();
+    expect(Buffer.from(file!.data)).toEqual(LEGACY_PNG);
+  });
+
+  it("a NEW render/validate on a LEGACY-shaped project lands in derived/ and leaves the pre-existing history/<id>/ bytes untouched", async () => {
+    const { runtime, dir } = await seedProject();
+    await seedLegacySnapshot(dir, "0001");
+
+    const legacyPngBefore = await readFile(join(snapshotDir(dir, "0001"), PROJECT_LAYOUT.snapshot.viewsDir, "iso.png"));
+    const legacyValidationBefore = await readFile(join(snapshotDir(dir, "0001"), PROJECT_LAYOUT.snapshot.validationFile), "utf8");
+    const manifestBefore = await readFile(join(snapshotDir(dir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "utf8");
+
+    const agentCore = createAgentScadCore({ runtime, projectId: "bracket" });
+    // Real render/validate against the SAME (legacy) head snapshot.
+    const validation = await agentCore.validateMesh({});
+    expect(validation.report.volume_mm3).toBeCloseTo(20 * 20 * 20, 1);
+    await agentCore.renderViews({ views: ["front"] });
+
+    // The pre-existing legacy bytes are untouched -- proves write-once holds
+    // even starting from a legacy (pre-fix-created) snapshot, not just a
+    // fresh one.
+    expect(await readFile(join(snapshotDir(dir, "0001"), PROJECT_LAYOUT.snapshot.viewsDir, "iso.png"))).toEqual(
+      legacyPngBefore
+    );
+    expect(await readFile(join(snapshotDir(dir, "0001"), PROJECT_LAYOUT.snapshot.validationFile), "utf8")).toBe(
+      legacyValidationBefore
+    );
+    expect(await readFile(join(snapshotDir(dir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "utf8")).toBe(
+      manifestBefore
+    );
+
+    // The manifest now reports the NEW validation (derived/ wins over the
+    // legacy embedded value once a fresh attach has happened), and BOTH the
+    // legacy 'iso' render and the newly-attached 'front' render resolve.
+    const manifest = await readSnapshotManifest(dir, "0001");
+    expect(manifest.validation?.volume_mm3).toBeCloseTo(20 * 20 * 20, 1);
+    expect(manifest.renders.map((r) => r.view).sort()).toEqual(["front", "iso"]);
+
+    const rest = createScadCoreApi(runtime);
+    const legacyFile = await rest.getSnapshotRenderFile("bracket", "0001", "iso"); // still legacy, untouched
+    expect(Buffer.from(legacyFile!.data)).toEqual(LEGACY_PNG);
+    const freshFile = await rest.getSnapshotRenderFile("bracket", "0001", "front"); // new, from derived/
+    expect(freshFile).not.toBeNull();
+    expect(freshFile!.bytes).toBeGreaterThan(0);
   }, 60_000);
 });

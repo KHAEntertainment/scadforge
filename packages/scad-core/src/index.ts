@@ -87,6 +87,8 @@ export { PARAMS_LOCK_MAX_ATTEMPTS, withParamsLock } from "./store/params-lock.js
 export {
   attachRendersToSnapshot,
   attachValidationToSnapshot,
+  resolveSnapshotRenderPath,
+  resolveSnapshotValidationPath,
   snapshotRenderPath,
   snapshotValidationPath,
   snapshotViewsDir
