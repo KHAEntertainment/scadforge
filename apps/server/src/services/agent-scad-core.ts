@@ -50,7 +50,7 @@ import type {
 } from "@scadforge/scad-core";
 import type { ExportRecord } from "@scadforge/protocol";
 import { renderAndAttach } from "./scad-core-impl.js";
-import { readParams, readProject, readScad, type ServerRuntime } from "./runtime.js";
+import { planParamUpdate, readParams, readProject, readScad, type ServerRuntime } from "./runtime.js";
 import { exportFileUrl, renderFileUrl, snapshotUrl } from "./urls.js";
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */
@@ -134,31 +134,25 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
     },
 
     async setParams(params: ParamValues, pass: number): Promise<SetParamsOutcome> {
-      const schema = await paramSchema();
-      const known = new Set(schema.parameters.map((p) => p.name));
-      const unknown_params: string[] = [];
-      const accepted: ParamValues = { ...(await readParams(dir)) };
-      for (const [name, value] of Object.entries(params)) {
-        // An empty schema means the model has never been parsed for parameters
-        // (a brand-new project). Rejecting everything then would make
-        // `set_params` unusable before the first successful render, so an
-        // empty schema accepts whatever it is given.
-        if (known.size > 0 && !known.has(name)) {
-          unknown_params.push(name);
-          continue;
-        }
-        accepted[name] = value;
-      }
+      // Single code path (Issue #32): the exact same validation + merge the
+      // REST route uses (`scad-core-impl.ts`'s `updateParams`, both via
+      // `runtime.ts`'s `planParamUpdate`). The frozen `set_params` result
+      // shape (`contract.ts`) has no per-value error field, so every
+      // rejection — unknown name, wrong type, out of range — folds into
+      // `unknown_params`; only `plan.merged` (which already excludes them)
+      // is applied and snapshotted, never a silent coerce of a bad value.
+      const plan = await planParamUpdate(dir, runtime, params);
+      const unknown_params = plan.rejected.map((r) => r.name);
 
       const snapshot = await createSnapshot(dir, {
         content: await readScad(dir),
-        params: accepted,
+        params: plan.merged,
         message: `Set ${Object.keys(params).length - unknown_params.length} parameter(s)`,
         origin: "manual",
         pass
       });
       options.onSnapshot?.(snapshot);
-      return { params: accepted, unknown_params, snapshot };
+      return { params: plan.merged, unknown_params, snapshot };
     },
 
     async renderViews(request: AgentRenderRequest): Promise<RenderResult> {

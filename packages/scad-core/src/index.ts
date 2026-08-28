@@ -42,6 +42,8 @@ export type { MeshExportResult } from "./runner/mesh-export.js";
 export { exportRun } from "./runner/export.js";
 export { validateModel } from "./runner/validate-model.js";
 export type { ValidateModelOptions } from "./runner/validate-model.js";
+export { validateParamValues } from "./runner/params-validate.js";
+export type { ParamRejection, ParamRejectionReason, ValidateParamValuesResult } from "./runner/params-validate.js";
 
 // validate/
 export { parseStl } from "./validate/stl.js";
