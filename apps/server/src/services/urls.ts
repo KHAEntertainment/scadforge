@@ -62,3 +62,20 @@ export function snapshotUrl(projectId: string, snapshotId: SnapshotId): string {
 export function projectUrl(projectId: string): string {
   return buildPath(API_ROUTES.projects.get, { projectId });
 }
+
+/**
+ * Path template for a snapshot's persisted mesh (ScadForge Issue #41).
+ *
+ * NOT in `API_ROUTES`: `packages/protocol` is frozen (CLAUDE.md hard rule 2)
+ * and a feature PR may not add to it. The template is declared here, next to
+ * every other URL this server owns, and `routes/snapshots.ts` mounts THIS
+ * constant — so the builder and the mount point cannot drift apart the way
+ * they would if the route file spelled the path out a second time. Folding it
+ * into `API_ROUTES.snapshots` is a follow-up contract-change issue.
+ */
+export const SNAPSHOT_MESH_ROUTE = "/projects/:projectId/snapshots/:snapshotId/mesh";
+
+/** HTTP path for a snapshot's persisted binary STL. */
+export function snapshotMeshUrl(projectId: string, snapshotId: SnapshotId): string {
+  return buildPath(SNAPSHOT_MESH_ROUTE, { projectId, snapshotId });
+}

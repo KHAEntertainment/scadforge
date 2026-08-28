@@ -68,7 +68,13 @@ function fillRoute(template: string, params: Record<string, string>): string {
  */
 export function createApiClient(options: ApiClientOptions = {}) {
   const baseUrl = options.baseUrl ?? "";
-  const fetchImpl = options.fetchImpl ?? fetch;
+  // `fetch` is bound to the global explicitly. A bare `fetchImpl(...)` call is
+  // safe as written (WebIDL replaces an `undefined` receiver with the global),
+  // but that safety lasts only as long as nobody turns this into a property
+  // call — browsers throw `TypeError: Illegal invocation` on a WebIDL global
+  // invoked with any other receiver. Binding once here makes the guarantee
+  // local instead of an invariant every future caller has to remember.
+  const fetchImpl: typeof fetch = options.fetchImpl ?? fetch.bind(globalThis);
 
   async function request<T>(
     path: string,
@@ -249,6 +255,24 @@ export function createApiClient(options: ApiClientOptions = {}) {
 
     resolveUrl(path: string): string {
       return join(baseUrl, path);
+    },
+
+    /**
+     * Existence probe for a binary artifact (Issue #41's snapshot mesh).
+     *
+     * Returns a plain boolean rather than throwing: "this snapshot has no
+     * mesh" is a normal answer, not a failure, and a caller that has to catch
+     * an exception to learn it would be modelling it wrong. An unreachable
+     * server also resolves `false` — the viewer's placeholder is the right
+     * outcome either way.
+     */
+    async headRaw(url: string): Promise<boolean> {
+      try {
+        const res = await fetchImpl(join(baseUrl, url), { method: "HEAD" });
+        return res.ok;
+      } catch {
+        return false;
+      }
     }
   };
 }

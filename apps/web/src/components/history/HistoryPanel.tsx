@@ -14,6 +14,16 @@ export interface HistoryPanelProps {
   error: string | null;
   /** Refetches the snapshot list — called after a successful revert so the UI reflects the new head (Issue #34 AC). */
   onChanged: () => void;
+  /**
+   * Notifies the owner which snapshot is selected, so the Preview tab can show
+   * that snapshot's mesh and renders (Issue #41).
+   *
+   * Selection state stays HERE rather than being lifted: this component
+   * already handles the awkward cases (a list that refreshes under an
+   * in-flight selection, a revert that should select the new snapshot), and
+   * moving that up would duplicate it. The owner only needs to be told.
+   */
+  onSelected?: (id: string) => void;
 }
 
 /**
@@ -25,7 +35,15 @@ export interface HistoryPanelProps {
  * disappears (it never does today — history is append-only — but the list
  * can still refresh out from under an in-flight selection).
  */
-export function HistoryPanel({ client, projectId, snapshots, loading, error, onChanged }: HistoryPanelProps) {
+export function HistoryPanel({
+  client,
+  projectId,
+  snapshots,
+  loading,
+  error,
+  onChanged,
+  onSelected
+}: HistoryPanelProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -39,9 +57,22 @@ export function HistoryPanel({ client, projectId, snapshots, loading, error, onC
   const diffState = useSnapshotDiff(client, projectId, selectedId);
   const headId = snapshots[0]?.id ?? null;
 
+  /**
+   * Only a DELIBERATE pick is reported upward — not the default selection the
+   * effect above makes, and not the re-pin after a list refresh. Reporting
+   * those would let merely opening the History tab override the preview's own
+   * choice of snapshot, which is the behaviour App's fallback chain already
+   * covers.
+   */
+  function handleSelect(id: string) {
+    setSelectedId(id);
+    onSelected?.(id);
+  }
+
   function handleReverted(newSnapshot: SnapshotManifest) {
     onChanged();
     setSelectedId(newSnapshot.id);
+    onSelected?.(newSnapshot.id);
   }
 
   return (
@@ -53,7 +84,7 @@ export function HistoryPanel({ client, projectId, snapshots, loading, error, onC
           loading={loading}
           error={error}
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          onSelect={handleSelect}
         />
       </div>
       <div className="history-panel-detail">

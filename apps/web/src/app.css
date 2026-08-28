@@ -83,6 +83,17 @@ body {
   background: #fff;
   border: 1px solid #e3e3e3;
 }
+/* The user's own prompt (Issue #41). Deliberately distinct from the assistant
+   bubble — indented, tinted and right-aligned — so a glance at the transcript
+   shows who said what. */
+.chat-item--user {
+  background: #e7edfd;
+  border: 1px solid #c9d6f7;
+  color: #16264a;
+  margin-left: 1.5rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .chat-item--tool {
   background: #f1f3f8;
   font-size: 0.8rem;
@@ -179,6 +190,35 @@ body {
 .viewer-3d,
 .viewer-placeholder {
   flex: 1;
+  /* Flex items default to `min-height: auto`, which refuses to shrink below
+     content size — that lets the three.js canvas push the validation panel
+     off the bottom of the tab instead of sharing the space. */
+  min-height: 0;
+}
+
+/* The surface shared by the 3D viewer and the PNG views. A flex column, so
+   `.viewer-3d { flex: 1 }` inside it resolves to a real height — inside a
+   plain block it collapses to zero and the canvas renders nothing. */
+.preview-surface {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.preview-viewer {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The viewer stays MOUNTED while a PNG view is shown so its WebGL context is
+   never torn down and re-created — browsers cap live WebGL contexts and
+   reclaim the oldest, which blanked the viewport after a few mode switches.
+   `display: none` keeps the context alive; unmounting would not. */
+.preview-viewer--hidden {
+  display: none;
 }
 
 .viewer-placeholder {
@@ -195,6 +235,38 @@ body {
   max-height: 100%;
   margin: auto;
   object-fit: contain;
+}
+
+/* Validation verdict under the preview (Issue #41 symptom 3). `flex: none` so
+   it keeps its height while the viewport above absorbs the remaining space. */
+.validation-panel {
+  flex: none;
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+  padding: 0.5rem 0.75rem;
+  border-top: 1px solid #eee;
+  font-size: 0.8rem;
+  background: #fafafa;
+}
+.validation-panel--amber {
+  background: #fff8ec;
+  border-top-color: #f0d9ab;
+}
+.validation-panel--red {
+  background: #fff1f1;
+  border-top-color: #f0bcbc;
+}
+.validation-panel-detail {
+  color: #555;
+}
+.validation-findings {
+  margin: 0;
+  padding-left: 1.1rem;
+  color: #333;
+}
+.validation-findings li + li {
+  margin-top: 0.25rem;
 }
 
 .history-tab {

@@ -10,6 +10,8 @@ export interface HistoryTabProps {
   loading: boolean;
   error: string | null;
   onExported: () => void;
+  /** Reports the selected snapshot up to `App`, which previews it (Issue #41). */
+  onSelectSnapshot?: (id: string) => void;
 }
 
 /**
@@ -19,7 +21,15 @@ export interface HistoryTabProps {
  * `onExported` (the callback name predates revert; it simply means "the
  * snapshot list may have changed, refetch it").
  */
-export function HistoryTab({ client, projectId, snapshots, loading, error, onExported }: HistoryTabProps) {
+export function HistoryTab({
+  client,
+  projectId,
+  snapshots,
+  loading,
+  error,
+  onExported,
+  onSelectSnapshot
+}: HistoryTabProps) {
   return (
     <div className="history-tab">
       <ExportButton client={client} projectId={projectId} onExported={onExported} />
@@ -30,6 +40,7 @@ export function HistoryTab({ client, projectId, snapshots, loading, error, onExp
         loading={loading}
         error={error}
         onChanged={onExported}
+        onSelected={onSelectSnapshot}
       />
     </div>
   );

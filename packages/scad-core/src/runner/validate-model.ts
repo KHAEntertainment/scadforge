@@ -16,6 +16,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+import { copyFile, mkdir, rename, rm } from "node:fs/promises";
+import { dirname } from "node:path";
 import { DEFAULT_RENDER_TIMEOUT_MS } from "../types.js";
 import type { ParamValues, ValidationGateOptions, ValidationResult } from "../types.js";
 import { validateMesh } from "../validate/validate.js";
@@ -33,6 +35,21 @@ export interface ValidateModelOptions {
   timeoutMs?: number;
   /** Library directories staged alongside the model (BOSL2/MCAD). */
   libraryPaths?: readonly string[];
+  /**
+   * Absolute path to KEEP the binary STL at (ScadForge Issue #41).
+   *
+   * This function already renders a binary STL — it is the input manifold-3d
+   * validates — and until now threw it away with the work directory, which is
+   * why no `.stl` existed anywhere in a project tree and the 3D viewer was
+   * permanently blank. Handing a destination in reuses that render instead of
+   * paying for a second one.
+   *
+   * Persisting is BEST EFFORT: a copy that fails never fails the validation
+   * the caller actually asked for. The frozen `ValidationResult` has no field
+   * to report the destination in, and does not need one — the path is the
+   * caller's own input, and its existence on disk is the whole signal.
+   */
+  persistMeshTo?: string;
 }
 
 /**
@@ -51,9 +68,31 @@ export async function validateModel(scadPath: string, options: ValidateModelOpti
     // `format: "stl"` is the single-invocation path (mesh-export.ts): the
     // requested format IS the validation input, so no second render runs.
     const mesh = await exportMeshWithValidationStl(work.dir, work.modelName, "stl", overrideArgs, timeoutMs);
+    if (options.persistMeshTo) {
+      await persistMesh(mesh.stlPath, options.persistMeshTo);
+    }
     const result = await validateMesh({ meshPath: mesh.stlPath, options: options.gate });
     return { ...result, export_ms: mesh.ms };
   } finally {
     await work.cleanup();
+  }
+}
+
+/**
+ * Copies the just-rendered validation STL to `dest`.
+ *
+ * Written via a sibling `.tmp` file and then renamed, so a reader (the mesh
+ * route, streaming bytes to the viewer) never observes a half-written STL —
+ * `rename` within one directory is atomic. Best effort by contract: any
+ * failure resolves quietly, leaving whatever mesh was already there intact.
+ */
+async function persistMesh(sourcePath: string, dest: string): Promise<void> {
+  const tmp = `${dest}.tmp`;
+  try {
+    await mkdir(dirname(dest), { recursive: true });
+    await copyFile(sourcePath, tmp);
+    await rename(tmp, dest);
+  } catch {
+    await rm(tmp, { force: true }).catch(() => {});
   }
 }

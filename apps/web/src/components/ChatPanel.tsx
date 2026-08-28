@@ -11,6 +11,13 @@ export interface ChatPanelProps {
 
 function ChatItemRow({ item }: { item: ChatItem }) {
   switch (item.kind) {
+    case "user_text":
+      return (
+        <p className="chat-item chat-item--user" data-testid="chat-user-message">
+          {item.text}
+        </p>
+      );
+
     case "assistant_text":
       return <p className="chat-item chat-item--assistant">{item.text}</p>;
 
