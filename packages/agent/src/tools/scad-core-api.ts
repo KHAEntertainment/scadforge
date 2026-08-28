@@ -62,9 +62,16 @@ export interface WriteScadOutcome {
 
 /** Result of {@link ScadCoreApi.setParams}. */
 export interface SetParamsOutcome {
-  /** The full parameter bag after the update. */
+  /** The full parameter bag after the update — only ACCEPTED values are applied. */
   params: ParamValues;
-  /** Names rejected because they are not in the parameter schema. */
+  /**
+   * Names whose supplied value was rejected and therefore NOT applied: not
+   * declared in the current Customizer schema, of the wrong runtime type, or
+   * out of its declared min/max/options/maxLength (Issue #32). The frozen
+   * `set_params` tool result has no separate error field for the latter two
+   * cases, so every rejection reason folds into this one array — never a
+   * silent coerce of a bad value into range.
+   */
   unknown_params: string[];
   snapshot: SnapshotManifest | null;
 }

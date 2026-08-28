@@ -9,6 +9,16 @@
 // it here (rather than folding params into `projects.ts`) is what hard rule 3
 // requires, and it is what makes the Customizer schema — the thing Scenario A
 // asserts on — reachable over HTTP at all.
+//
+// Issue #32: an unknown parameter name, a wrong-type value, or an
+// out-of-range value is never silently coerced. That validation is NOT done
+// here (this route only checks request SHAPE — `values` is an object,
+// `snapshot` is a boolean) — `scadCore.updateParams` (`scad-core-impl.ts`)
+// runs it via `runtime.ts`'s `planParamUpdate`, the exact same function the
+// agent's `set_params` tool handler calls, and rejects with a
+// `VALIDATION_FAILED` this route relays via `toErrorResponse` below. One
+// validated code path for both surfaces — see `planParamUpdate`'s doc
+// comment for why.
 
 import { Hono } from "hono";
 import { API_ROUTES } from "@scadforge/protocol";

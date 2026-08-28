@@ -57,12 +57,13 @@ import {
   snapshotDir,
   snapshotRenderPath
 } from "@scadforge/scad-core";
-import type { ParamValues, RenderAttachment, RenderedView } from "@scadforge/scad-core";
+import type { RenderAttachment, RenderedView } from "@scadforge/scad-core";
 import { RouteError } from "./errors.js";
 import { allocateProjectId, listProjectIds } from "./project-paths.js";
 import type { RenderFile, ScadCoreApi } from "./scad-core-api.js";
 import {
   asRouteResult,
+  planParamUpdate,
   readParams,
   readProject,
   readScad,
@@ -301,9 +302,21 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
     async updateParams(projectId, request: ParamsUpdateRequest): Promise<ParamsResponse> {
       const dir = runtime.dirFor(projectId);
       await readProject(dir);
-      const current = await readParams(dir);
-      // Partial update: only the named parameters change (`api.ts`).
-      const merged: ParamValues = { ...current, ...request.values };
+      // Single code path (Issue #32): the same validation + merge
+      // `set_params` uses (`runtime.ts`'s `planParamUpdate`). An unknown
+      // name, an out-of-range value, or a value of the wrong type is a hard
+      // failure here — never a silent coerce, never a silent drop (unlike
+      // the agent tool, whose frozen result shape can only report rejections
+      // via `unknown_params`, this REST route's frozen `ApiError` shape can
+      // say exactly what was wrong with each one).
+      const plan = await planParamUpdate(dir, runtime, request.values);
+      if (plan.rejected.length > 0) {
+        throw new RouteError(
+          "VALIDATION_FAILED",
+          plan.rejected.map((r) => r.message).join(" ")
+        );
+      }
+      const merged = plan.merged;
       const message = `Set ${Object.keys(request.values).length} parameter(s)`;
 
       if (request.snapshot !== false) {

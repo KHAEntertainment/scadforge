@@ -15,9 +15,11 @@ import {
   ScadForgeError,
   readProjectManifest,
   rootModelPath,
-  rootParamsPath
+  rootParamsPath,
+  runParamExport,
+  validateParamValues
 } from "@scadforge/scad-core";
-import type { ParamValues, ParamsFile } from "@scadforge/scad-core";
+import type { ParamRejection, ParamSchema, ParamValues, ParamsFile } from "@scadforge/scad-core";
 import type { ProjectManifest, ProviderConfig } from "@scadforge/protocol";
 import { RouteError } from "./errors.js";
 import { projectDir, resolveProjectsRoot } from "./project-paths.js";
@@ -119,4 +121,58 @@ export async function writeRootParams(dir: string, params: ParamValues): Promise
     parameterSets: { [PARAMS_ACTIVE_PRESET]: params }
   };
   await writeFile(rootParamsPath(dir), JSON.stringify(file, null, 2), "utf8");
+}
+
+/** An empty schema, used when the current model cannot be parsed for parameters yet. */
+const EMPTY_PARAM_SCHEMA: ParamSchema = { title: "", parameters: [] };
+
+/**
+ * The live Customizer schema for the project at `dir`, or an empty schema
+ * when the current `model.scad` does not parse (a brand-new project's
+ * placeholder, or a broken intermediate state) — never a throw. Used ONLY to
+ * validate a params UPDATE (see {@link planParamUpdate}); the REST `GET
+ * .../params` route (`scad-core-impl.ts`'s `paramsResponse`) still surfaces a
+ * genuine parse failure as `RENDER_FAILED`, since a caller asking to READ the
+ * schema needs to know it isn't available.
+ */
+export async function readParamSchema(dir: string, runtime: ServerRuntime): Promise<ParamSchema> {
+  try {
+    return await runParamExport(rootModelPath(dir), { libraryPaths: runtime.libraryPaths });
+  } catch {
+    return EMPTY_PARAM_SCHEMA;
+  }
+}
+
+/** The result of validating and merging a partial params update onto the project's current values. */
+export interface ParamUpdatePlan {
+  /** The full parameter bag after the update — `current` with every ACCEPTED value from `values` applied. */
+  merged: ParamValues;
+  /** Empty when every supplied value validated. Never merged into `merged`. */
+  rejected: ParamRejection[];
+}
+
+/**
+ * THE single code path (Issue #32) that turns a caller-supplied partial
+ * `values` bag into the full merged params.json contents, validated against
+ * the project's live Customizer schema via `validateParamValues`
+ * (`@scadforge/scad-core`). Both `routes/params.ts` (through
+ * `scad-core-impl.ts`'s `updateParams`) and the agent's `set_params` tool
+ * (through `agent-scad-core.ts`'s `setParams`) call this — neither re-derives
+ * the merge or the validation rules itself, so a value the REST route
+ * accepts and a value the agent accepts can never disagree.
+ *
+ * Callers still decide what to DO with `rejected`: the REST route treats any
+ * rejection as a hard `VALIDATION_FAILED` (never a silent coerce); the
+ * agent's frozen `set_params` result shape has no field for a per-value
+ * error, so it folds every rejection into `unknown_params` and applies only
+ * `merged` (which already excludes them) — see each call site.
+ */
+export async function planParamUpdate(
+  dir: string,
+  runtime: ServerRuntime,
+  values: ParamValues
+): Promise<ParamUpdatePlan> {
+  const [schema, current] = await Promise.all([readParamSchema(dir, runtime), readParams(dir)]);
+  const { accepted, rejected } = validateParamValues(schema, values);
+  return { merged: { ...current, ...accepted }, rejected };
 }
