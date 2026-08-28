@@ -76,12 +76,14 @@ export {
   createSnapshot,
   initProject,
   listSnapshots,
+  mergeParamsAtomic,
   readProjectManifest,
   readSnapshotManifest,
   recordExport,
   revertToSnapshot
 } from "./store/store.js";
 export type { CreateSnapshotInput, InitProjectInput } from "./store/store.js";
+export { PARAMS_LOCK_MAX_ATTEMPTS, withParamsLock } from "./store/params-lock.js";
 export {
   attachRendersToSnapshot,
   attachValidationToSnapshot,

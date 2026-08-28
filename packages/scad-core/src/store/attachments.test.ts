@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PROJECT_LAYOUT } from "@scadforge/protocol";
 import type { SnapshotManifest } from "@scadforge/protocol";
-import { initProject } from "./store.js";
+import { initProject, readSnapshotManifest } from "./store.js";
 import { snapshotDir } from "./paths.js";
 import {
   attachRendersToSnapshot,
@@ -40,13 +40,16 @@ afterEach(async () => {
   await rm(projectDir, { recursive: true, force: true });
 });
 
-async function readManifest(id: string): Promise<SnapshotManifest> {
+/** Reads `history/<id>/manifest.json` RAW off disk -- bypassing `readSnapshotManifest`'s derived merge, so these assertions prove the file itself is untouched (Issue #45 AC2). */
+async function readRawHistoryManifest(id: string): Promise<SnapshotManifest> {
   const raw = await readFile(join(snapshotDir(projectDir, id), PROJECT_LAYOUT.snapshot.manifestFile), "utf8");
   return JSON.parse(raw) as SnapshotManifest;
 }
 
 describe("attachRendersToSnapshot", () => {
-  it("copies the PNG into the snapshot's views/ dir and records a RenderRef", async () => {
+  it("copies the PNG into the snapshot's DERIVED views/ dir and records a RenderRef, WITHOUT touching history/<id>/manifest.json", async () => {
+    const rawBefore = await readRawHistoryManifest("0001");
+
     const manifest = await attachRendersToSnapshot(projectDir, "0001", [
       { view: "iso", sourcePath: pngPath, render_ms: 42, width: 1024, height: 768 }
     ]);
@@ -61,8 +64,19 @@ describe("attachRendersToSnapshot", () => {
       render_ms: 42
     });
     await expect(readFile(snapshotRenderPath(projectDir, "0001", "iso"))).resolves.toEqual(PNG_BYTES);
-    // Persisted, not just returned.
-    expect((await readManifest("0001")).renders).toHaveLength(1);
+
+    // Reads through the real store surface (what every consumer actually
+    // calls) see the enrichment merged in...
+    expect((await readSnapshotManifest(projectDir, "0001")).renders).toHaveLength(1);
+    // ...but the RAW `history/0001/manifest.json` file on disk is byte-for-byte
+    // unchanged -- this is the enforced-in-code guarantee AC2 requires, not a
+    // convention.
+    expect(await readRawHistoryManifest("0001")).toEqual(rawBefore);
+    // And its own `views/` directory (created empty at snapshot creation) has
+    // no PNG in it -- the file physically lives under `derived/`.
+    await expect(
+      readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.viewsDir, "iso.png"))
+    ).rejects.toThrow();
   });
 
   it("uses the caller's URL builder, and falls back to a bare relative path without one", async () => {
@@ -90,21 +104,18 @@ describe("attachRendersToSnapshot", () => {
 
     expect(second.renders.filter((r) => r.view === "iso")).toHaveLength(1);
     expect(second.renders[0]).toMatchObject({ render_ms: 99, width: 640, height: 480 });
+    // A second attach for the SAME view still never touches history/.
+    expect((await readRawHistoryManifest("0001")).renders).toEqual([]);
   });
 
   it("leaves the model timeline untouched (append-only history is not violated)", async () => {
-    const before = await readManifest("0001");
+    const before = await readRawHistoryManifest("0001");
     await attachRendersToSnapshot(projectDir, "0001", [
       { view: "iso", sourcePath: pngPath, render_ms: 5, width: 1024, height: 768 }
     ]);
-    const after = await readManifest("0001");
+    const after = await readRawHistoryManifest("0001");
 
-    expect(after.id).toBe(before.id);
-    expect(after.parent).toBe(before.parent);
-    expect(after.timestamp).toBe(before.timestamp);
-    expect(after.files).toEqual(before.files);
-    expect(after.params).toEqual(before.params);
-    expect(after.origin).toBe(before.origin);
+    expect(after).toEqual(before);
     await expect(
       readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.modelFile), "utf8")
     ).resolves.toBe("cube([10,10,10]);\n");
@@ -123,9 +134,9 @@ describe("attachRendersToSnapshot", () => {
     expect(manifest.renders).toEqual([]);
   });
 
-  it("derives the views/ directory from the frozen project layout", () => {
+  it("derives the DERIVED views/ directory, not history/<id>/views/", () => {
     expect(snapshotViewsDir(projectDir, "0002")).toBe(
-      join(snapshotDir(projectDir, "0002"), PROJECT_LAYOUT.snapshot.viewsDir)
+      join(projectDir, PROJECT_LAYOUT.metaDir, "derived", "0002", "views")
     );
   });
 });
@@ -147,7 +158,9 @@ const GREEN_VALIDATION: ValidationResult = {
 };
 
 describe("attachValidationToSnapshot", () => {
-  it("persists the full report verbatim and summarises it into the manifest", async () => {
+  it("persists the full report verbatim to the DERIVED location and summarises it into the read-merged manifest, WITHOUT touching history/<id>/validation.json or manifest.json", async () => {
+    const rawBefore = await readRawHistoryManifest("0001");
+
     const manifest = await attachValidationToSnapshot(projectDir, "0001", GREEN_VALIDATION);
 
     expect(manifest.validation).toEqual({
@@ -161,7 +174,13 @@ describe("attachValidationToSnapshot", () => {
 
     const persisted = JSON.parse(await readFile(snapshotValidationPath(projectDir, "0001"), "utf8"));
     expect(persisted).toEqual(GREEN_VALIDATION.report);
-    expect((await readManifest("0001")).validation?.manifold).toBe(true);
+    expect((await readSnapshotManifest(projectDir, "0001")).validation?.manifold).toBe(true);
+
+    // The raw file on disk never changed.
+    expect(await readRawHistoryManifest("0001")).toEqual(rawBefore);
+    await expect(
+      readFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.validationFile), "utf8")
+    ).rejects.toThrow();
   });
 
   it("records a red gate and its warning count without discarding the report", async () => {
@@ -180,24 +199,23 @@ describe("attachValidationToSnapshot", () => {
     expect(manifest.validation).toMatchObject({ badge: "red", manifold: false, components: null, warning_count: 1 });
   });
 
-  it("re-validating replaces the previous verdict rather than appending", async () => {
+  it("re-validating replaces the previous verdict rather than appending, still never touching history/", async () => {
     await attachValidationToSnapshot(projectDir, "0001", GREEN_VALIDATION);
+    const rawAfterFirst = await readRawHistoryManifest("0001");
     const second = await attachValidationToSnapshot(projectDir, "0001", {
       ...GREEN_VALIDATION,
       gate: { ...GREEN_VALIDATION.gate, badge: "amber", warnings: ["multi-part allowed by override"] }
     });
     expect(second.validation?.badge).toBe("amber");
     expect(second.validation?.warning_count).toBe(1);
+    expect(await readRawHistoryManifest("0001")).toEqual(rawAfterFirst);
   });
 
   it("leaves the model timeline untouched", async () => {
-    const before = await readManifest("0001");
+    const before = await readRawHistoryManifest("0001");
     await attachValidationToSnapshot(projectDir, "0001", GREEN_VALIDATION);
-    const after = await readManifest("0001");
-    expect(after.id).toBe(before.id);
-    expect(after.timestamp).toBe(before.timestamp);
-    expect(after.params).toEqual(before.params);
-    expect(after.files.model_scad).toBe(before.files.model_scad);
+    const after = await readRawHistoryManifest("0001");
+    expect(after).toEqual(before);
   });
 
   it("fails with a typed SNAPSHOT_NOT_FOUND on an unknown snapshot", async () => {

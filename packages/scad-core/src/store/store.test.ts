@@ -8,12 +8,13 @@ import {
   createSnapshot,
   initProject,
   listSnapshots,
+  mergeParamsAtomic,
   readProjectManifest,
   readSnapshotManifest,
   recordExport,
   revertToSnapshot
 } from "./store.js";
-import { snapshotDir } from "./paths.js";
+import { snapshotDir, rootParamsPath } from "./paths.js";
 
 let projectDir: string;
 
@@ -158,6 +159,65 @@ describe("project store (filesystem, temp dir)", () => {
 
     const project = await readProjectManifest(projectDir);
     expect(project.head).toBe("0004");
+  });
+
+  // Issue #44: `revertToSnapshot` also writes root `params.json` (it REPLACES
+  // it wholesale with the target's own bag) and must hold the SAME params
+  // lock as `mergeParamsAtomic`, or a concurrent params update could
+  // interleave with its `createSnapshot` write of the same shared files.
+  it("revertToSnapshot holds the params lock -- fully serialized against a concurrent mergeParamsAtomic writer, never interleaved", async () => {
+    await initProject(projectDir, {
+      id: "p",
+      name: "n",
+      provider: providerConfig,
+      content: "cube([10,10,10]);\n",
+      params: { size: 10 }
+    });
+    await createSnapshot(projectDir, {
+      content: "cube([20,20,20]);\n",
+      params: { size: 20 },
+      message: "v2",
+      origin: "manual",
+      pass: null
+    });
+
+    const events: string[] = [];
+    const slowMerge = mergeParamsAtomic(projectDir, { extra: 99 }, async (merged) => {
+      events.push("merge-start");
+      await new Promise((r) => setTimeout(r, 40));
+      await writeFile(
+        rootParamsPath(projectDir),
+        JSON.stringify({ fileFormatVersion: 1, parameterSets: { current: merged } }, null, 2),
+        "utf8"
+      );
+      events.push("merge-end");
+      return merged;
+    });
+    // No direct hook inside `revertToSnapshot` to bracket with events, but it
+    // acquires the SAME lock via `withParamsLock` before its `createSnapshot`
+    // call -- if that lock is real, `revertToSnapshot` can only run either
+    // entirely BEFORE `merge-start` or entirely AFTER `merge-end`, never
+    // overlapping the 40ms window in between.
+    const revert = revertToSnapshot(projectDir, "0001").then(() => events.push("revert-done"));
+
+    await Promise.all([slowMerge, revert]);
+
+    const mergeStart = events.indexOf("merge-start");
+    const mergeEnd = events.indexOf("merge-end");
+    const revertDone = events.indexOf("revert-done");
+    // revert-done is never BETWEEN merge-start and merge-end (which would
+    // mean revert's write landed while merge was still mid-critical-section).
+    const revertBeforeMerge = revertDone < mergeStart;
+    const revertAfterMerge = revertDone > mergeEnd;
+    expect(revertBeforeMerge || revertAfterMerge).toBe(true);
+
+    // And whichever ran last fully committed its OWN coherent value -- no
+    // torn write mixing the two.
+    const raw = JSON.parse(await readFile(rootParamsPath(projectDir), "utf8"));
+    const values = raw.parameterSets.current;
+    const isRevertOnly = values.size === 10 && values.extra === undefined;
+    const isMergeAfterRevert = values.extra === 99 && values.size === 10;
+    expect(isRevertOnly || isMergeAfterRevert).toBe(true);
   });
 
   it("recordExport appends to an append-only exports ledger", async () => {

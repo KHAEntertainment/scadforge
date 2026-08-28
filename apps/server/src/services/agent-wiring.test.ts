@@ -77,7 +77,10 @@ describe("agent seam: artifactUrl / exportFileName (Issue #16's open question, a
     const scadCore = createAgentScadCore({ runtime, projectId: "bracket" });
     const { mkdir, writeFile } = await import("node:fs/promises");
     const png = snapshotRenderPath(dir, "0001", "iso");
-    await mkdir(join(dir, ".scadforge", "history", "0001", "views"), { recursive: true });
+    // Post-creation renders physically live under `.scadforge/derived/<id>/`
+    // (Issue #45), never `history/<id>/views/` -- `snapshotRenderPath` builds
+    // that path, so mkdir its actual parent.
+    await mkdir(join(dir, ".scadforge", "derived", "0001", "views"), { recursive: true });
     await writeFile(png, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     const base64 = await scadCore.readImageBase64(png);
     expect(base64).toBe("iVBORw==");

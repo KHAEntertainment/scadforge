@@ -133,9 +133,9 @@ describe.skipIf(!dockerAvailable())("@docker Issue #32: set_params and PUT .../p
     expect(outcome.params).toEqual({});
   }, 60_000);
 
-  // COUNTEREXAMPLE: concurrent updates from both surfaces never lose a write
-  // to a data race -- each targets a DIFFERENT key, so the merge must retain both.
-  it("concurrent REST and agent updates to different keys both persist", async () => {
+  // COUNTEREXAMPLE (Issue #44, was a documented limitation -- now fixed):
+  // concurrent updates from both surfaces to DISJOINT keys must both survive.
+  it("concurrent REST and agent updates to different keys BOTH persist -- no lost update", async () => {
     const withVector = "size = 20; // [5:50]\noffset = 3; // [0:20]\ncube([size, size, size + offset]);\n";
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("concurrent");
@@ -155,20 +155,56 @@ describe.skipIf(!dockerAvailable())("@docker Issue #32: set_params and PUT .../p
       agentCore.setParams({ offset: 7 }, 0)
     ]);
 
+    // Issue #44: both writers now merge onto the params LOCK's serialized,
+    // always-fresh read of the current file (`@scadforge/scad-core`'s
+    // `mergeParamsAtomic`), so a genuinely concurrent update to a DISJOINT key
+    // is never lost -- both values must be present, regardless of which
+    // writer's snapshot ends up head.
     const params = await rest.getParams("concurrent");
-    // Both writers read `current` (this repo's read-merge-write, no
-    // cross-process lock on the merge itself) at roughly the same time and
-    // each persist their OWN merge; whichever snapshot lands last wins
-    // wholesale, so a genuinely concurrent update to a DISJOINT key can be
-    // lost (a documented limitation of the current store, not something
-    // Issue #32 introduces or is scoped to fix -- `packages/scad-core/src/
-    // store/**` is Issue #34's owned path). The invariant this DOES have to
-    // hold: the result is one of the two writers' own valid, complete merges
-    // -- never a torn write mixing an old and new value for the SAME key,
-    // and never a crash.
-    const isRestsMerge = params.values.size === 25 && params.values.offset === undefined;
-    const isAgentsMerge = params.values.offset === 7 && params.values.size === undefined;
-    expect(isRestsMerge || isAgentsMerge).toBe(true);
+    expect(params.values).toEqual({ size: 25, offset: 7 });
+  }, 60_000);
+
+  // COUNTEREXAMPLE (Issue #44): N concurrent writers, each a DISJOINT key --
+  // every one must survive, cross-process-safe locking (not an in-process
+  // mutex the M4 MCP server, sharing the same `.scadforge/` tree, could race
+  // past).
+  it("N concurrent REST writers to N disjoint keys all persist -- no lost update", async () => {
+    const params = Array.from({ length: 8 }, (_, i) => `p${i}`);
+    const declarations = params.map((p) => `${p} = 0; // [0:100]`).join("\n");
+    const content = `${declarations}\ncube([${params.map((p) => `1 + ${p}`).join(", ")}]);\n`;
+
+    const runtime = runtimeFor(root);
+    const dir = runtime.dirFor("n-concurrent");
+    await initProject(dir, {
+      id: "n-concurrent",
+      name: "N Concurrent",
+      provider: runtime.provider,
+      content,
+      message: "Initial snapshot"
+    });
+
+    const rest = createScadCoreApi(runtime);
+    await Promise.all(
+      params.map((p, i) => rest.updateParams("n-concurrent", { values: { [p]: i + 1 }, snapshot: true }))
+    );
+
+    const result = await rest.getParams("n-concurrent");
+    for (let i = 0; i < params.length; i++) {
+      expect(result.values[params[i]!]).toBe(i + 1);
+    }
+  }, 60_000);
+
+  // Rapid successive writes (slider-drag pattern): must not degrade or
+  // deadlock, and the LAST write to a given key wins (no lost update to
+  // itself, no torn state).
+  it("rapid successive writes to the SAME key (slider-drag pattern) never deadlock and the final value sticks", async () => {
+    const runtime = await seedProject();
+    const rest = createScadCoreApi(runtime);
+
+    for (let v = 21; v <= 40; v++) {
+      await rest.updateParams("bracket", { values: { size: v }, snapshot: false });
+    }
+    expect((await rest.getParams("bracket")).values).toEqual({ size: 40 });
   }, 60_000);
 
   it("params referencing a variable the current model no longer declares are rejected as unknown on both surfaces", async () => {
