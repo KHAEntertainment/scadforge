@@ -85,6 +85,8 @@ export type { CreateSnapshotInput, InitProjectInput } from "./store/store.js";
 export {
   attachRendersToSnapshot,
   attachValidationToSnapshot,
+  SNAPSHOT_MESH_FILE,
+  snapshotMeshPath,
   snapshotRenderPath,
   snapshotValidationPath,
   snapshotViewsDir

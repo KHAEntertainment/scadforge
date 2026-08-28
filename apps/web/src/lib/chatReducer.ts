@@ -8,6 +8,17 @@ import type { SnapshotManifest, SseEvent, TurnStatus, TurnUsage } from "@scadfor
 
 /** One row in the rendered chat transcript. */
 export type ChatItem =
+  /**
+   * The user's own prompt, echoed into the transcript the instant it is
+   * submitted (Issue #41 symptom 2).
+   *
+   * There is no SSE event carrying it back — the frozen event union is
+   * assistant-side only — so nothing ever put the user's words on screen and
+   * the transcript read as a monologue. `localId` is assigned once at submit
+   * time and never regenerated, which is what makes re-rendering, the rest of
+   * the turn's events, and a rehydrate-from-storage all idempotent.
+   */
+  | { kind: "user_text"; localId: string; text: string }
   | { kind: "assistant_text"; turnId: string; text: string }
   | {
       kind: "tool_activity";
@@ -156,4 +167,62 @@ export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
 /** Folds an ordered list of events (e.g. from a test fixture) into final state. */
 export function reduceChatEvents(events: SseEvent[], seed: ChatState = initialChatState): ChatState {
   return events.reduce(reduceChatEvent, seed);
+}
+
+// ── local actions (Issue #41) ────────────────────────────────────────────────
+//
+// Not everything in the transcript comes from the wire. The user's own message
+// and a rehydrated transcript are both purely client-side, so they travel as
+// LOCAL actions alongside the frozen `SseEvent` union rather than being faked
+// into it — `reduceChatEvent` above stays a pure function of the contract, and
+// its exhaustiveness guard keeps working if the union grows.
+
+/** A client-originated transcript change. */
+export type ChatLocalAction =
+  /** The user submitted `text`; echo it immediately (optimistic). */
+  | { type: "local_user_message"; localId: string; text: string }
+  /** Replace the whole transcript, e.g. rehydrating after a page refresh. */
+  | { type: "local_restore"; items: ChatItem[] }
+  /** Drop the transcript, e.g. when the selected project changes. */
+  | { type: "local_reset" };
+
+/** Everything `useChat`'s reducer accepts: wire events plus local actions. */
+export type ChatAction = SseEvent | ChatLocalAction;
+
+function isLocalAction(action: ChatAction): action is ChatLocalAction {
+  return action.type.startsWith("local_");
+}
+
+/** Applies one wire event or local action to chat state. Never throws on well-typed input. */
+export function reduceChatAction(state: ChatState, action: ChatAction): ChatState {
+  if (!isLocalAction(action)) return reduceChatEvent(state, action);
+
+  switch (action.type) {
+    case "local_user_message": {
+      // Idempotent by `localId`: a double-submit, a StrictMode double-invoke,
+      // or a restore racing a live echo can each deliver this twice, and none
+      // of them may put the prompt on screen twice (AC: "without
+      // duplicating").
+      if (state.items.some((item) => item.kind === "user_text" && item.localId === action.localId)) {
+        return state;
+      }
+      return {
+        ...state,
+        items: [...state.items, { kind: "user_text", localId: action.localId, text: action.text }]
+      };
+    }
+
+    case "local_restore": {
+      return { ...state, items: action.items };
+    }
+
+    case "local_reset": {
+      return initialChatState;
+    }
+
+    default: {
+      const _exhaustive: never = action;
+      return _exhaustive;
+    }
+  }
 }

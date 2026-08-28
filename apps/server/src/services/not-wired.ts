@@ -33,6 +33,7 @@ export const notWiredScadCoreApi: ScadCoreApi = {
   getSnapshotDiff: async () => notWired(),
   revertSnapshot: async () => notWired(),
   getSnapshotRenderFile: async () => notWired(),
+  getSnapshotMeshFile: async () => notWired(),
   getParams: async () => notWired(),
   updateParams: async () => notWired(),
   renderViews: async () => notWired(),

@@ -4,7 +4,9 @@
 // round-trip: parser (#30) -> schema -> set value -> render -> bbox reflects
 // the change, exercised end to end against the pinned OpenSCAD image.
 import { describe, expect, it } from "vitest";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseParamSchema } from "../params/parse.js";
 import { dockerAvailable, fixture } from "../test-support/docker-available.js";
 import { validateModel } from "./validate-model.js";
@@ -55,5 +57,65 @@ describe.skipIf(!dockerAvailable())("@docker validateModel params override (real
     const baseline = await validateModel(scadPath, {});
     const withBogusOverride = await validateModel(scadPath, { params: { not_a_real_param: 999 } });
     expect(withBogusOverride.report.volume_mm3).toEqual(baseline.report.volume_mm3);
+  }, 60_000);
+});
+
+// ── mesh persistence (Issue #41) ─────────────────────────────────────────────
+//
+// The demo's 3D preview was blank in part because this function rendered a
+// binary STL for manifold-3d and then deleted it with the work directory, so
+// no `.stl` existed anywhere in a project tree. `persistMeshTo` keeps that
+// SAME render — the point being that no second render pass is added.
+describe.skipIf(!dockerAvailable())("@docker validateModel mesh persistence (Issue #41)", () => {
+  it("keeps the validation STL at persistMeshTo, and it is the mesh that was validated", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scadforge-mesh-persist-"));
+    try {
+      // A nested destination, since the real caller aims at a snapshot
+      // directory that may not have been created yet.
+      const dest = join(dir, "history", "0002", "mesh.stl");
+      const result = await validateModel(fixture("simple.scad"), { params: { size: 20 }, persistMeshTo: dest });
+
+      const bytes = await readFile(dest);
+      expect(bytes.byteLength).toBeGreaterThan(0);
+
+      // Binary STL: an 80-byte header, then a uint32 triangle count, then 50
+      // bytes per triangle. Checking the count against the report proves the
+      // persisted file is the very mesh that was validated, not some other
+      // render or a truncated copy.
+      expect(bytes.byteLength).toBe(84 + 50 * result.report.triangle_count);
+      expect(bytes.readUInt32LE(80)).toBe(result.report.triangle_count);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("writes no stray temp file beside the mesh, so the snapshot directory stays clean", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scadforge-mesh-persist-"));
+    try {
+      await validateModel(fixture("simple.scad"), { persistMeshTo: join(dir, "mesh.stl") });
+      // The copy goes via `mesh.stl.tmp` + rename so a reader never sees a
+      // half-written STL; the temp name must not survive the rename.
+      expect((await readdir(dir)).sort()).toEqual(["mesh.stl"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("counterexample: an unwritable destination is swallowed — validation still returns its verdict", async () => {
+    // Persisting is bookkeeping for the UI. A model the user paid to render
+    // and validate must still report its result even if the mesh cannot be
+    // stored (read-only volume, full disk, a path that is not a directory).
+    const dir = await mkdtemp(join(tmpdir(), "scadforge-mesh-persist-"));
+    try {
+      const blocker = join(dir, "blocker");
+      await writeFile(blocker, "not a directory");
+      const result = await validateModel(fixture("simple.scad"), {
+        persistMeshTo: join(blocker, "nested", "mesh.stl")
+      });
+      expect(result.report.manifold).toBe(true);
+      expect(result.gate.badge).toBe("green");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }, 60_000);
 });

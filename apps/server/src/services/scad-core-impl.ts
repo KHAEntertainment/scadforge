@@ -55,6 +55,7 @@ import {
   rootModelPath,
   runParamExport,
   snapshotDir,
+  snapshotMeshPath,
   snapshotRenderPath
 } from "@scadforge/scad-core";
 import type { RenderAttachment, RenderedView } from "@scadforge/scad-core";
@@ -293,6 +294,14 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
     async getSnapshotRenderFile(projectId, snapshotId, view): Promise<RenderFile | null> {
       const dir = runtime.dirFor(projectId);
       return readFileOrNull(snapshotRenderPath(dir, snapshotId, view as ViewName));
+    },
+
+    async getSnapshotMeshFile(projectId, snapshotId): Promise<RenderFile | null> {
+      const dir = runtime.dirFor(projectId);
+      // Deliberately a plain file read, exactly like the PNG lookup above: a
+      // missing mesh is `null`, never a throw. The route turns that into a
+      // 404 the viewer renders as "no mesh for this snapshot yet".
+      return readFileOrNull(snapshotMeshPath(dir, snapshotId));
     },
 
     // ── params ───────────────────────────────────────────────────────────────

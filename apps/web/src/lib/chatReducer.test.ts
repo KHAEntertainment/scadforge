@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SnapshotManifest, SseEvent } from "@scadforge/protocol";
-import { initialChatState, reduceChatEvent, reduceChatEvents } from "./chatReducer.js";
+import { initialChatState, reduceChatAction, reduceChatEvent, reduceChatEvents } from "./chatReducer.js";
+import type { ChatItem } from "./chatReducer.js";
 
 const TURN_ID = "turn-1";
 
@@ -144,5 +145,81 @@ describe("reduceChatEvents", () => {
     const b = reduceChatEvent(initialChatState, event);
     expect(a).toEqual(b);
     expect(initialChatState.items).toHaveLength(0); // original state untouched
+  });
+});
+
+// ── the user's own message (Issue #41 symptom 2) ─────────────────────────────
+//
+// The frozen SSE union is assistant-side only, so nothing ever echoed the
+// user's prompt into the transcript and the demo read as a monologue.
+
+describe("reduceChatAction — local user echo", () => {
+  it("appends the user's message as its own transcript item", () => {
+    const state = reduceChatAction(initialChatState, {
+      type: "local_user_message",
+      localId: "local-1",
+      text: "Make me a hinged box"
+    });
+    expect(state.items).toEqual([{ kind: "user_text", localId: "local-1", text: "Make me a hinged box" }]);
+  });
+
+  it("is idempotent for the same localId — a re-dispatch never duplicates the prompt (AC)", () => {
+    const action = { type: "local_user_message" as const, localId: "local-1", text: "Make me a hinged box" };
+    const once = reduceChatAction(initialChatState, action);
+    const twice = reduceChatAction(once, action);
+    expect(twice.items).toHaveLength(1);
+    // Identity, not just length: an idempotent action must not churn state and
+    // force React to re-render the whole transcript.
+    expect(twice).toBe(once);
+  });
+
+  it("keeps two distinct prompts, even when their text is identical", () => {
+    let state = reduceChatAction(initialChatState, { type: "local_user_message", localId: "local-1", text: "again" });
+    state = reduceChatAction(state, { type: "local_user_message", localId: "local-2", text: "again" });
+    expect(state.items).toHaveLength(2);
+  });
+
+  it("the echo survives the rest of the turn's events, in submission order (AC)", () => {
+    // The regression this pins: the prompt must still be there, above the
+    // reply, once the whole turn has streamed in.
+    let state = reduceChatAction(initialChatState, {
+      type: "local_user_message",
+      localId: "local-1",
+      text: "Make me a hinged box"
+    });
+    const events: SseEvent[] = [
+      turnStarted(),
+      { type: "assistant_text", turn_id: TURN_ID, text: "Done." },
+      {
+        type: "turn_done",
+        turn_id: TURN_ID,
+        status: "ok",
+        passes_used: 1,
+        summary: "Built it",
+        usage: null,
+        duration_ms: 10
+      }
+    ];
+    for (const event of events) state = reduceChatAction(state, event);
+
+    expect(state.items[0]).toMatchObject({ kind: "user_text", text: "Make me a hinged box" });
+    expect(state.items.some((item) => item.kind === "assistant_text")).toBe(true);
+  });
+
+  it("restores a stored transcript wholesale, and reset clears it", () => {
+    const items: ChatItem[] = [{ kind: "user_text", localId: "local-1", text: "restored" }];
+    const restored = reduceChatAction(initialChatState, { type: "local_restore", items });
+    expect(restored.items).toEqual(items);
+
+    // Re-echoing a restored message (the same localId arriving again after a
+    // rehydrate) still must not duplicate it.
+    const reEchoed = reduceChatAction(restored, {
+      type: "local_user_message",
+      localId: "local-1",
+      text: "restored"
+    });
+    expect(reEchoed.items).toHaveLength(1);
+
+    expect(reduceChatAction(restored, { type: "local_reset" })).toEqual(initialChatState);
   });
 });

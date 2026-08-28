@@ -163,3 +163,25 @@ export async function attachValidationToSnapshot(
 export function snapshotValidationPath(projectDir: string, snapshotId: SnapshotId): string {
   return join(snapshotDir(projectDir, snapshotId), PROJECT_LAYOUT.snapshot.validationFile);
 }
+
+// ── the snapshot mesh (ScadForge Issue #41) ──────────────────────────────────
+//
+// `PROJECT_LAYOUT.snapshot` is part of the FROZEN contract and has no `mesh`
+// entry, so the file name lives here rather than being smuggled into
+// protocol. Two consequences, both deliberate:
+//
+//   1. `SnapshotManifest` gains NO mesh field — a snapshot's mesh is
+//      discovered by its presence at this well-known path, not by a manifest
+//      pointer. Persisting a mesh therefore writes exactly one NEW file and
+//      rewrites nothing, which is what keeps it clear of Issue #45 (a
+//      re-validation path rewriting historical manifests).
+//   2. A snapshot legitimately may have no mesh (nothing ever validated it).
+//      Callers must treat "absent" as normal, not as an error.
+
+/** File name of a snapshot's persisted binary STL, inside its snapshot directory. */
+export const SNAPSHOT_MESH_FILE = "mesh.stl";
+
+/** Absolute path of a snapshot's persisted binary STL (may not exist — see above). */
+export function snapshotMeshPath(projectDir: string, snapshotId: SnapshotId): string {
+  return join(snapshotDir(projectDir, snapshotId), SNAPSHOT_MESH_FILE);
+}

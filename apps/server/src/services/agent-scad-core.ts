@@ -36,6 +36,7 @@ import {
   rootModelPath,
   runParamExport,
   runSyntaxCheck,
+  snapshotMeshPath,
   validateModel
 } from "@scadforge/scad-core";
 import type {
@@ -51,7 +52,7 @@ import type {
 import type { ExportRecord } from "@scadforge/protocol";
 import { renderAndAttach } from "./scad-core-impl.js";
 import { planParamUpdate, readParams, readProject, readScad, type ServerRuntime } from "./runtime.js";
-import { exportFileUrl, renderFileUrl, snapshotUrl } from "./urls.js";
+import { exportFileUrl, renderFileUrl, snapshotMeshUrl, snapshotUrl } from "./urls.js";
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */
 const EMPTY_PARAM_SCHEMA: ParamSchema = { title: "", parameters: [] };
@@ -165,10 +166,21 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
     },
 
     async validateMesh(request: AgentValidateRequest): Promise<ValidationResult> {
+      // Read the head BEFORE validating: `validateModel` renders the binary
+      // STL this snapshot's 3D preview will be served from, and it can only
+      // keep that render if it is told where to put it (Issue #41). Asking
+      // afterwards would mean the mesh had already gone with the work dir.
+      const project = await readProject(dir);
+      const head = project.head;
+
       const result = await validateModel(rootModelPath(dir), {
         params: request.params,
         gate: { allowMultiPart: request.allowMultiPart === true },
-        libraryPaths: runtime.libraryPaths
+        libraryPaths: runtime.libraryPaths,
+        // Adds `mesh.stl` to the snapshot directory and nothing else — no
+        // manifest field, no rewrite of any existing file (see the note in
+        // scad-core's `attachments.ts`).
+        persistMeshTo: head ? snapshotMeshPath(dir, head) : undefined
       });
       lastValidation = result.report;
 
@@ -176,11 +188,10 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // report would live only in this turn's memory: the History badge, the
       // `ExportResponse.validation` field and any later inspection of what a
       // given revision actually measured would all be permanently null.
-      const project = await readProject(dir);
-      if (project.head) {
+      if (head) {
         // A validation run whose bookkeeping fails must not fail the tool —
         // the model still needs to see the report it just paid for.
-        await attachValidationToSnapshot(dir, project.head, result).catch(() => {});
+        await attachValidationToSnapshot(dir, head, result).catch(() => {});
       }
       return result;
     },
@@ -244,10 +255,21 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
         }
         case "export":
           return exportFileUrl(projectId, basename(ref));
-        case "mesh":
-          // Validation meshes are throwaway intermediates in a temp work dir
-          // (`validateModel` removes them); there is nothing to serve.
-          return null;
+        case "mesh": {
+          // Since Issue #41 a validation mesh CAN be durable: `validateMesh`
+          // above asks `validateModel` to keep it at the head snapshot's
+          // `mesh.stl`. Recover the snapshot id from the layout exactly as
+          // the `render` case does.
+          //
+          // A mesh still living in a temp work dir (any path outside this
+          // project's `history/`) remains unservable and returns null — the
+          // honest answer, and the reason this is a path check rather than an
+          // unconditional URL.
+          const rel = relative(dir, ref).split(/[\\/]/);
+          const historyIndex = rel.indexOf("history");
+          if (historyIndex === -1 || rel.length <= historyIndex + 1) return null;
+          return snapshotMeshUrl(projectId, rel[historyIndex + 1]);
+        }
       }
     },
 
