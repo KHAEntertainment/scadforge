@@ -126,3 +126,38 @@ describe("apiClient snapshots (Issue #34)", () => {
     });
   });
 });
+
+describe("apiClient params methods (Issue #33)", () => {
+  it("GET params returns the frozen ParamsResponse shape", async () => {
+    const body = { title: "bracket", parameters: [{ name: "wall", type: "number", initial: 4, min: 2, max: 10 }], values: { wall: 4 } };
+    const fetchImpl = vi.fn(async () => jsonResponse(body));
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.getParams("p1")).resolves.toEqual(body);
+    expect(fetchImpl).toHaveBeenCalledWith("/api/projects/p1/params", expect.anything());
+  });
+
+  it("PUT params sends the values body and returns the merged ParamsResponse", async () => {
+    const responseBody = { title: "bracket", parameters: [], values: { wall: 9 } };
+    const fetchImpl = vi.fn(async () => jsonResponse(responseBody));
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.updateParams("p1", { values: { wall: 9 } })).resolves.toEqual(responseBody);
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/projects/p1/params");
+    expect(init.method).toBe("PUT");
+    expect(JSON.parse(init.body as string)).toEqual({ values: { wall: 9 } });
+  });
+
+  it("counterexample: a rejected value surfaces VALIDATION_FAILED with the server's message", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse({ error_code: "VALIDATION_FAILED", message: "'wall' value 99 is above its max of 10." }, 422)
+    );
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.updateParams("p1", { values: { wall: 99 } })).rejects.toMatchObject({
+      error_code: "VALIDATION_FAILED",
+      message: expect.stringContaining("above its max")
+    });
+  });
+});
