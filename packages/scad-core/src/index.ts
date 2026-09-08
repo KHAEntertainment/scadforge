@@ -13,6 +13,10 @@ export const SCAD_CORE_PACKAGE_NAME = "@scadforge/scad-core";
 export * from "./types.js";
 export * from "./errors.js";
 
+// Line-ending normalization (Issue #40) — the write-time fix applied wherever
+// scad-core persists/ingests `.scad` source.
+export { normalizeLineEndings } from "./lf.js";
+
 // params/
 export {
   CRLF_ANNOTATION_WARNING,
@@ -45,6 +49,8 @@ export { validateModel } from "./runner/validate-model.js";
 export type { ValidateModelOptions } from "./runner/validate-model.js";
 export { validateParamValues } from "./runner/params-validate.js";
 export type { ParamRejection, ParamRejectionReason, ValidateParamValuesResult } from "./runner/params-validate.js";
+export { analyzeSourceParams } from "./runner/source-params.js";
+export type { SourceParamsAnalysis } from "./runner/source-params.js";
 
 // validate/
 export { parseStl } from "./validate/stl.js";
@@ -85,6 +91,7 @@ export {
 } from "./store/store.js";
 export type { CreateSnapshotInput, InitProjectInput, RevertToSnapshotOptions } from "./store/store.js";
 export { PARAMS_LOCK_MAX_ATTEMPTS, withParamsLock } from "./store/params-lock.js";
+export { computeSourceRevision } from "./store/revision.js";
 export {
   attachRendersToSnapshot,
   attachValidationToSnapshot,

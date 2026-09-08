@@ -17,12 +17,14 @@
 //     `exportRun`, so this method only maps its refusal onto
 //     `VALIDATION_FAILED`.
 
-import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PROJECT_LAYOUT } from "@scadforge/protocol";
 import type {
+  BuildRequest,
+  BuildResponse,
   CreateProjectRequest,
   ExportRecord,
   ExportRequest,
@@ -30,25 +32,36 @@ import type {
   ListProjectsResponse,
   ParamsResponse,
   ParamsUpdateRequest,
+  ProjectManifest,
   ProjectResponse,
   RenderViewsRequest,
   RenderViewsResponse,
   RenderedViewResponse,
   RevertRequest,
   SnapshotDiffResponse,
+  SnapshotId,
   SnapshotManifest,
   SnapshotResponse,
+  SourcePreflightRequest,
+  SourcePreflightResponse,
+  SourceResponse,
+  SourceUpdateRequest,
   ViewName
 } from "@scadforge/protocol";
 import {
   DEFAULT_VIEWS,
+  analyzeSourceParams,
   attachRendersToSnapshot,
+  attachValidationToSnapshot,
+  computeSourceRevision,
   createSnapshot,
   exportRunWithValidation,
   exportsDir,
   initProject,
   listSnapshots,
   mergeParamsAtomic,
+  normalizeLineEndings,
+  readProjectManifest,
   readSnapshotManifest,
   recordExport,
   renderViews as runRenderViews,
@@ -57,10 +70,14 @@ import {
   revertToSnapshot,
   rootModelPath,
   runParamExport,
+  runSyntaxCheck,
   snapshotDir,
-  snapshotRenderPath
+  snapshotMeshPath,
+  snapshotRenderPath,
+  validateModel,
+  withParamsLock
 } from "@scadforge/scad-core";
-import type { RenderAttachment, RenderedView } from "@scadforge/scad-core";
+import type { ParamSchema, ParamValues, RenderAttachment, RenderedView } from "@scadforge/scad-core";
 import { RouteError } from "./errors.js";
 import { allocateProjectId, listProjectIds } from "./project-paths.js";
 import type { RenderFile, ScadCoreApi } from "./scad-core-api.js";
@@ -186,6 +203,77 @@ export async function renderAndAttach(
   }
 }
 
+// ── source revision + proposed-source compilation (Issue #54) ──────────────
+
+/** The coherent head+source+params state of a project, plus its opaque revision. */
+interface SourceState {
+  project: ProjectManifest;
+  head: SnapshotId | null;
+  scad: string;
+  params: ParamValues;
+  revision: string;
+}
+
+/**
+ * Reads the project's coherent head + `model.scad` + `params.json` state UNDER
+ * the cross-process params lock, so the returned revision never mixes a head
+ * from one write with a source/params from another. Every writer of those
+ * three files serializes on the same lock, so reading inside it is what makes
+ * the (head, source, params) triple coherent.
+ */
+async function coherentSourceState(dir: string): Promise<SourceState> {
+  await readProject(dir); // PROJECT_NOT_FOUND before we try to create the params lock dir
+  return withParamsLock(dir, async () => {
+    const project = await readProjectManifest(dir);
+    const scad = await readScad(dir);
+    const params = await readParams(dir);
+    return { project, head: project.head, scad, params, revision: computeSourceRevision(project.head, scad, params) };
+  });
+}
+
+/** Stages a raw source string into a throwaway `.scad` file for OpenSCAD to read. */
+async function stageScadString(scad: string): Promise<{ scadPath: string; cleanup: () => Promise<void> }> {
+  const dir = await mkdtemp(join(tmpdir(), "scadforge-source-"));
+  const scadPath = join(dir, "model.scad");
+  await writeFile(scadPath, scad, "utf8");
+  return { scadPath, cleanup: () => rm(dir, { recursive: true, force: true }).catch(() => {}) };
+}
+
+/** Result of compiling a proposed source outside the params lock. */
+interface ProposedSourceCompile {
+  syntax_ok: boolean;
+  diagnostics: string | null;
+  schema: ParamSchema;
+}
+
+/**
+ * Syntax-checks the proposed source and (when it parses) exports its
+ * Customizer schema. Deliberately runs OUTSIDE the params lock — both steps
+ * are OpenSCAD subprocess calls — the caller re-checks the revision inside the
+ * lock afterwards (compile outside, recheck inside).
+ */
+async function compileProposedSource(runtime: ServerRuntime, scad: string): Promise<ProposedSourceCompile> {
+  const staged = await stageScadString(scad);
+  try {
+    const syntax = await runSyntaxCheck(staged.scadPath, { libraryPaths: runtime.libraryPaths });
+    let schema: ParamSchema = { title: "", parameters: [] };
+    if (syntax.ok) {
+      try {
+        schema = await runParamExport(staged.scadPath, { libraryPaths: runtime.libraryPaths });
+      } catch {
+        schema = { title: "", parameters: [] };
+      }
+    }
+    return {
+      syntax_ok: syntax.ok,
+      diagnostics: syntax.ok ? null : syntax.errors.join("\n"),
+      schema
+    };
+  } finally {
+    await staged.cleanup();
+  }
+}
+
 /** Builds the real `ScadCoreApi`. */
 export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
   async function headSnapshot(dir: string, head: string | null): Promise<SnapshotManifest | null> {
@@ -219,6 +307,13 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       readParams(dir)
     ]);
     return { title: schema.title, parameters: schema.parameters as ParamsResponse["parameters"], values };
+  }
+
+  async function sourceResponse(projectId: string): Promise<SourceResponse> {
+    const dir = runtime.dirFor(projectId);
+    const state = await asRouteResult(() => coherentSourceState(dir), "failed to read source");
+    const head = state.head ? await headSnapshot(dir, state.head) : null;
+    return { project: state.project, scad: state.scad, params: state.params, head, revision: state.revision };
   }
 
   return {
@@ -387,6 +482,100 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       return paramsResponse(projectId);
     },
 
+    // ── source (Issue #54) ──────────────────────────────────────────────────
+
+    getSource: (projectId) => sourceResponse(projectId),
+
+    async preflightSource(projectId, request: SourcePreflightRequest): Promise<SourcePreflightResponse> {
+      const dir = runtime.dirFor(projectId);
+
+      // Enforce the editor's base revision BEFORE doing any (slow) compile.
+      const initial = await asRouteResult(() => coherentSourceState(dir), "failed to read source");
+      if (initial.revision !== request.base_revision) {
+        throw new RouteError("CONFLICT", "Source changed since you loaded it; refresh before continuing.");
+      }
+
+      // Compile the proposed source OUTSIDE the params lock.
+      const scad = normalizeLineEndings(request.scad);
+      const compiled = await compileProposedSource(runtime, scad);
+
+      // Re-check the revision inside the lock — a concurrent write that landed
+      // during the compile must surface as CONFLICT, never a silent rebase.
+      const current = await asRouteResult(() => coherentSourceState(dir), "failed to re-read source");
+      if (current.revision !== request.base_revision) {
+        throw new RouteError("CONFLICT", "Source changed while checking; refresh and try again.");
+      }
+
+      const analysis = analyzeSourceParams(compiled.schema, current.params, compiled.syntax_ok);
+      return {
+        revision: current.revision,
+        syntax_ok: compiled.syntax_ok,
+        diagnostics: compiled.diagnostics,
+        parameters: compiled.schema.parameters as SourcePreflightResponse["parameters"],
+        retained_params: analysis.retained_params,
+        removed_params: analysis.removed_params
+      };
+    },
+
+    async updateSource(projectId, request: SourceUpdateRequest): Promise<SourceResponse> {
+      const dir = runtime.dirFor(projectId);
+      const scad = normalizeLineEndings(request.scad);
+
+      // Enforce base_revision before compiling.
+      const initial = await asRouteResult(() => coherentSourceState(dir), "failed to read source");
+      if (initial.revision !== request.base_revision) {
+        throw new RouteError("CONFLICT", "Source changed since you loaded it; refresh before saving.");
+      }
+
+      // Compile outside the lock.
+      const compiled = await compileProposedSource(runtime, scad);
+      if (!compiled.syntax_ok) {
+        throw new RouteError("VALIDATION_FAILED", compiled.diagnostics ?? "Source does not parse.");
+      }
+
+      // Recompute the drop set server-side (never trust the client's preflight).
+      const analysis = analyzeSourceParams(compiled.schema, initial.params, true);
+      const removedNames = new Set(analysis.removed_params.map((r) => r.name));
+      const discarded = request.discarded_params ?? [];
+      const discardedSet = new Set(discarded);
+      const missing = analysis.removed_params.filter((r) => !discardedSet.has(r.name)).map((r) => r.name);
+      const extra = discarded.filter((name) => !removedNames.has(name));
+      if (missing.length > 0 || extra.length > 0) {
+        const parts: string[] = [];
+        if (missing.length > 0) parts.push(`not acknowledged: ${missing.join(", ")}`);
+        if (extra.length > 0) parts.push(`unexpected: ${extra.join(", ")}`);
+        throw new RouteError(
+          "VALIDATION_FAILED",
+          `discarded_params must exactly match the overrides this edit drops (${parts.join("; ")}).`
+        );
+      }
+
+      // Commit under the params lock, re-checking the revision one last time so
+      // a concurrent write between the compile and the commit can never be
+      // force-overwritten.
+      await asRouteResult(
+        () =>
+          withParamsLock(dir, async () => {
+            const current = await readProjectManifest(dir);
+            const currentScad = await readScad(dir);
+            const currentParams = await readParams(dir);
+            if (computeSourceRevision(current.head, currentScad, currentParams) !== request.base_revision) {
+              throw new RouteError("CONFLICT", "Source changed while saving; refresh and retry.");
+            }
+            await createSnapshot(dir, {
+              content: scad,
+              params: analysis.retained_params,
+              message: "Edited source",
+              origin: "manual",
+              pass: null
+            });
+          }),
+        "failed to save source"
+      );
+
+      return sourceResponse(projectId);
+    },
+
     // ── renders ──────────────────────────────────────────────────────────────
 
     async renderViews(projectId, request: RenderViewsRequest): Promise<RenderViewsResponse> {
@@ -411,6 +600,78 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
         views,
         total_ms: result.total_ms,
         snapshot
+      };
+    },
+
+    // ── build (Issue #54) ───────────────────────────────────────────────────
+
+    async build(projectId, request: BuildRequest): Promise<BuildResponse> {
+      const dir = runtime.dirFor(projectId);
+
+      // Enforce base_revision, then PIN the head snapshot id before any (slow)
+      // render/validate work — a concurrent save that moves head mid-build must
+      // not redirect this build's results onto a different snapshot.
+      const state = await asRouteResult(() => coherentSourceState(dir), "failed to read source");
+      if (state.revision !== request.base_revision) {
+        throw new RouteError("CONFLICT", "Source changed since you loaded it; refresh before building.");
+      }
+      const pinned = state.head;
+      if (!pinned) {
+        throw new RouteError("INTERNAL_ERROR", "Project has no snapshot to build.");
+      }
+
+      // Render + validate the PINNED snapshot's OWN staged content, never the
+      // project's current root state (Issue #45). Runs outside the params lock.
+      const staged = await stageSnapshotModel(dir, pinned);
+      const outDir = await mkdtemp(join(tmpdir(), "scadforge-build-"));
+      try {
+        const renderResult = await asRouteResult(
+          () =>
+            runRenderViews(
+              { scadPath: staged.scadPath, outDir, views: DEFAULT_VIEWS, params: staged.params },
+              { libraryPaths: runtime.libraryPaths }
+            ),
+          "build render failed"
+        );
+
+        const attachments: RenderAttachment[] = renderResult.views
+          .filter((view): view is RenderedView & { path: string } => view.ok && view.path !== null)
+          .map((view) => ({
+            view: view.view,
+            sourcePath: view.path,
+            render_ms: view.render_ms,
+            width: view.imgsize[0],
+            height: view.imgsize[1]
+          }));
+
+        if (attachments.length === 0) {
+          throw new RouteError("RENDER_FAILED", renderResult.message ?? "Build produced no renders.");
+        }
+        await asRouteResult(
+          () =>
+            attachRendersToSnapshot(dir, pinned, attachments, {
+              buildRenderUrl: (snapshotId, view) => renderFileUrl(projectId, snapshotId, view)
+            }),
+          "failed to attach renders"
+        );
+
+        const validation = await asRouteResult(
+          () =>
+            validateModel(staged.scadPath, {
+              params: staged.params,
+              libraryPaths: runtime.libraryPaths,
+              persistMeshTo: snapshotMeshPath(dir, pinned)
+            }),
+          "build validation failed"
+        );
+        await asRouteResult(() => attachValidationToSnapshot(dir, pinned, validation), "failed to attach validation");
+      } finally {
+        await staged.cleanup();
+        await rm(outDir, { recursive: true, force: true }).catch(() => {});
+      }
+
+      return {
+        snapshot: await asRouteResult(() => readSnapshotManifest(dir, pinned), "failed to read built snapshot")
       };
     },
 

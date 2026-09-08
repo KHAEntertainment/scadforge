@@ -23,6 +23,12 @@ import type {
   SnapshotDiffResponse,
   SnapshotManifest,
   SnapshotResponse,
+  SourcePreflightRequest,
+  SourcePreflightResponse,
+  SourceResponse,
+  SourceUpdateRequest,
+  BuildRequest,
+  BuildResponse,
   ViewName
 } from "@scadforge/protocol";
 import { RouteError } from "../services/errors.js";
@@ -198,6 +204,65 @@ export function createFakeScadCoreApi(): ScadCoreApi & { _projects: Map<string, 
         parameters: [{ name: "pipe_d", type: "number", initial: 32, min: 1, max: 200 }],
         values: project.params
       };
+    },
+
+    async getSource(projectId: string): Promise<SourceResponse> {
+      const project = requireProject(projectId);
+      const head = project.snapshots.at(-1) ?? null;
+      return { project: project.manifest, scad: project.scad, params: project.params, head, revision: "fake-revision" };
+    },
+
+    async preflightSource(projectId: string, request: SourcePreflightRequest): Promise<SourcePreflightResponse> {
+      const project = requireProject(projectId);
+      if (request.base_revision === "__stale__") {
+        throw new RouteError("CONFLICT", "stale revision (fake: forced conflict).");
+      }
+      if (request.scad === "__invalid__") {
+        return {
+          revision: "fake-revision",
+          syntax_ok: false,
+          diagnostics: "ERROR: Parser error: fake invalid source.",
+          parameters: [],
+          retained_params: {},
+          removed_params: []
+        };
+      }
+      return {
+        revision: "fake-revision",
+        syntax_ok: true,
+        diagnostics: null,
+        parameters: [{ name: "pipe_d", type: "number", initial: 32, min: 1, max: 200 }],
+        retained_params: project.params,
+        removed_params: []
+      };
+    },
+
+    async updateSource(projectId: string, request: SourceUpdateRequest): Promise<SourceResponse> {
+      const project = requireProject(projectId);
+      if (request.base_revision === "__stale__") {
+        throw new RouteError("CONFLICT", "stale revision (fake: forced conflict).");
+      }
+      if (request.scad === "__invalid__") {
+        throw new RouteError("VALIDATION_FAILED", "Source does not parse (fake).");
+      }
+      project.scad = request.scad;
+      return {
+        project: project.manifest,
+        scad: project.scad,
+        params: project.params,
+        head: project.snapshots.at(-1) ?? null,
+        revision: "fake-revision"
+      };
+    },
+
+    async build(projectId: string, request: BuildRequest): Promise<BuildResponse> {
+      const project = requireProject(projectId);
+      if (request.base_revision === "__stale__") {
+        throw new RouteError("CONFLICT", "stale revision (fake: forced conflict).");
+      }
+      const head = project.snapshots.at(-1);
+      if (!head) throw new RouteError("INTERNAL_ERROR", "No snapshot to build.");
+      return { snapshot: head };
     },
 
     async renderViews(projectId: string, request: RenderViewsRequest): Promise<RenderViewsResponse> {
