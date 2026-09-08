@@ -240,10 +240,16 @@ async function stageScadString(scad: string): Promise<{ scadPath: string; cleanu
 }
 
 /** Result of compiling a proposed source outside the params lock. */
-interface ProposedSourceCompile {
+export interface ProposedSourceCompile {
   syntax_ok: boolean;
   diagnostics: string | null;
   schema: ParamSchema;
+}
+
+/** Injectable runner seams keep the source compiler deterministic in unit tests. */
+export interface SourceCompileDeps {
+  syntaxCheck?: typeof runSyntaxCheck;
+  paramExport?: typeof runParamExport;
 }
 
 /**
@@ -252,17 +258,20 @@ interface ProposedSourceCompile {
  * are OpenSCAD subprocess calls — the caller re-checks the revision inside the
  * lock afterwards (compile outside, recheck inside).
  */
-async function compileProposedSource(runtime: ServerRuntime, scad: string): Promise<ProposedSourceCompile> {
+export async function compileProposedSource(
+  runtime: ServerRuntime,
+  scad: string,
+  deps: SourceCompileDeps = {}
+): Promise<ProposedSourceCompile> {
   const staged = await stageScadString(scad);
   try {
-    const syntax = await runSyntaxCheck(staged.scadPath, { libraryPaths: runtime.libraryPaths });
+    const syntax = await (deps.syntaxCheck ?? runSyntaxCheck)(staged.scadPath, { libraryPaths: runtime.libraryPaths });
     let schema: ParamSchema = { title: "", parameters: [] };
     if (syntax.ok) {
-      try {
-        schema = await runParamExport(staged.scadPath, { libraryPaths: runtime.libraryPaths });
-      } catch {
-        schema = { title: "", parameters: [] };
-      }
+      // A successful syntax check does not make a failed Customizer export a
+      // valid empty schema. Propagate the exporter error so preflight/save can
+      // report the failure instead of silently dropping every override.
+      schema = await (deps.paramExport ?? runParamExport)(staged.scadPath, { libraryPaths: runtime.libraryPaths });
     }
     return {
       syntax_ok: syntax.ok,
@@ -272,6 +281,22 @@ async function compileProposedSource(runtime: ServerRuntime, scad: string): Prom
   } finally {
     await staged.cleanup();
   }
+}
+
+/**
+ * Build requires a complete render set. A partial result is useful for the
+ * non-mutating render preview endpoint, but must never be attached and
+ * returned as a successful authoritative build.
+ */
+export function assertCompleteBuildRender(
+  result: Awaited<ReturnType<typeof runRenderViews>>,
+  expectedViews: readonly ViewName[] = DEFAULT_VIEWS
+): void {
+  const failed = result.views.filter((view) => !view.ok).map((view) => view.view);
+  if (result.ok && result.views.length === expectedViews.length && failed.length === 0) return;
+
+  const detail = failed.length > 0 ? ` Failed views: ${failed.join(", ")}.` : "";
+  throw new RouteError("RENDER_FAILED", result.message ?? `Build render incomplete.${detail}`);
 }
 
 /** Builds the real `ScadCoreApi`. */
@@ -633,6 +658,7 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
             ),
           "build render failed"
         );
+        assertCompleteBuildRender(renderResult);
 
         const attachments: RenderAttachment[] = renderResult.views
           .filter((view): view is RenderedView & { path: string } => view.ok && view.path !== null)
