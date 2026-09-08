@@ -193,7 +193,7 @@ describe("reduceChatAction — local user echo", () => {
       {
         type: "turn_done",
         turn_id: TURN_ID,
-        status: "ok",
+        status: "completed",
         passes_used: 1,
         summary: "Built it",
         usage: null,

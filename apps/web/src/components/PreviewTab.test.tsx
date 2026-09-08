@@ -1,10 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import type { ParamValues } from "@scadforge/protocol";
 import type { UseWasmPreviewResult } from "../wasm/index.js";
 
-const useWasmPreviewMock = vi.fn<[], UseWasmPreviewResult>();
+const useWasmPreviewMock = vi.fn<(scad: string | null, params: ParamValues, enabled: boolean) => UseWasmPreviewResult>();
 vi.mock("../wasm/index.js", () => ({
-  useWasmPreview: (...args: unknown[]) => useWasmPreviewMock(...(args as []))
+  useWasmPreview: (scad: string | null, params: ParamValues, enabled: boolean) => useWasmPreviewMock(scad, params, enabled)
 }));
 
 // Imported AFTER the mock so PreviewTab picks up the mocked hook.

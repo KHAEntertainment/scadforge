@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { ParamValues, SnapshotManifest, ViewName } from "@scadforge/protocol";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { SnapshotManifest, ViewName } from "@scadforge/protocol";
 import { createApiClient } from "./lib/apiClient.js";
 import { useProject } from "./hooks/useProject.js";
 import { useChat } from "./hooks/useChat.js";
@@ -25,19 +25,59 @@ export function App() {
 
   const chat = useChat(client, projectId);
   const snapshots = useSnapshots(client, projectId);
-  const headSnapshotId = chat.state.headSnapshot?.id ?? null;
-  const liveSource = useLiveModelSource(client, projectId, headSnapshotId);
-  const paramsController = useParamsController(client, projectId, headSnapshotId);
+
+  /**
+   * The freshest known project head. A `snapshot_created` event can arrive
+   * before the next list request completes, so an unlisted chat snapshot is a
+   * short-lived fast path. Once that id appears in the list, the list wins:
+   * it is newest-first and carries late render/validation enrichment that the
+   * creation-time SSE record cannot contain.
+   */
+  const workingHead = useMemo<SnapshotManifest | null>(() => {
+    const listedHead = snapshots.snapshots[0] ?? null;
+    const chatHead = chat.state.headSnapshot;
+    if (!chatHead) return listedHead;
+    const chatHeadIsListed = snapshots.snapshots.some((snapshot) => snapshot.id === chatHead.id);
+    return chatHeadIsListed ? listedHead : chatHead;
+  }, [snapshots.snapshots, chat.state.headSnapshot]);
+  const workingHeadId = workingHead?.id ?? null;
+
+  const liveSource = useLiveModelSource(client, projectId, workingHeadId);
+  const handleParamsSaved = useCallback(() => snapshots.refresh(), [snapshots.refresh]);
+  const paramsController = useParamsController(client, projectId, workingHeadId, handleParamsSaved);
+
+  // Refresh immediately when a turn announces a snapshot, then once more
+  // when the stream closes: render/validation artifacts attach after snapshot
+  // creation and may not be present in the first list response.
+  const chatHeadId = chat.state.headSnapshot?.id ?? null;
+  useEffect(() => {
+    if (chatHeadId) snapshots.refresh();
+  }, [chatHeadId, snapshots.refresh]);
+
+  const turnWasStreamingRef = useRef(false);
+  useEffect(() => {
+    if (chat.isStreaming) {
+      turnWasStreamingRef.current = true;
+      return;
+    }
+    if (turnWasStreamingRef.current) {
+      turnWasStreamingRef.current = false;
+      snapshots.refresh();
+    }
+  }, [chat.isStreaming, snapshots.refresh]);
 
   // Which snapshot the History tab has selected, if the user has picked one.
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
 
-  // A turn that produces a new snapshot pulls the preview forward to it.
-  // Without this, having ever clicked a row in History would pin the viewer to
-  // that older snapshot and the next turn's result would silently not show.
+  // Preserve a deliberate historical selection across same-head list
+  // refreshes/enrichment, but pull the preview forward whenever the actual
+  // working head id advances (chat, params save, manual save, or revert).
+  const previousWorkingHeadIdRef = useRef<string | null>(null);
   useEffect(() => {
-    if (headSnapshotId) setSelectedSnapshotId(null);
-  }, [headSnapshotId]);
+    const previous = previousWorkingHeadIdRef.current;
+    previousWorkingHeadIdRef.current = workingHeadId;
+    if (previous !== null && previous !== workingHeadId) setSelectedSnapshotId(null);
+  }, [workingHeadId]);
 
   /**
    * The snapshot every panel below renders (Issue #41 cause (c)).
@@ -55,10 +95,8 @@ export function App() {
       ? (snapshots.snapshots.find((s) => s.id === selectedSnapshotId) ?? null)
       : null;
     if (selected) return selected;
-    // The live head can be newer than the last `GET /snapshots`, so it is
-    // preferred over the list; the list is what survives a refresh.
-    return chat.state.headSnapshot ?? snapshots.snapshots[0] ?? null;
-  }, [selectedSnapshotId, snapshots.snapshots, chat.state.headSnapshot]);
+    return workingHead;
+  }, [selectedSnapshotId, snapshots.snapshots, workingHead]);
 
   const currentSnapshotId = currentSnapshot?.id ?? null;
   const mesh = useSnapshotMesh(client, projectId, currentSnapshotId);
@@ -74,14 +112,10 @@ export function App() {
 
   const handleSelectSnapshot = useCallback((id: string) => setSelectedSnapshotId(id), []);
 
-  // The debounced Params-tab working values are the live-preview source of
-  // truth once loaded (they always carry the FULL merged bag, from either a
-  // GET or a PUT echo); `liveSource.params` (the last server-fetched project
-  // params) is only the fallback before that first load resolves.
-  const liveParams = useMemo<ParamValues>(
-    () => ({ ...liveSource.params, ...paramsController.debouncedValues }),
-    [liveSource.params, paramsController.debouncedValues]
-  );
+  // The controller's bag is a COMPLETE override bag, not a partial diff.
+  // `{}` is therefore authoritative after a revert to defaults and must not
+  // be merged with stale values from a previous `getProject` response.
+  const liveParams = paramsController.debouncedValues;
 
   return (
     <div className="app">

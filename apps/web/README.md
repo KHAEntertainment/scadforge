@@ -24,15 +24,26 @@ proxy (see "Dev proxy" below) — it never guesses a server port itself. Three
 things need to be running, in this order, each in its own terminal from the
 repo root:
 
+First install and build the workspace with Node 22+ and the pinned pnpm
+version from the root `package.json`:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm build
+```
+
+Set `SCADFORGE_MODEL` to the intended model before starting the API server
+for live chats; when it is unset, the Agent SDK chooses its default. The
+server process needs access to the configured Claude credentials.
+
 ```bash
 # 1. Pinned OpenSCAD image (Docker) — builds/verifies the image apps/server
 #    shells out to for every render/export. One-shot; prints the pinned
 #    version and exits.
 docker compose up openscad
 
-# 2. API server — build once, then run. Point SCADFORGE_PROJECTS_DIR at a
+# 2. API server — run the workspace build from above. Point SCADFORGE_PROJECTS_DIR at a
 #    scratch directory; it's created if missing.
-pnpm --filter @scadforge/server build
 PORT=3001 SCADFORGE_PROJECTS_DIR=/tmp/scadforge-demo node apps/server/dist/index.js
 
 # 3. Web app (dev server with the API proxy wired in)

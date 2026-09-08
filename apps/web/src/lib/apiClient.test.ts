@@ -139,14 +139,15 @@ describe("apiClient params methods (Issue #33)", () => {
 
   it("PUT params sends the values body and returns the merged ParamsResponse", async () => {
     const responseBody = { title: "bracket", parameters: [], values: { wall: 9 } };
-    const fetchImpl = vi.fn(async () => jsonResponse(responseBody));
+    const fetchImpl = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      expect(String(url)).toBe("/api/projects/p1/params");
+      expect(init?.method).toBe("PUT");
+      expect(JSON.parse(String(init?.body))).toEqual({ values: { wall: 9 } });
+      return jsonResponse(responseBody);
+    });
     const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
 
     await expect(client.updateParams("p1", { values: { wall: 9 } })).resolves.toEqual(responseBody);
-    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/api/projects/p1/params");
-    expect(init.method).toBe("PUT");
-    expect(JSON.parse(init.body as string)).toEqual({ values: { wall: 9 } });
   });
 
   it("counterexample: a rejected value surfaces VALIDATION_FAILED with the server's message", async () => {

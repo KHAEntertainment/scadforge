@@ -1,0 +1,271 @@
+{
+  "started": "2026-09-08T21:03:44.868Z",
+  "duration_ms": 12451,
+  "node": "v22.23.2",
+  "platform": "darwin/arm64",
+  "flags": {
+    "keep": false,
+    "no_compose": true,
+    "negative_control": false
+  },
+  "timings_ms": {
+    "compose up (pinned OpenSCAD)": 0,
+    "start server": 650,
+    "create project": 30,
+    "AC1 — Customizer schema": 435,
+    "render + validate original snapshot (wall=3)": 2746,
+    "capture original snapshot fingerprint": 29,
+    "AC2/AC3/AC7 — param sweep (export preview vs WASM)": 4237,
+    "AC4 — set_params via the real tool-handler seam": 3283,
+    "AC5/AC6/AC8 — revert + immutability": 488
+  },
+  "tolerances": {
+    "volume_rel": 0.005,
+    "bbox_abs_mm": 0.1
+  },
+  "sweep_wall_values": [
+    2,
+    4.5,
+    6
+  ],
+  "assertions": [
+    {
+      "id": "AC1",
+      "description": "Customizer schema exposes `wall` (type/initial/min/max/step from the fixture's Customizer annotation)",
+      "ok": true,
+      "detail": "wall: type=number initial=3 min=1 max=10 step=0.5; values={}"
+    },
+    {
+      "id": "AC2-wall2",
+      "description": "WASM/server volume+bbox(min/max corners) agree within tolerance at wall=2",
+      "ok": true,
+      "detail": "Δvol=0.0000mm³ (0.000%, tol 0.5%); Δcorners=[0.0000,0.0000,0.0000,0.0000,0.0000,0.0000]mm (tol 0.1mm)"
+    },
+    {
+      "id": "AC2-wall4.5",
+      "description": "WASM/server volume+bbox(min/max corners) agree within tolerance at wall=4.5",
+      "ok": true,
+      "detail": "Δvol=0.0000mm³ (0.000%, tol 0.5%); Δcorners=[0.0000,0.0000,0.0000,0.0000,0.0000,0.0000]mm (tol 0.1mm)"
+    },
+    {
+      "id": "AC2-wall6",
+      "description": "WASM/server volume+bbox(min/max corners) agree within tolerance at wall=6",
+      "ok": true,
+      "detail": "Δvol=0.0000mm³ (0.000%, tol 0.5%); Δcorners=[0.0000,0.0000,0.0000,0.0000,0.0000,0.0000]mm (tol 0.1mm)"
+    },
+    {
+      "id": "AC3",
+      "description": "server volume strictly increases with `wall` across the swept settings",
+      "ok": true,
+      "detail": "volumes: wall=2→6814.2572mm³, wall=4.5→13244.3444mm³, wall=6→17478.9329mm³"
+    },
+    {
+      "id": "AC7-wall2",
+      "description": "ExportResponse.validation reflects the actual preview override (wall=2), not a stale head snapshot",
+      "ok": true,
+      "detail": "ExportResponse.validation.volume_mm3=6814.2572 vs actual exported-mesh volume=6814.2572mm³ (tol 0.5%)"
+    },
+    {
+      "id": "AC7-wall4.5",
+      "description": "ExportResponse.validation reflects the actual preview override (wall=4.5), not a stale head snapshot",
+      "ok": true,
+      "detail": "ExportResponse.validation.volume_mm3=13244.3444 vs actual exported-mesh volume=13244.3444mm³ (tol 0.5%)"
+    },
+    {
+      "id": "AC7-wall6",
+      "description": "ExportResponse.validation reflects the actual preview override (wall=6), not a stale head snapshot",
+      "ok": true,
+      "detail": "ExportResponse.validation.volume_mm3=17478.9329 vs actual exported-mesh volume=17478.9329mm³ (tol 0.5%)"
+    },
+    {
+      "id": "AC4a",
+      "description": "set_params (real tool-handler seam) is visible over REST GET .../params",
+      "ok": true,
+      "detail": "handler result wall=4; REST GET wall=4"
+    },
+    {
+      "id": "AC4b",
+      "description": "the real parameter edit (wall 3→4mm) changes authoritative (server-rendered) geometry in the expected direction",
+      "ok": true,
+      "detail": "wall=3 → 9291.6851mm³; wall=4 → 11895.4587mm³"
+    },
+    {
+      "id": "AC5",
+      "description": "revert creates a NEW snapshot restoring scad+params, verified via the API",
+      "ok": true,
+      "detail": "new snapshot 0003 (original 0001, pre-revert head 0002); scad matches=true; values={} (original {})"
+    },
+    {
+      "id": "AC6",
+      "description": "revert restores the target snapshot's render PNGs and persisted mesh byte-for-byte",
+      "ok": true,
+      "detail": "reverted 0003: renders=[iso@d2f336ae,front@4ca02898,right@002a15ff,section@aa5d9e94] vs original [iso@d2f336ae,front@4ca02898,right@002a15ff,section@aa5d9e94]; mesh reverted=6d9a752b original=6d9a752b"
+    },
+    {
+      "id": "AC8",
+      "description": "the original snapshot's scad/renders/mesh are byte-identical after set_params + revert (history is immutable)",
+      "ok": true,
+      "detail": "original 0001 unchanged: scad=true, renders=true, mesh=true"
+    }
+  ],
+  "summary": "13/13 assertions passed",
+  "sweep": [
+    {
+      "wall": 2,
+      "server": {
+        "manifold": true,
+        "status": "NoError",
+        "volume_mm3": 6814.2572,
+        "surface_area": 6172.3876,
+        "bbox": {
+          "min": [
+            -21,
+            -18,
+            -10
+          ],
+          "max": [
+            18,
+            18,
+            10
+          ]
+        },
+        "triangle_count": 1198,
+        "components": 1,
+        "genus": 5
+      },
+      "wasm": {
+        "manifold": true,
+        "status": "NoError",
+        "volume_mm3": 6814.2572,
+        "surface_area": 6172.3876,
+        "bbox": {
+          "min": [
+            -21,
+            -18,
+            -10
+          ],
+          "max": [
+            18,
+            18,
+            10
+          ]
+        },
+        "triangle_count": 1204,
+        "components": 1,
+        "genus": 5
+      },
+      "exportValidation": {
+        "badge": "amber",
+        "manifold": true,
+        "components": 1,
+        "volume_mm3": 6814.2572,
+        "warning_count": 1
+      }
+    },
+    {
+      "wall": 4.5,
+      "server": {
+        "manifold": true,
+        "status": "NoError",
+        "volume_mm3": 13244.3444,
+        "surface_area": 7302.0373,
+        "bbox": {
+          "min": [
+            -23.5,
+            -20.5,
+            -10
+          ],
+          "max": [
+            20.5,
+            20.5,
+            10
+          ]
+        },
+        "triangle_count": 1102,
+        "components": 1,
+        "genus": 3
+      },
+      "wasm": {
+        "manifold": true,
+        "status": "NoError",
+        "volume_mm3": 13244.3444,
+        "surface_area": 7302.0373,
+        "bbox": {
+          "min": [
+            -23.5,
+            -20.5,
+            -10
+          ],
+          "max": [
+            20.5,
+            20.5,
+            10
+          ]
+        },
+        "triangle_count": 1108,
+        "components": 1,
+        "genus": 3
+      },
+      "exportValidation": {
+        "badge": "amber",
+        "manifold": true,
+        "components": 1,
+        "volume_mm3": 13244.3444,
+        "warning_count": 1
+      }
+    },
+    {
+      "wall": 6,
+      "server": {
+        "manifold": true,
+        "status": "NoError",
+        "volume_mm3": 17478.9329,
+        "surface_area": 8010.3419,
+        "bbox": {
+          "min": [
+            -25,
+            -22,
+            -10
+          ],
+          "max": [
+            22,
+            22,
+            10
+          ]
+        },
+        "triangle_count": 1070,
+        "components": 1,
+        "genus": 3
+      },
+      "wasm": {
+        "manifold": true,
+        "status": "NoError",
+        "volume_mm3": 17478.9329,
+        "surface_area": 8010.3419,
+        "bbox": {
+          "min": [
+            -25,
+            -22,
+            -10
+          ],
+          "max": [
+            22,
+            22,
+            10
+          ]
+        },
+        "triangle_count": 1076,
+        "components": 1,
+        "genus": 3
+      },
+      "exportValidation": {
+        "badge": "amber",
+        "manifold": true,
+        "components": 1,
+        "volume_mm3": 17478.9329,
+        "warning_count": 1
+      }
+    }
+  ],
+  "error": null
+}

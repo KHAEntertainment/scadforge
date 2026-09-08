@@ -73,6 +73,56 @@ describe("HistoryPanel", () => {
     await waitFor(() => expect(screen.getByTestId("diff-first-snapshot")).toBeInTheDocument());
   });
 
+  it("preserves an explicit historical selection for same-head enrichment, then selects the new head when it advances", async () => {
+    const initial = [
+      makeSnapshot({ id: "0002", parent: "0001", message: "Second" }),
+      makeSnapshot({ id: "0001", parent: null, message: "First" })
+    ];
+    const getSnapshotDiff = vi.fn().mockImplementation((_projectId: string, snapshotId: string) =>
+      Promise.resolve({ id: snapshotId, parent: snapshotId === "0001" ? null : "0001", diff: "" })
+    );
+    const view = render(
+      <HistoryPanel
+        client={makeClient({ getSnapshotDiff })}
+        projectId="p1"
+        snapshots={initial}
+        loading={false}
+        error={null}
+        onChanged={vi.fn()}
+      />
+    );
+    await waitFor(() => expect(screen.getAllByTestId("snapshot-row")[0]).toHaveAttribute("aria-pressed", "true"));
+    await userEvent.click(screen.getAllByTestId("snapshot-row")[1]);
+    expect(screen.getAllByTestId("snapshot-row")[1]).toHaveAttribute("aria-pressed", "true");
+
+    // Same head id, richer record: a deliberate historical selection stays.
+    view.rerender(
+      <HistoryPanel
+        client={makeClient({ getSnapshotDiff })}
+        projectId="p1"
+        snapshots={[makeSnapshot({ id: "0002", parent: "0001", message: "Second, enriched" }), initial[1]]}
+        loading={false}
+        error={null}
+        onChanged={vi.fn()}
+      />
+    );
+    expect(screen.getAllByTestId("snapshot-row")[1]).toHaveAttribute("aria-pressed", "true");
+
+    // A genuinely new head clears the historical selection in lockstep with
+    // App's default preview moving forward.
+    view.rerender(
+      <HistoryPanel
+        client={makeClient({ getSnapshotDiff })}
+        projectId="p1"
+        snapshots={[makeSnapshot({ id: "0003", parent: "0002", message: "Third" }), ...initial]}
+        loading={false}
+        error={null}
+        onChanged={vi.fn()}
+      />
+    );
+    await waitFor(() => expect(screen.getAllByTestId("snapshot-row")[0]).toHaveAttribute("aria-pressed", "true"));
+  });
+
   it("counterexample: reverting selects the newly-created snapshot and notifies the parent to refresh (append-only — the list grows, nothing is removed)", async () => {
     // Two snapshots so the target (0001) is NOT the current head (0002) —
     // reverting to the head itself is a disabled no-op (see the empty-list test below).

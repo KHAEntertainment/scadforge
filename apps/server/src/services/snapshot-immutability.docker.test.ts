@@ -22,7 +22,13 @@ import { join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PROJECT_LAYOUT } from "@scadforge/protocol";
 import type { SnapshotManifest } from "@scadforge/protocol";
-import { initProject, parseStl, readSnapshotManifest, snapshotDir } from "@scadforge/scad-core";
+import {
+  initProject,
+  parseStl,
+  readSnapshotManifest,
+  resolveSnapshotValidationPath,
+  snapshotDir
+} from "@scadforge/scad-core";
 import { createAgentScadCore } from "./agent-scad-core.js";
 import { createScadCoreApi } from "./scad-core-impl.js";
 import { createServerRuntime } from "./runtime.js";
@@ -127,6 +133,72 @@ describe.skipIf(!dockerAvailable())("@docker Issue #45: snapshots are immutable 
 
     expect(after).toEqual(before);
   }, 60_000);
+
+  it("returns validation for the exact explicit-params geometry that was exported", async () => {
+    const { runtime } = await seedProject();
+    const rest = createScadCoreApi(runtime);
+
+    const response = await rest.runExport("bracket", { format: "stl", params: { size: 35 } });
+    const file = await rest.getExportFile("bracket", response.export.file);
+    expect(file).not.toBeNull();
+
+    const triangles = parseStl(Buffer.from(file!.data));
+    const maxCoord = Math.max(...triangles.flatMap((triangle) => triangle.flatMap((vertex) => vertex)));
+    expect(maxCoord).toBeCloseTo(35, 1);
+    expect(response.validation).toMatchObject({
+      badge: "green",
+      manifold: true,
+      components: 1,
+      volume_mm3: 35 * 35 * 35,
+      warning_count: 0
+    });
+  }, 60_000);
+
+  it("revert restores rendered, validated geometry into a new snapshot without changing the source snapshot", async () => {
+    const { runtime, dir } = await seedProject();
+    const rest = createScadCoreApi(runtime);
+    const agentCore = createAgentScadCore({ runtime, projectId: "bracket" });
+
+    const validation = await agentCore.validateMesh({});
+    const render = await agentCore.renderViews({ views: ["iso"] });
+    expect(render.ok).toBe(true);
+
+    const sourceHistoryBefore = await checksumSnapshotDir(dir, "0001");
+    const sourceRenderBefore = Buffer.from((await rest.getSnapshotRenderFile("bracket", "0001", "iso"))!.data);
+    const sourceMeshBefore = Buffer.from((await rest.getSnapshotMeshFile("bracket", "0001"))!.data);
+    const sourceValidationPath = (await resolveSnapshotValidationPath(dir, "0001"))!;
+    const sourceValidationBefore = await readFile(sourceValidationPath);
+
+    const edited = await agentCore.writeScad({
+      content: "size = 25; // [5:50]\ncube([size, size, size]);\n",
+      message: "Edited after rendered source",
+      pass: 1
+    });
+    expect(edited.snapshot).not.toBeNull();
+    expect(edited.snapshot!.id).toBe("0002");
+
+    const reverted = await rest.revertSnapshot("bracket", "0001", {});
+    expect(reverted.snapshot.id).toBe("0003");
+    expect(reverted.snapshot.origin).toBe("revert");
+    expect(reverted.snapshot.validation?.volume_mm3).toBeCloseTo(validation.report.volume_mm3!, 1);
+    expect(reverted.snapshot.renders).toEqual([
+      expect.objectContaining({ view: "iso", url: expect.stringContaining("/snapshots/0003/") })
+    ]);
+
+    const restoredRender = await rest.getSnapshotRenderFile("bracket", "0003", "iso");
+    const restoredMesh = await rest.getSnapshotMeshFile("bracket", "0003");
+    const restoredValidationPath = (await resolveSnapshotValidationPath(dir, "0003"))!;
+    expect(Buffer.from(restoredRender!.data)).toEqual(sourceRenderBefore);
+    expect(Buffer.from(restoredMesh!.data)).toEqual(sourceMeshBefore);
+    expect(await readFile(restoredValidationPath)).toEqual(sourceValidationBefore);
+
+    expect(await checksumSnapshotDir(dir, "0001")).toEqual(sourceHistoryBefore);
+    expect(Buffer.from((await rest.getSnapshotRenderFile("bracket", "0001", "iso"))!.data)).toEqual(
+      sourceRenderBefore
+    );
+    expect(Buffer.from((await rest.getSnapshotMeshFile("bracket", "0001"))!.data)).toEqual(sourceMeshBefore);
+    expect(await readFile(sourceValidationPath)).toEqual(sourceValidationBefore);
+  }, 180_000);
 
   it("re-validating (and rendering) the current head after an UNSNAPSHOTTED params change still describes the HEAD SNAPSHOT'S OWN persisted params, not the project's current root state", async () => {
     const { runtime, dir } = await seedProject();

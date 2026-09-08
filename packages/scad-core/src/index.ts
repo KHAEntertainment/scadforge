@@ -39,7 +39,8 @@ export { runSyntaxCheck } from "./runner/syntax.js";
 export { runParamExport } from "./runner/param-export.js";
 export { exportMeshWithValidationStl } from "./runner/mesh-export.js";
 export type { MeshExportResult } from "./runner/mesh-export.js";
-export { exportRun } from "./runner/export.js";
+export { exportRun, exportRunWithValidation } from "./runner/export.js";
+export type { ExportRunWithValidationResult } from "./runner/export.js";
 export { validateModel } from "./runner/validate-model.js";
 export type { ValidateModelOptions } from "./runner/validate-model.js";
 export { validateParamValues } from "./runner/params-validate.js";
@@ -82,7 +83,7 @@ export {
   recordExport,
   revertToSnapshot
 } from "./store/store.js";
-export type { CreateSnapshotInput, InitProjectInput } from "./store/store.js";
+export type { CreateSnapshotInput, InitProjectInput, RevertToSnapshotOptions } from "./store/store.js";
 export { PARAMS_LOCK_MAX_ATTEMPTS, withParamsLock } from "./store/params-lock.js";
 export {
   attachRendersToSnapshot,

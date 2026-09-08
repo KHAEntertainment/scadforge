@@ -44,7 +44,7 @@ import {
   DEFAULT_VIEWS,
   attachRendersToSnapshot,
   createSnapshot,
-  exportRun,
+  exportRunWithValidation,
   exportsDir,
   initProject,
   listSnapshots,
@@ -304,7 +304,10 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       const dir = runtime.dirFor(projectId);
       await readProject(dir);
       const snapshot = await asRouteResult(
-        () => revertToSnapshot(dir, snapshotId),
+        () =>
+          revertToSnapshot(dir, snapshotId, {
+            buildRenderUrl: (newSnapshotId, view) => renderFileUrl(projectId, newSnapshotId, view)
+          }),
         `failed to revert to snapshot '${snapshotId}'`
       );
       const scad = await readFile(join(snapshotDir(dir, snapshot.id), snapshot.files.model_scad), "utf8");
@@ -427,9 +430,9 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       const isPreview = request.params !== undefined;
       const staged = project.head && !isPreview ? await stageSnapshotModel(dir, project.head) : null;
 
-      const result = await asRouteResult(async () => {
+      const exportOutcome = await asRouteResult(async () => {
         try {
-          return await exportRun(
+          return await exportRunWithValidation(
             {
               scadPath: staged?.scadPath ?? rootModelPath(dir),
               outDir,
@@ -443,6 +446,8 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
           await staged?.cleanup();
         }
       }, "export failed");
+
+      const { result, validation } = exportOutcome;
 
       if (!result.ok || !result.path) {
         throw new RouteError(
@@ -471,8 +476,18 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       };
       await asRouteResult(() => recordExport(dir, record), "failed to record the export");
 
-      const head = await headSnapshot(dir, project.head);
-      return { export: record, validation: head?.validation ?? null };
+      return {
+        export: record,
+        validation: validation
+          ? {
+              badge: validation.gate.badge,
+              manifold: validation.report.manifold,
+              components: validation.report.components,
+              volume_mm3: validation.report.volume_mm3,
+              warning_count: validation.gate.warnings.length
+            }
+          : null
+      };
     },
 
     async getExportFile(projectId, file): Promise<RenderFile | null> {

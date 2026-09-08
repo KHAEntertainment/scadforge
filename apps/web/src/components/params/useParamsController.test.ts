@@ -216,4 +216,190 @@ describe("useParamsController", () => {
     expect(result.current.parameters.map((p) => p.name)).toEqual(["wall", "height"]);
     expect(result.current.values.height).toBe(20);
   });
+
+  it("invokes the onSaved callback after a successful PUT", async () => {
+    const onSaved = vi.fn();
+    const updateParams = vi.fn().mockResolvedValue(schema({ wall: 6 }));
+    const client = makeClient({ getParams: vi.fn().mockResolvedValue(schema({ wall: 4 })), updateParams });
+
+    const { result } = renderHook(() => useParamsController(client, "p1", null, onSaved));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.setValue("wall", 6);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(PARAMS_DEBOUNCE_MS);
+      await flushMicrotasks();
+    });
+
+    expect(updateParams).toHaveBeenCalledTimes(1);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not invoke the onSaved callback when the PUT is rejected", async () => {
+    const onSaved = vi.fn();
+    const updateParams = vi
+      .fn()
+      .mockRejectedValue(new ApiClientError({ error_code: "VALIDATION_FAILED", message: "bad value" }));
+    const client = makeClient({ getParams: vi.fn().mockResolvedValue(schema({ wall: 4 })), updateParams });
+
+    const { result } = renderHook(() => useParamsController(client, "p1", null, onSaved));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.setValue("wall", 99);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(PARAMS_DEBOUNCE_MS);
+      await flushMicrotasks();
+    });
+
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it("reconciliation updates debouncedValues for params the user has not touched (not only values)", async () => {
+    const getParams = vi
+      .fn()
+      .mockResolvedValueOnce(schema({ wall: 4, length: 10 }))
+      .mockResolvedValueOnce(schema({ wall: 40, length: 100 }));
+    const client = makeClient({ getParams, updateParams: vi.fn() });
+
+    const { result, rerender } = renderHook(({ headSnapshotId }) => useParamsController(client, "p1", headSnapshotId), {
+      initialProps: { headSnapshotId: null as string | null }
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.debouncedValues.wall).toBe(4);
+
+    rerender({ headSnapshotId: "0002" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(result.current.values.wall).toBe(40);
+    expect(result.current.debouncedValues.wall).toBe(40);
+    expect(result.current.debouncedValues.length).toBe(100);
+  });
+
+  it("reconciliation keeps a dirty param's local debounced value while adopting the server value for untouched params", async () => {
+    const getParams = vi
+      .fn()
+      .mockResolvedValueOnce(schema({ wall: 4, length: 10 }))
+      .mockResolvedValueOnce(schema({ wall: 40, length: 100 }));
+    const client = makeClient({ getParams, updateParams: vi.fn() });
+
+    const { result, rerender } = renderHook(({ headSnapshotId }) => useParamsController(client, "p1", headSnapshotId), {
+      initialProps: { headSnapshotId: null as string | null }
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The user is mid-edit on `length` (dirty; the debounce has not fired).
+    act(() => {
+      result.current.setValue("length", 55);
+    });
+
+    rerender({ headSnapshotId: "0002" });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(result.current.values.length).toBe(55); // immediate value preserved
+    expect(result.current.debouncedValues.length).toBe(10); // local debounced value preserved, not clobbered to 100
+    expect(result.current.debouncedValues.wall).toBe(40); // untouched param adopts the server value
+  });
+
+  it("a rejected PUT preserves a newer edit made while it was in flight (and resends it)", async () => {
+    let rejectFirst!: (cause: unknown) => void;
+    const updateParams = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<ParamsResponse>((_resolve, reject) => {
+            rejectFirst = reject;
+          })
+      )
+      .mockResolvedValueOnce(schema({ wall: 8 }));
+    const client = makeClient({ getParams: vi.fn().mockResolvedValue(schema({ wall: 4 })), updateParams });
+
+    const { result } = renderHook(() => useParamsController(client, "p1", null));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.setValue("wall", 6);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(PARAMS_DEBOUNCE_MS);
+      await Promise.resolve();
+    });
+    expect(updateParams).toHaveBeenCalledTimes(1); // first PUT (wall=6) in flight
+
+    act(() => {
+      result.current.setValue("wall", 8); // newer edit while in flight
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(PARAMS_DEBOUNCE_MS);
+      await Promise.resolve();
+    });
+    expect(updateParams).toHaveBeenCalledTimes(1); // queued, not an overlapping request
+
+    await act(async () => {
+      rejectFirst(new ApiClientError({ error_code: "VALIDATION_FAILED", message: "rejected" }));
+      await flushMicrotasks();
+    });
+
+    // The newer edit (wall=8) is preserved, not reverted to the last committed value (4).
+    expect(result.current.values.wall).toBe(8);
+    // And it is resent (and confirmed) once the rejected request settles.
+    expect(updateParams).toHaveBeenCalledTimes(2);
+    expect(updateParams).toHaveBeenLastCalledWith("p1", { values: { wall: 8 } });
+    expect(result.current.dirty.has("wall")).toBe(false); // the resend succeeded, so nothing stays dirty
+  });
+
+  it("a stale getParams reply cannot clobber the values from a newer reconcile", async () => {
+    let resolveInitial!: (res: ParamsResponse) => void;
+    const getParams = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<ParamsResponse>((resolve) => {
+            resolveInitial = resolve;
+          })
+      )
+      .mockResolvedValueOnce(schema({ wall: 40 }));
+    const client = makeClient({ getParams, updateParams: vi.fn() });
+
+    const { result, rerender } = renderHook(({ headSnapshotId }) => useParamsController(client, "p1", headSnapshotId), {
+      initialProps: { headSnapshotId: null as string | null }
+    });
+    // The initial reset load is still in flight.
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // A head snapshot arrives; its reconcile resolves FIRST.
+    rerender({ headSnapshotId: "0002" });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+    expect(result.current.values.wall).toBe(40);
+
+    // The stale initial load resolves last — it must not overwrite the reconcile.
+    await act(async () => {
+      resolveInitial(schema({ wall: 4 }));
+      await flushMicrotasks();
+    });
+
+    expect(result.current.values.wall).toBe(40);
+    expect(result.current.debouncedValues.wall).toBe(40);
+  });
 });
