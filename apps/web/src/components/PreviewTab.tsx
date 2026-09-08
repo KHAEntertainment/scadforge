@@ -25,6 +25,9 @@ export interface PreviewTabProps {
   /** Current model source + params for the WASM live preview (Issue #31); null while the project hasn't loaded yet. */
   liveScad: string | null;
   liveParams: ParamValues;
+  /** True while History has selected a snapshot older than the working head. */
+  historical?: boolean;
+  onReturnToCurrent?: () => void;
 }
 
 type PreviewMode = "orbit" | "live" | ViewName;
@@ -62,7 +65,9 @@ export function PreviewTab({
   validation = null,
   pngUrls,
   liveScad,
-  liveParams
+  liveParams,
+  historical = false,
+  onReturnToCurrent
 }: PreviewTabProps) {
   const [mode, setMode] = useState<PreviewMode>("orbit");
 
@@ -91,6 +96,8 @@ export function PreviewTab({
         pngUrls={pngUrls}
         liveScad={liveScad}
         liveParams={liveParams}
+        historical={historical}
+        onReturnToCurrent={onReturnToCurrent}
         mode={mode}
         onModeChange={setMode}
       />
@@ -113,13 +120,18 @@ function PreviewTabBody({
   pngUrls,
   liveScad,
   liveParams,
+  historical,
+  onReturnToCurrent,
   mode,
   onModeChange
 }: Required<Pick<PreviewTabProps, "stlUrl" | "meshStatus" | "snapshotId" | "validation" | "pngUrls" | "liveScad" | "liveParams">> & {
   mode: PreviewMode;
   onModeChange: (mode: PreviewMode) => void;
+  historical: boolean;
+  onReturnToCurrent?: () => void;
 }) {
   const isLive = mode === "live";
+  const [showGrid, setShowGrid] = useState(true);
 
   // `enabled: isLive` — the worker is only spawned while the Live tab is
   // actually selected, not on every project/param change.
@@ -146,6 +158,7 @@ function PreviewTabBody({
 
   return (
     <div className="preview-tab">
+      {historical ? <div className="historical-banner" role="status">Viewing historical snapshot <button type="button" onClick={onReturnToCurrent}>Return to current</button></div> : null}
       <div className="preview-view-buttons" role="group" aria-label="Preview view">
         <button type="button" className={mode === "orbit" ? "active" : ""} onClick={() => onModeChange("orbit")}>
           3D
@@ -170,6 +183,9 @@ function PreviewTabBody({
             {view}
           </button>
         ))}
+        <span className="preview-view-spacer" />
+        <button type="button" className={showGrid ? "active" : ""} onClick={() => setShowGrid((value) => !value)} aria-pressed={showGrid}>Grid</button>
+        <button type="button" onClick={() => onModeChange("orbit")}>Fit</button>
       </div>
 
       {mode === "live" ? (
@@ -186,7 +202,7 @@ function PreviewTabBody({
         </div>
       ) : null}
 
-      <div className="preview-surface">
+      <div className={`preview-surface ${showGrid ? "preview-surface--grid" : ""}`}>
         {/* Hidden rather than unmounted while a PNG is shown, so the WebGL
             context survives every mode switch (see `viewerUrl` above). */}
         <div className={showPng ? "preview-viewer preview-viewer--hidden" : "preview-viewer"}>

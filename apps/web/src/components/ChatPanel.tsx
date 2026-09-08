@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type KeyboardEvent } from "react";
 import type { ChatItem, ChatState } from "../lib/chatReducer.js";
 
 export interface ChatPanelProps {
@@ -62,8 +62,15 @@ export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }:
     setDraft("");
   }
 
+  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+    }
+  }
+
   return (
-    <section className="chat-panel" aria-label="Chat">
+    <section className="chat-panel" aria-label="Chat conversation">
       <div className="chat-transcript" data-testid="chat-transcript">
         {state.items.length === 0 ? (
           <p className="chat-empty">Ask ScadForge to build or change your model.</p>
@@ -77,16 +84,17 @@ export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }:
         ) : null}
       </div>
       <form className="chat-composer" onSubmit={handleSubmit}>
-        <input
-          type="text"
+        <textarea
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={handleKeyDown}
           placeholder="Describe what you want to build…"
           disabled={disabled || isStreaming}
           aria-label="Message"
+          rows={3}
         />
         <button type="submit" disabled={disabled || isStreaming || draft.trim().length === 0}>
-          {isStreaming ? "Working…" : "Send"}
+          {isStreaming ? "Working…" : "Send ⌘↵"}
         </button>
       </form>
     </section>
