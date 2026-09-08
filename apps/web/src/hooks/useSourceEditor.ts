@@ -135,8 +135,12 @@ export function useSourceEditor(
   const pendingRef = useRef(pendingRemoved);
   const savingRef = useRef(false);
   const onSavedRef = useRef(onSaved);
+  const projectGenerationRef = useRef(0);
+  const draftGenerationRef = useRef(0);
+  const projectIdRef = useRef(projectId);
 
   onSavedRef.current = onSaved;
+  projectIdRef.current = projectId;
   draftRef.current = draftScad;
   savedRef.current = savedScad;
   baseRef.current = baseRevision;
@@ -144,6 +148,9 @@ export function useSourceEditor(
 
   // ── load (project switch, first mount, or explicit reload) ────────────────
   useEffect(() => {
+    projectGenerationRef.current += 1;
+    draftGenerationRef.current += 1;
+    savingRef.current = false;
     if (!projectId) {
       hydratedForRef.current = null;
       setSavedScad(null);
@@ -210,6 +217,7 @@ export function useSourceEditor(
   }, [projectId, draftScad, baseRevision, savedScad, dirty]);
 
   const setDraft = useCallback((text: string) => {
+    draftGenerationRef.current += 1;
     setDraftScad(text);
     setDirty(text !== savedRef.current);
     setSaveError(null);
@@ -232,13 +240,17 @@ export function useSourceEditor(
   }, [projectId]);
 
   const attemptPut = useCallback(
-    async (text: string, base: string, discarded: string[]): Promise<void> => {
-      if (!projectId) return;
-      const res = await client.updateSource(projectId, {
+    async (text: string, base: string, discarded: string[], generation: number, draftGeneration: number, requestProjectId: string): Promise<void> => {
+      if (!projectId || generation !== projectGenerationRef.current || draftGeneration !== draftGenerationRef.current || projectIdRef.current !== requestProjectId) return;
+      const res = await client.updateSource(requestProjectId, {
         scad: text,
         base_revision: base,
         discarded_params: discarded
       });
+      // A newer edit may have landed while the PUT was in flight. Advance the
+      // confirmed base/source, then compare against the current draft below so
+      // that newer typing remains dirty instead of being erased.
+      if (generation !== projectGenerationRef.current || projectIdRef.current !== requestProjectId) return;
       setSavedScad(res.scad);
       setBaseRevision(res.revision);
       setPendingRemoved(null);
@@ -257,6 +269,9 @@ export function useSourceEditor(
     const text = normalizeLf(draftRef.current);
     const base = baseRef.current;
     if (base === null) return;
+    const generation = projectGenerationRef.current;
+    const draftGeneration = draftGenerationRef.current;
+    const requestProjectId = projectId;
 
     savingRef.current = true;
     setSaving(true);
@@ -265,6 +280,7 @@ export function useSourceEditor(
     client
       .preflightSource(projectId, { scad: text, base_revision: base })
       .then((pre) => {
+        if (generation !== projectGenerationRef.current || draftGeneration !== draftGenerationRef.current || projectIdRef.current !== requestProjectId) return;
         if (!pre.syntax_ok) {
           setSaveError(`This code doesn't parse yet: ${pre.diagnostics ?? "syntax error"}`);
           return;
@@ -273,13 +289,15 @@ export function useSourceEditor(
           setPendingRemoved(pre.removed_params);
           return;
         }
-        return attemptPut(text, base, []);
+        return attemptPut(text, base, [], generation, draftGeneration, requestProjectId);
       })
       .catch((cause) => {
+        if (generation !== projectGenerationRef.current || projectIdRef.current !== requestProjectId) return;
         if (cause instanceof ApiClientError && cause.error_code === "CONFLICT") setConflict(true);
         setSaveError(describeSaveError(cause));
       })
       .finally(() => {
+        if (generation !== projectGenerationRef.current || projectIdRef.current !== requestProjectId) return;
         savingRef.current = false;
         setSaving(false);
       });
@@ -292,16 +310,21 @@ export function useSourceEditor(
     const text = normalizeLf(draftRef.current);
     const base = baseRef.current;
     if (base === null) return;
+    const generation = projectGenerationRef.current;
+    const draftGeneration = draftGenerationRef.current;
+    const requestProjectId = projectId;
 
     savingRef.current = true;
     setSaving(true);
     setSaveError(null);
-    attemptPut(text, base, removed.map((p) => p.name))
+    attemptPut(text, base, removed.map((p) => p.name), generation, draftGeneration, requestProjectId)
       .catch((cause) => {
+        if (generation !== projectGenerationRef.current || projectIdRef.current !== requestProjectId) return;
         if (cause instanceof ApiClientError && cause.error_code === "CONFLICT") setConflict(true);
         setSaveError(describeSaveError(cause));
       })
       .finally(() => {
+        if (generation !== projectGenerationRef.current || projectIdRef.current !== requestProjectId) return;
         savingRef.current = false;
         setSaving(false);
       });

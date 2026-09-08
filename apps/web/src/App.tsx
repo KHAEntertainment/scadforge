@@ -57,6 +57,8 @@ export function App() {
   const [headerNotice, setHeaderNotice] = useState<string | null>(null);
   const [buildState, setBuildState] = useState<"idle" | "building">("idle");
   const [exportState, setExportState] = useState<string | null>(null);
+  const [historicalSource, setHistoricalSource] = useState<{ snapshotId: string; scad: string; params: SnapshotManifest["params"] } | null>(null);
+  const historicalRequestRef = useRef(0);
 
   useEffect(() => {
     if (pendingProjectId && !sourceEditor.dirty && !sourceEditor.saving) {
@@ -64,6 +66,24 @@ export function App() {
       setPendingProjectId(null);
     }
   }, [pendingProjectId, sourceEditor.dirty, sourceEditor.saving, projectState.selectProject]);
+
+  // Historical Live mode must use the selected snapshot's captured source and
+  // overrides. Load it independently from the current-head source and ignore
+  // late replies when the user changes selection or project.
+  useEffect(() => {
+    const request = ++historicalRequestRef.current;
+    if (!projectId || !selectedSnapshotId || selectedSnapshotId === workingHeadId) {
+      setHistoricalSource(null);
+      return;
+    }
+    setHistoricalSource(null);
+    client.getSnapshot(projectId, selectedSnapshotId).then((response) => {
+      if (request !== historicalRequestRef.current) return;
+      setHistoricalSource({ snapshotId: selectedSnapshotId, scad: response.scad, params: response.params });
+    }).catch(() => {
+      if (request === historicalRequestRef.current) setHistoricalSource(null);
+    });
+  }, [client, projectId, selectedSnapshotId, workingHeadId]);
 
   const previousWorkingHeadIdRef = useRef<string | null>(null);
   useEffect(() => {
@@ -81,8 +101,15 @@ export function App() {
   const pngUrls = useMemo<Partial<Record<ViewName, string | null>>>(() => Object.fromEntries((currentSnapshot?.renders ?? []).map((render) => [render.view, client.resolveUrl(render.url)])), [currentSnapshot, client]);
   const validation = currentSnapshot?.validation ?? null;
   const historical = selectedSnapshotId !== null && selectedSnapshotId !== workingHeadId;
-  const effectiveScad = historical ? liveSource.scad : (sourceEditor.draftScad || liveSource.scad);
-  const liveParams = paramsController.initialized ? paramsController.debouncedValues : liveSource.params;
+  const liveSourceReady = (liveSource.projectId === undefined || liveSource.projectId === projectId)
+    && (liveSource.headSnapshotId === undefined || liveSource.headSnapshotId === workingHeadId)
+    && liveSource.scad !== null;
+  const effectiveScad = historical
+    ? (historicalSource?.snapshotId === selectedSnapshotId ? historicalSource.scad : null)
+    : (sourceEditor.draftScad || (liveSourceReady ? liveSource.scad : null));
+  const liveParams = historical
+    ? (historicalSource?.snapshotId === selectedSnapshotId ? historicalSource.params : {})
+    : (paramsController.initialized ? paramsController.debouncedValues : (liveSourceReady ? liveSource.params : {}));
 
   useEffect(() => {
     const chatHeadId = chat.state.headSnapshot?.id;
@@ -103,6 +130,32 @@ export function App() {
     if (sourceEditor.dirty) setPendingProjectId(id);
     else projectState.selectProject(id);
   }
+
+  const handleCreateProject = useCallback(async (name: string, scad?: string) => {
+    if (chat.isStreaming) {
+      setHeaderNotice("Finish the active chat turn before creating or switching projects.");
+      return null;
+    }
+    if (sourceEditor.dirty || sourceEditor.saving) {
+      setHeaderNotice("Save, discard, or cancel your current draft before creating or switching projects.");
+      return null;
+    }
+    const originProjectId = projectId;
+    const created = await projectState.createProject(name, scad, { select: false });
+    if (!created) return null;
+    // Creation is asynchronous; re-check the guard before changing the active
+    // project so a turn/edit that began while the request was in flight wins.
+    if (chat.isStreaming) {
+      setHeaderNotice("Project created. Finish the active chat turn before switching to it.");
+    } else if (sourceEditor.dirty || sourceEditor.saving) {
+      setPendingProjectId(created.id);
+    } else if (originProjectId === projectId) {
+      projectState.selectProject(created.id);
+    } else {
+      setHeaderNotice("Project created, but the active project changed while it was being created.");
+    }
+    return created;
+  }, [chat.isStreaming, projectId, projectState, sourceEditor.dirty, sourceEditor.saving]);
 
   async function build() {
     if (!projectId || sourceEditor.dirty || !sourceEditor.baseRevision) return;
@@ -139,7 +192,7 @@ export function App() {
 
   return (
     <div className="app">
-      <StudioHeader projects={projects} selectedId={projectId} projectName={project?.name ?? null} loading={projectLoading} creating={projectState.creating} createError={projectState.createError} activeTurn={chat.isStreaming} dirty={sourceEditor.dirty} saving={sourceEditor.saving} building={buildState === "building"} onSelectProject={requestProjectSwitch} onCreateProject={projectState.createProject} onBuild={() => void build()} onExport={(format) => void exportModel(format)} onExportSource={exportSource} />
+      <StudioHeader projects={projects} selectedId={projectId} projectName={project?.name ?? null} loading={projectLoading} creating={projectState.creating} createError={projectState.createError} activeTurn={chat.isStreaming} dirty={sourceEditor.dirty} saving={sourceEditor.saving} building={buildState === "building"} onSelectProject={requestProjectSwitch} onCreateProject={handleCreateProject} onBuild={() => void build()} onExport={(format) => void exportModel(format)} onExportSource={exportSource} />
       <StatusStrip client={client} validationBadge={validation?.badge ?? null} />
       {headerNotice || exportState ? <div className="studio-notice" role="status">{headerNotice ?? exportState}<button type="button" aria-label="Dismiss notice" onClick={() => { setHeaderNotice(null); setExportState(null); }}>Dismiss</button></div> : null}
       <main className="app-body">

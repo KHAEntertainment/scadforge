@@ -62,4 +62,27 @@ describe("useSourceEditor", () => {
     act(() => result.current.acknowledgeSave());
     await waitFor(() => expect(updateSource).toHaveBeenCalledWith("p1", expect.objectContaining({ discarded_params: ["size"] })));
   });
+
+  it("does not commit a draft that became stale while preflight was in flight", async () => {
+    let resolvePreflight!: (value: unknown) => void;
+    const preflightSource = vi.fn(() => new Promise((resolve) => { resolvePreflight = resolve; }));
+    const updateSource = vi.fn().mockResolvedValue({ scad: "cube(2);", params: {}, revision: "r2", project: {} });
+    const api = client({
+      getSource: vi.fn().mockResolvedValue({ scad: "cube(1);", params: {}, revision: "r1", project: {} }),
+      preflightSource: preflightSource as unknown as ApiClient["preflightSource"],
+      updateSource
+    });
+    const { result } = renderHook(() => useSourceEditor(api, "p1"));
+    await waitFor(() => expect(result.current.baseRevision).toBe("r1"));
+    act(() => result.current.setDraft("cube(2);"));
+    act(() => result.current.save());
+    expect(preflightSource).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.setDraft("cube(3);"));
+    act(() => resolvePreflight({ revision: "r1", syntax_ok: true, diagnostics: null, parameters: [], retained_params: {}, removed_params: [] }));
+    await waitFor(() => expect(result.current.saving).toBe(false));
+    expect(updateSource).not.toHaveBeenCalled();
+    expect(result.current.draftScad).toBe("cube(3);");
+    expect(result.current.dirty).toBe(true);
+  });
 });

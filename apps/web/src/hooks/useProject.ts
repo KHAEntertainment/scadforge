@@ -11,7 +11,7 @@ export interface UseProjectResult {
   creating: boolean;
   createError: string | null;
   selectProject: (id: string) => void;
-  createProject: (name: string, scad?: string) => Promise<ProjectManifest | null>;
+  createProject: (name: string, scad?: string, options?: { select?: boolean }) => Promise<ProjectManifest | null>;
   reload: () => void;
 }
 
@@ -78,14 +78,16 @@ export function useProject(client: ApiClient): UseProjectResult {
     rememberProject(id);
   }, []);
 
-  const createProject = useCallback(async (name: string, scad?: string) => {
+  const createProject = useCallback(async (name: string, scad?: string, options: { select?: boolean } = {}) => {
     setCreating(true);
     setCreateError(null);
     try {
       const response = await client.createProject({ name, scad });
       setProjects((current) => [response.project, ...current]);
-      setSelectedId(response.project.id);
-      rememberProject(response.project.id);
+      if (options.select !== false) {
+        setSelectedId(response.project.id);
+        rememberProject(response.project.id);
+      }
       return response.project;
     } catch (cause) {
       setCreateError(cause instanceof Error ? cause.message : "Failed to create project.");
