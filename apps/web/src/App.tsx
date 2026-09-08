@@ -114,8 +114,12 @@ export function App() {
 
   // The controller's bag is a COMPLETE override bag, not a partial diff.
   // `{}` is therefore authoritative after a revert to defaults and must not
-  // be merged with stale values from a previous `getProject` response.
-  const liveParams = paramsController.debouncedValues;
+  // be merged with stale values from a previous `getProject` response. But
+  // until the controller's FIRST successful `GET /params`, its bag is the
+  // uninitialized empty default — fall back to the project params already
+  // fetched by `useLiveModelSource` so a delayed/failed params load never
+  // makes Live compile defaults over persisted overrides.
+  const liveParams = paramsController.initialized ? paramsController.debouncedValues : liveSource.params;
 
   return (
     <div className="app">

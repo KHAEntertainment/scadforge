@@ -29,6 +29,13 @@ export interface ParamsControllerResult {
   saving: boolean;
   /** Message from the most recently REJECTED PUT; cleared on the next successful one. */
   saveError: string | null;
+  /**
+   * True once the first `GET /params` has succeeded, so the owner can treat
+   * `debouncedValues` as the authoritative override bag. Before that, an empty
+   * `debouncedValues` means "not loaded yet" (or "load failed"), not "loaded
+   * and empty", and the owner should fall back to `liveSource.params` instead.
+   */
+  initialized: boolean;
   setValue: (name: string, value: ParamValue) => void;
 }
 
@@ -77,6 +84,7 @@ export function useParamsController(
   const [dirty, setDirty] = useState<ReadonlySet<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [initialized, setInitialized] = useState(false);
 
   /** Last values the SERVER has confirmed (a GET, or a successful PUT's echo) — the revert target on a rejected PUT. */
   const committedRef = useRef<ParamValues>({});
@@ -107,6 +115,7 @@ export function useParamsController(
           setTitle(res.title);
           setParameters(res.parameters);
           committedRef.current = res.values;
+          setInitialized(true);
           if (mode === "reconcile") {
             // Conflict policy (see doc comment above): keep any locally-dirty
             // value, adopt everything else from the server. `debouncedValues`
@@ -148,6 +157,7 @@ export function useParamsController(
     }
     dirtyRef.current = new Set();
     setDirty(new Set());
+    setInitialized(false);
     load("reset");
     // `load` is memoized on the same [client, projectId] pair this effect is
     // keyed on, so including it does not change when this effect re-runs.
@@ -225,14 +235,20 @@ export function useParamsController(
         for (const name of namesToRevert) remainingDirty.delete(name);
         dirtyRef.current = remainingDirty;
         setDirty(new Set(remainingDirty));
-        setValues((prev) => {
+        // Roll back BOTH the visible control and the debounced live-preview
+        // bag. The debounce already copied the rejected value into the latter
+        // before the PUT ran, so leaving it would keep Live compiling the
+        // refused geometry long after the control (and server) reverted.
+        const rollback = (prev: ParamValues): ParamValues => {
           const next = { ...prev };
           for (const name of namesToRevert) {
             if (name in committedRef.current) next[name] = committedRef.current[name];
             else delete next[name];
           }
           return next;
-        });
+        };
+        setValues(rollback);
+        setDebouncedValues(rollback);
       })
       .finally(() => {
         inFlightRef.current = false;
@@ -270,6 +286,7 @@ export function useParamsController(
     dirty,
     saving,
     saveError,
+    initialized,
     setValue
   };
 }

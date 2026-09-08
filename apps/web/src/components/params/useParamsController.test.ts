@@ -147,6 +147,7 @@ describe("useParamsController", () => {
     });
 
     expect(result.current.values.wall).toBe(4); // reverted
+    expect(result.current.debouncedValues.wall).toBe(4); // Live preview reverted too, not left on the refused value
     expect(result.current.saveError).toMatch(/above its max/);
     expect(result.current.dirty.has("wall")).toBe(false);
   });
@@ -359,6 +360,7 @@ describe("useParamsController", () => {
 
     // The newer edit (wall=8) is preserved, not reverted to the last committed value (4).
     expect(result.current.values.wall).toBe(8);
+    expect(result.current.debouncedValues.wall).toBe(8); // the newer edit's debounced value survives the rejection too
     // And it is resent (and confirmed) once the rejected request settles.
     expect(updateParams).toHaveBeenCalledTimes(2);
     expect(updateParams).toHaveBeenLastCalledWith("p1", { values: { wall: 8 } });
@@ -401,5 +403,52 @@ describe("useParamsController", () => {
 
     expect(result.current.values.wall).toBe(40);
     expect(result.current.debouncedValues.wall).toBe(40);
+  });
+
+  it("initialized is false until the first successful load, then true", async () => {
+    const client = makeClient({ getParams: vi.fn().mockResolvedValue(schema({ wall: 4 })), updateParams: vi.fn() });
+
+    const { result } = renderHook(() => useParamsController(client, "p1", null));
+    expect(result.current.initialized).toBe(false);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.initialized).toBe(true);
+  });
+
+  it("initialized stays false when the initial load fails", async () => {
+    const client = makeClient({
+      getParams: vi.fn().mockRejectedValue(new ApiClientError({ error_code: "INTERNAL_ERROR", message: "GET /params failed" })),
+      updateParams: vi.fn()
+    });
+
+    const { result } = renderHook(() => useParamsController(client, "p1", null));
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(result.current.initialized).toBe(false);
+    expect(result.current.loadError).toMatch(/GET \/params failed/);
+  });
+
+  it("initialized resets to false on project change, then back to true after the new project loads", async () => {
+    const client = makeClient({ getParams: vi.fn().mockResolvedValue(schema({ wall: 4 })), updateParams: vi.fn() });
+
+    const { result, rerender } = renderHook(({ projectId }) => useParamsController(client, projectId, null), {
+      initialProps: { projectId: "p1" as string | null }
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.initialized).toBe(true);
+
+    rerender({ projectId: "p2" });
+    expect(result.current.initialized).toBe(false);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.initialized).toBe(true);
   });
 });

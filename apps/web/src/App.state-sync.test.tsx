@@ -34,6 +34,7 @@ const harness = vi.hoisted(() => ({
     dirty: new Set<string>(),
     saving: false,
     saveError: null,
+    initialized: true,
     setValue: vi.fn()
   },
   liveHead: null as string | null,
@@ -158,6 +159,8 @@ beforeEach(() => {
   harness.refresh.mockReset();
   harness.liveSource = { scad: "cube(1);", params: {} };
   harness.controller.debouncedValues = {};
+  harness.controller.values = {};
+  harness.controller.initialized = true;
   harness.liveHead = null;
   harness.controllerHead = null;
   harness.controllerOnSaved = null;
@@ -249,6 +252,29 @@ describe("App working-head synchronization", () => {
     harness.controller.debouncedValues = {};
     render(<App />);
 
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-params", "{}");
+  });
+
+  it("falls back to liveSource.params before the controller initializes, then treats the (possibly empty) bag as authoritative", () => {
+    harness.liveSource = { scad: "cube(size);", params: { wall: 7 } };
+    harness.controller.initialized = false;
+    harness.controller.debouncedValues = {};
+    const view = render(<App />);
+
+    // Before the first successful GET /params, an empty controller bag means
+    // "not loaded yet" — Live uses the already-fetched project params.
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-params", JSON.stringify({ wall: 7 }));
+
+    // Once initialized, the controller bag is authoritative.
+    harness.controller.initialized = true;
+    harness.controller.debouncedValues = { wall: 9 };
+    view.rerender(<App />);
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-params", JSON.stringify({ wall: 9 }));
+
+    // A legitimate revert-to-defaults empty bag stays authoritative, never
+    // resurrecting the stale fallback.
+    harness.controller.debouncedValues = {};
+    view.rerender(<App />);
     expect(screen.getByTestId("preview-state")).toHaveAttribute("data-params", "{}");
   });
 
