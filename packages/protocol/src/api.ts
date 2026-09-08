@@ -58,6 +58,14 @@ export const API_ROUTES = {
   exports: {
     create: "/projects/:projectId/export",
     file: "/projects/:projectId/exports/:file"
+  },
+  source: {
+    get: "/projects/:projectId/source",
+    preflight: "/projects/:projectId/source/preflight",
+    update: "/projects/:projectId/source"
+  },
+  build: {
+    create: "/projects/:projectId/build"
   }
 } as const;
 
@@ -274,4 +282,95 @@ export interface ExportResponse {
   export: ExportRecord;
   /** Validation state at export time; null when validation could not run. */
   validation: SnapshotManifest["validation"];
+}
+
+// ── source (studio code editing) ─────────────────────────────────────────────
+//
+// Contract addition #54 (lead-approved, delivered in a dedicated contract
+// commit). The studio's editable Code tab works against an OPAQUE revision of
+// the project's coherent head+source+params state so a save built on stale
+// state is rejected (`CONFLICT`) rather than force-overwritten, and so the
+// editor can learn exactly which parameter overrides a source edit would
+// remove before it commits.
+
+/** `GET /api/projects/:projectId/source`. The project response plus the current revision. */
+export interface SourceResponse extends ProjectResponse {
+  /**
+   * Opaque revision token identifying the coherent head+source+params state
+   * this response reflects. Echo it back as `base_revision` to a later
+   * preflight/PUT; a mismatch is a `CONFLICT`.
+   */
+  revision: string;
+}
+
+/** `POST /api/projects/:projectId/source/preflight` — a non-mutating dry run. */
+export interface SourcePreflightRequest {
+  /** Proposed `.scad` source, syntax-checked and analyzed for parameters. */
+  scad: string;
+  /**
+   * The revision the editor currently holds. ENFORCED: a stale revision is
+   * `CONFLICT` (the server never silently rebases a draft built on old
+   * source). The editor keeps its original `base_revision` unchanged.
+   */
+  base_revision: string;
+}
+
+/**
+ * One current parameter override the proposed source edit would DROP. Dropped
+ * either because its name is no longer declared, or because its current value
+ * is now incompatible (wrong type, out of range, or not an allowed option).
+ * `PUT .../source` must explicitly acknowledge each one via
+ * `discarded_params` before it will proceed.
+ */
+export interface RemovedParam {
+  name: string;
+  /** Human-readable reason (e.g. "no longer declared", "value out of range"). */
+  reason: string;
+}
+
+/** `POST /api/projects/:projectId/source/preflight`. */
+export interface SourcePreflightResponse {
+  /** The confirmed current revision — equal to the request's `base_revision`. */
+  revision: string;
+  syntax_ok: boolean;
+  /** `ERROR:` diagnostics; `null`, never `""`, when `syntax_ok` is true. */
+  diagnostics: string | null;
+  /** Parameters the proposed source declares. Empty when it does not parse. */
+  parameters: ParamDefinitionWire[];
+  /** Current overrides that survive the proposed source unchanged. */
+  retained_params: ParamValues;
+  /**
+   * Current overrides the proposed source would drop (name no longer declared,
+   * or now-incompatible value). Empty when the source does not parse.
+   */
+  removed_params: RemovedParam[];
+}
+
+/** `PUT /api/projects/:projectId/source`. */
+export interface SourceUpdateRequest {
+  scad: string;
+  /** Must equal the server's current revision; a mismatch is `CONFLICT`. */
+  base_revision: string;
+  /**
+   * Names of the current overrides the client explicitly acknowledged
+   * discarding (because the new source no longer declares them, or their
+   * current value is now incompatible). Must be exactly the set that would
+   * actually be dropped; revalidated server-side, never trusted from the
+   * client. Invalid syntax is `VALIDATION_FAILED`.
+   */
+  discarded_params?: string[];
+}
+
+// ── build (authoritative snapshot render + validate) ─────────────────────────
+
+/** `POST /api/projects/:projectId/build`. */
+export interface BuildRequest {
+  /** Must equal the server's current revision; a mismatch is `CONFLICT`. */
+  base_revision: string;
+}
+
+/** `POST /api/projects/:projectId/build`. */
+export interface BuildResponse {
+  /** The pinned snapshot, with renders, mesh, and validation attached. */
+  snapshot: SnapshotManifest;
 }

@@ -224,14 +224,23 @@ describe("REST surface", () => {
   it("mounts under /api with one route group per resource (CLAUDE.md rule 3)", () => {
     expect(API_BASE_PATH).toBe("/api");
     expect(Object.keys(API_ROUTES).sort()).toEqual([
+      "build",
       "chat",
       "exports",
       "health",
       "params",
       "projects",
       "renders",
-      "snapshots"
+      "snapshots",
+      "source"
     ]);
+  });
+
+  it("mounts the #54 studio source/build routes", () => {
+    expect(API_ROUTES.source.get).toBe("/projects/:projectId/source");
+    expect(API_ROUTES.source.preflight).toBe("/projects/:projectId/source/preflight");
+    expect(API_ROUTES.source.update).toBe("/projects/:projectId/source");
+    expect(API_ROUTES.build.create).toBe("/projects/:projectId/build");
   });
 
   it("uses :projectId / :snapshotId path params consistently", () => {
