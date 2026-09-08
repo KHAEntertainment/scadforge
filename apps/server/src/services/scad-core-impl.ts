@@ -522,7 +522,10 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
 
       // Compile the proposed source OUTSIDE the params lock.
       const scad = normalizeLineEndings(request.scad);
-      const compiled = await compileProposedSource(runtime, scad);
+      const compiled = await asRouteResult(
+        () => compileProposedSource(runtime, scad),
+        "failed to compile proposed source"
+      );
 
       // Re-check the revision inside the lock — a concurrent write that landed
       // during the compile must surface as CONFLICT, never a silent rebase.
@@ -553,7 +556,10 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       }
 
       // Compile outside the lock.
-      const compiled = await compileProposedSource(runtime, scad);
+      const compiled = await asRouteResult(
+        () => compileProposedSource(runtime, scad),
+        "failed to compile proposed source"
+      );
       if (!compiled.syntax_ok) {
         throw new RouteError("VALIDATION_FAILED", compiled.diagnostics ?? "Source does not parse.");
       }
