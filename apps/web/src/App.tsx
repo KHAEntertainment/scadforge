@@ -79,7 +79,11 @@ export function App() {
     setHistoricalSource(null);
     client.getSnapshot(projectId, selectedSnapshotId).then((response) => {
       if (request !== historicalRequestRef.current) return;
-      setHistoricalSource({ snapshotId: selectedSnapshotId, scad: response.scad, params: response.params });
+      setHistoricalSource({
+        snapshotId: selectedSnapshotId,
+        scad: response.scad,
+        params: response.snapshot.params
+      });
     }).catch(() => {
       if (request === historicalRequestRef.current) setHistoricalSource(null);
     });
