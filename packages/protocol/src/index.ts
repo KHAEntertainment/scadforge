@@ -78,6 +78,13 @@ export type {
   RenderedViewResponse,
   RenderViewsResponse,
   ExportRequest,
-  ExportResponse
+  ExportResponse,
+  SourceResponse,
+  SourcePreflightRequest,
+  SourcePreflightResponse,
+  RemovedParam,
+  SourceUpdateRequest,
+  BuildRequest,
+  BuildResponse
 } from "./api.js";
 export { API_BASE_PATH, API_ROUTES } from "./api.js";
