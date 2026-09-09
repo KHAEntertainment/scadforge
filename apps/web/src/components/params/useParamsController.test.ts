@@ -432,6 +432,44 @@ describe("useParamsController", () => {
     expect(result.current.loadError).toMatch(/GET \/params failed/);
   });
 
+  it("clears loading when a head reconciliation supersedes the initial project load", async () => {
+    let resolveInitial!: (res: ParamsResponse) => void;
+    const getParams = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise<ParamsResponse>((resolve) => {
+            resolveInitial = resolve;
+          })
+      )
+      .mockResolvedValueOnce(schema({ wall: 7 }));
+    const client = makeClient({ getParams, updateParams: vi.fn() });
+
+    const { result, rerender } = renderHook(({ headSnapshotId }) => useParamsController(client, "p1", headSnapshotId), {
+      initialProps: { headSnapshotId: null as string | null }
+    });
+    expect(result.current.loading).toBe(true);
+
+    // Snapshot hydration can publish a head before the initial GET resolves.
+    // The reconciliation is the newer request and must own loading state.
+    rerender({ headSnapshotId: "0001" });
+    await act(async () => {
+      await flushMicrotasks();
+    });
+
+    expect(result.current.parameters.map((parameter) => parameter.name)).toEqual(["wall"]);
+    expect(result.current.values.wall).toBe(7);
+    expect(result.current.loading).toBe(false);
+
+    // The superseded reset reply must remain harmless when it eventually lands.
+    await act(async () => {
+      resolveInitial(schema({ wall: 4 }));
+      await flushMicrotasks();
+    });
+    expect(result.current.values.wall).toBe(7);
+    expect(result.current.loading).toBe(false);
+  });
+
   it("initialized resets to false on project change, then back to true after the new project loads", async () => {
     const client = makeClient({ getParams: vi.fn().mockResolvedValue(schema({ wall: 4 })), updateParams: vi.fn() });
 

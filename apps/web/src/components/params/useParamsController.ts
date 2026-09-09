@@ -143,8 +143,13 @@ export function useParamsController(
           setLoadError(cause instanceof Error ? cause.message : "Failed to load parameters.");
         })
       .finally(() => {
-          if (mode === "reset" && seq === loadSeqRef.current) setLoading(false);
-        });
+        // A head reconciliation can supersede the initial project reset load
+        // (for example when snapshots hydrate in the same render). In that
+        // case the reset response is intentionally ignored, so only clearing
+        // loading for `mode === "reset"` would leave the tab stuck forever.
+        // Whichever request is current owns the loading lifecycle.
+        if (seq === loadSeqRef.current) setLoading(false);
+      });
     },
     [client, projectId]
   );
