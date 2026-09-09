@@ -19,6 +19,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type {
+  BuildRequest,
+  BuildResponse,
   CreateProjectRequest,
   ExportRequest,
   ExportResponse,
@@ -31,7 +33,11 @@ import type {
   RevertRequest,
   SnapshotDiffResponse,
   SnapshotManifest,
-  SnapshotResponse
+  SnapshotResponse,
+  SourcePreflightRequest,
+  SourcePreflightResponse,
+  SourceResponse,
+  SourceUpdateRequest
 } from "@scadforge/protocol";
 
 /** A binary file served verbatim (a render PNG or an export artifact). */
@@ -80,6 +86,32 @@ export interface ScadCoreApi {
   getParams(projectId: string): Promise<ParamsResponse>;
   /** Throws `PROJECT_NOT_FOUND`; unknown parameter names are ignored, not fatal. */
   updateParams(projectId: string, request: ParamsUpdateRequest): Promise<ParamsResponse>;
+
+  // ── source (studio code editing, Issue #54) ──────────────────────────────
+  /** Throws `PROJECT_NOT_FOUND`. */
+  getSource(projectId: string): Promise<SourceResponse>;
+  /**
+   * Non-mutating dry run: syntax-checks a proposed source edit and reports
+   * which current overrides it would drop. Throws `CONFLICT` on a stale
+   * `base_revision`; a source that does not parse is reported as
+   * `syntax_ok: false` (never a throw).
+   */
+  preflightSource(projectId: string, request: SourcePreflightRequest): Promise<SourcePreflightResponse>;
+  /**
+   * CAS save. Throws `CONFLICT` on a stale `base_revision`; `VALIDATION_FAILED`
+   * on invalid syntax or a `discarded_params` set that does not exactly match
+   * the overrides the save would drop. Creates one `manual` snapshot.
+   */
+  updateSource(projectId: string, request: SourceUpdateRequest): Promise<SourceResponse>;
+
+  // ── build (authoritative render + validate, Issue #54) ───────────────────
+  /**
+   * Renders + validates the pinned head snapshot and attaches the results to
+   * it. Throws `CONFLICT` on a stale `base_revision`; a total render failure
+   * or a mesh export/validation failure is a typed error — never a fake
+   * success.
+   */
+  build(projectId: string, request: BuildRequest): Promise<BuildResponse>;
 
   // ── renders ──────────────────────────────────────────────────────────────
   /**

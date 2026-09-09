@@ -98,6 +98,7 @@ export function useParamsController(
   const onSavedRef = useRef(onSaved);
   /** Monotonic load token: an out-of-order `getParams` reply must never overwrite a newer load's state. */
   const loadSeqRef = useRef(0);
+  const projectGenerationRef = useRef(0);
 
   onSavedRef.current = onSaved;
   valuesRef.current = values;
@@ -141,8 +142,8 @@ export function useParamsController(
           if (seq !== loadSeqRef.current) return;
           setLoadError(cause instanceof Error ? cause.message : "Failed to load parameters.");
         })
-        .finally(() => {
-          if (mode === "reset") setLoading(false);
+      .finally(() => {
+          if (mode === "reset" && seq === loadSeqRef.current) setLoading(false);
         });
     },
     [client, projectId]
@@ -150,6 +151,11 @@ export function useParamsController(
 
   // Project (or first) load: full reset.
   useEffect(() => {
+    projectGenerationRef.current += 1;
+    // Requests for the previous project may still settle, but they must not
+    // hold the new project's send queue hostage or mutate shared state.
+    inFlightRef.current = false;
+    resendRef.current = false;
     lastReconciledSnapshotRef.current = null;
     if (debounceTimerRef.current) {
       clearTimeout(debounceTimerRef.current);
@@ -181,6 +187,8 @@ export function useParamsController(
 
   const flush = useCallback(() => {
     if (!projectId) return;
+    const generation = projectGenerationRef.current;
+    const requestProjectId = projectId;
     const names = Array.from(dirtyRef.current);
     if (names.length === 0) return;
     if (inFlightRef.current) {
@@ -197,8 +205,9 @@ export function useParamsController(
     for (const name of names) diff[name] = valuesRef.current[name];
 
     client
-      .updateParams(projectId, { values: diff })
+      .updateParams(requestProjectId, { values: diff })
       .then((res) => {
+        if (generation !== projectGenerationRef.current) return;
         setSaveError(null);
         committedRef.current = res.values;
         // Keep dirty only for names the user changed again WHILE this
@@ -219,6 +228,7 @@ export function useParamsController(
         onSavedRef.current?.();
       })
       .catch((cause) => {
+        if (generation !== projectGenerationRef.current) return;
         // Server authority: a rejected value (wrong type, out of range,
         // unknown name) is never left showing in the UI as if it were
         // accepted — but a NEWER edit made while this PUT was in flight is
@@ -251,6 +261,7 @@ export function useParamsController(
         setDebouncedValues(rollback);
       })
       .finally(() => {
+        if (generation !== projectGenerationRef.current) return;
         inFlightRef.current = false;
         setSaving(false);
         if (resendRef.current) {

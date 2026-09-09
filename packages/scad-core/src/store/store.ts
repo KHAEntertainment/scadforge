@@ -63,6 +63,7 @@ import { OPENSCAD_IMAGE, OPENSCAD_VERSION } from "../types.js";
 import type { ParamValues, ParamsFile, ValidationGateResult, ValidationReport } from "../types.js";
 import { PARAMS_ACTIVE_PRESET, PARAMS_FILE_FORMAT_VERSION } from "../types.js";
 import { ScadForgeError, withTypedError } from "../errors.js";
+import { normalizeLineEndings } from "../lf.js";
 import {
   exportsDir,
   historyDir,
@@ -271,8 +272,14 @@ async function writeSnapshotFiles(
   const viewsDirPath = join(dir, PROJECT_LAYOUT.snapshot.viewsDir);
   await mkdir(viewsDirPath, { recursive: true });
 
+  // Normalize to LF-only (Issue #40) BEFORE writing, so the snapshot, root
+  // `model.scad`, and the `diff.patch` against the parent all carry identical
+  // bytes -- the CLI runner and `--export-format=param` parser then never see
+  // a CRLF file the store did not intend.
+  const content = normalizeLineEndings(input.content);
+
   // model.scad
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), input.content, "utf8");
+  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), content, "utf8");
 
   // params.json (Customizer preset format, matching the project root convention)
   const paramsFile: ParamsFile = {
@@ -295,7 +302,7 @@ async function writeSnapshotFiles(
       `${parent}/model.scad`,
       `${id}/model.scad`,
       parentContent,
-      input.content
+      content
     );
     await writeFile(join(dir, PROJECT_LAYOUT.snapshot.diffFile), patch, "utf8");
     diffPatchRel = PROJECT_LAYOUT.snapshot.diffFile;
@@ -364,7 +371,7 @@ async function writeSnapshotFiles(
   await writeFile(join(dir, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(manifest, null, 2), "utf8");
 
   // Update root model.scad / params.json to the current state.
-  await writeFile(rootModelPath(projectDir), input.content, "utf8");
+  await writeFile(rootModelPath(projectDir), content, "utf8");
   await writeFile(rootParamsPath(projectDir), JSON.stringify(paramsFile, null, 2), "utf8");
 
   // Update project.json head.
