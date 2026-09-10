@@ -34,12 +34,16 @@
 // correct direction to err in: under-promising interactivity is safe,
 // over-promising it (a dead slider) is not.
 //
-// The systemic fix — normalizing line endings to LF wherever scad-core
-// writes/ingests `.scad` files (store/runner, outside this module's owned
-// path) — is out of scope here and has been flagged back to the Tech Lead
-// as a follow-up issue candidate. This module is the defensive backstop for
-// files that still arrive with CRLF endings from elsewhere (user upload,
-// external tooling, a pasted snippet).
+// LAYERING (Issue #40): the systemic fix now exists — `lf.ts`'s
+// `normalizeLineEndings` runs at every scad-core write/ingest boundary
+// (store snapshot writes, the server's source save/preflight staging), so
+// `.scad` bytes that reach this parser through any normal flow are already
+// LF-only and this module's stripping/warning path is UNREACHABLE there
+// (proven by store/crlf-ingest.docker.test.ts). This module is retained as
+// the defensive READ-time backstop for the residual paths that bypass a
+// scad-core write boundary — direct user-provided snippets handed straight
+// to the parser, external tooling, or a hand-edited file on disk. Do not
+// remove it: it is the second layer of a two-layer defense, not dead code.
 //
 // SPDX-License-Identifier: Apache-2.0
 
