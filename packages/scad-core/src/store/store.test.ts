@@ -489,6 +489,82 @@ describe("project store (filesystem, temp dir)", () => {
     expect(records[1].validation_overridden).toBe(true);
   });
 
+  // ── exports-ledger concurrency + integrity (Issue #48) ──
+
+  const exportRecord = (i: number) => ({
+    snapshot: "0001",
+    format: "3mf" as const,
+    file: `proj-0001-${i}.3mf`,
+    url: `/exports/proj-0001-${i}.3mf`,
+    bytes: 1000 + i,
+    timestamp: new Date().toISOString(),
+    validation_overridden: false
+  });
+  const exportsIndexPath = () => join(projectDir, PROJECT_LAYOUT.metaDir, PROJECT_LAYOUT.exportsDir, "index.json");
+
+  it("N concurrent exports all appear in the ledger -- no lost or interleaved entries (Issue #48)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const N = 10;
+    await Promise.all(Array.from({ length: N }, (_, i) => recordExport(projectDir, exportRecord(i))));
+
+    // Interleaved writes would leave bytes that do not parse at all.
+    const records = JSON.parse(await readFile(exportsIndexPath(), "utf8"));
+    expect(records).toHaveLength(N);
+    expect(new Set(records.map((r: { file: string }) => r.file)).size).toBe(N);
+    expect(records.map((r: { file: string }) => r.file).sort()).toEqual(
+      Array.from({ length: N }, (_, i) => `proj-0001-${i}.3mf`).sort()
+    );
+  });
+
+  it("unresolvable exports-lock contention surfaces the typed CONFLICT error rather than a silent drop (Issue #48)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    // Simulate a wedged lock holder that never releases: pre-create the
+    // lock directory, so every acquire attempt hits EEXIST until the retry
+    // loop exhausts and fails with the frozen CONFLICT code.
+    await mkdir(join(projectDir, PROJECT_LAYOUT.metaDir, "exports.lock"), { recursive: true });
+
+    await expect(recordExport(projectDir, exportRecord(0))).rejects.toMatchObject({ error_code: "CONFLICT" });
+
+    // Nothing was written: the failed append must not silently drop into a
+    // half-state, and the lock itself is still held (we created it).
+    await expect(readFile(exportsIndexPath(), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  }, 20000);
+
+  it("a corrupt exports ledger is detected, never silently parsed as empty -- and its bytes are preserved (Issue #48)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const corrupt = '{"truncated":';
+    await mkdir(join(projectDir, PROJECT_LAYOUT.metaDir, PROJECT_LAYOUT.exportsDir), { recursive: true });
+    await writeFile(exportsIndexPath(), corrupt, "utf8");
+
+    // Before the fix this SUCCEEDED by treating the corrupt file as empty
+    // and overwriting it -- silently losing every prior entry and the
+    // evidence. Now it refuses with a typed error naming the file.
+    const failure = recordExport(projectDir, exportRecord(0));
+    await expect(failure).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+    await expect(failure).rejects.toThrow(/corrupt/i);
+
+    // The corrupt bytes are untouched on disk for inspection/repair.
+    expect(await readFile(exportsIndexPath(), "utf8")).toBe(corrupt);
+
+    // And after a manual repair, appends work again (the lock was released
+    // by the failure path -- it must not wedge subsequent exports).
+    await rm(exportsIndexPath(), { force: true });
+    await recordExport(projectDir, exportRecord(1));
+    const records = JSON.parse(await readFile(exportsIndexPath(), "utf8"));
+    expect(records).toHaveLength(1);
+    expect(records[0].file).toBe("proj-0001-1.3mf");
+  });
+
+  it("a ledger that is valid JSON but not an array is also detected as corrupt (Issue #48)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const notAnArray = '{"records": []}';
+    await mkdir(join(projectDir, PROJECT_LAYOUT.metaDir, PROJECT_LAYOUT.exportsDir), { recursive: true });
+    await writeFile(exportsIndexPath(), notAnArray, "utf8");
+
+    await expect(recordExport(projectDir, exportRecord(0))).rejects.toThrow(/corrupt/i);
+    expect(await readFile(exportsIndexPath(), "utf8")).toBe(notAnArray);
+  });
+
   // ── COUNTEREXAMPLES: missing/malformed/boundary ──
 
   it("readProjectManifest on a directory that is not a project -> typed PROJECT_NOT_FOUND", async () => {
