@@ -14,6 +14,8 @@
 import { API_BASE_PATH, API_ROUTES } from "@scadforge/protocol";
 import type {
   ApiError,
+  BuildRequest,
+  BuildResponse,
   ChatTurnRequest,
   ExportRequest,
   ExportResponse,
@@ -26,7 +28,11 @@ import type {
   CreateProjectRequest,
   RevertRequest,
   SnapshotDiffResponse,
-  SnapshotResponse
+  SnapshotResponse,
+  SourcePreflightRequest,
+  SourcePreflightResponse,
+  SourceResponse,
+  SourceUpdateRequest
 } from "@scadforge/protocol";
 
 /** Thrown for any non-2xx response. Carries the frozen `{error_code, message}` body. */
@@ -167,6 +173,13 @@ export function createApiClient(options: ApiClientOptions = {}) {
       );
     },
 
+    /** `GET /projects/:projectId/snapshots/:snapshotId` — captured source for historical Code view. */
+    getSnapshot(projectId: string, snapshotId: string): Promise<SnapshotResponse> {
+      return request<SnapshotResponse>(
+        fillRoute(API_ROUTES.snapshots.get, { projectId, snapshotId })
+      );
+    },
+
     /** `GET /snapshots/:snapshotId/diff` — empty string for the first snapshot (frozen contract). */
     getSnapshotDiff(projectId: string, snapshotId: string): Promise<SnapshotDiffResponse> {
       return request<SnapshotDiffResponse>(
@@ -240,6 +253,44 @@ export function createApiClient(options: ApiClientOptions = {}) {
     updateParams(projectId: string, body: ParamsUpdateRequest): Promise<ParamsResponse> {
       return request<ParamsResponse>(fillRoute(API_ROUTES.params.update, { projectId }), {
         method: "PUT",
+        body: JSON.stringify(body)
+      });
+    },
+
+    /** `GET /projects/:projectId/source` — current source + params + head, with the opaque `revision` (Issue #54). */
+    getSource(projectId: string): Promise<SourceResponse> {
+      return request<SourceResponse>(fillRoute(API_ROUTES.source.get, { projectId }));
+    },
+
+    /**
+     * `POST /projects/:projectId/source/preflight` — non-mutating dry run that
+     * ENFORCES `base_revision` (stale → `CONFLICT`). On success returns the
+     * confirmed current revision (equal to the request's `base_revision`) plus
+     * the parameter drop the eventual PUT would require.
+     */
+    preflightSource(projectId: string, body: SourcePreflightRequest): Promise<SourcePreflightResponse> {
+      return request<SourcePreflightResponse>(fillRoute(API_ROUTES.source.preflight, { projectId }), {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+    },
+
+    /**
+     * `PUT /projects/:projectId/source` — compare-and-swap save. Rejects with
+     * `CONFLICT` (stale revision) or `VALIDATION_FAILED` (invalid syntax); it
+     * revalidates server-side and never trusts the client.
+     */
+    updateSource(projectId: string, body: SourceUpdateRequest): Promise<SourceResponse> {
+      return request<SourceResponse>(fillRoute(API_ROUTES.source.update, { projectId }), {
+        method: "PUT",
+        body: JSON.stringify(body)
+      });
+    },
+
+    /** `POST /projects/:projectId/build` — pins the saved snapshot and attaches real renders/mesh/validation. */
+    build(projectId: string, body: BuildRequest): Promise<BuildResponse> {
+      return request<BuildResponse>(fillRoute(API_ROUTES.build.create, { projectId }), {
+        method: "POST",
         body: JSON.stringify(body)
       });
     },

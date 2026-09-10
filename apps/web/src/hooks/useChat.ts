@@ -84,6 +84,7 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const projectGenerationRef = useRef(0);
   /** Gates persistence until the restore for THIS project has run — see below. */
   const hydratedFor = useRef<string | null>(null);
 
@@ -91,6 +92,11 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
   // below can fire for the same project, so the initial empty state is never
   // written over a stored transcript.
   useEffect(() => {
+    const generation = ++projectGenerationRef.current;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsStreaming(false);
+    setStreamError(null);
     if (!projectId) {
       hydratedFor.current = null;
       dispatch({ type: "local_reset" });
@@ -99,6 +105,14 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
     const stored = loadItems(projectId);
     dispatch(stored ? { type: "local_restore", items: stored } : { type: "local_reset" });
     hydratedFor.current = projectId;
+    return () => {
+      // Abort and invalidate any stream belonging to the project being left.
+      if (projectGenerationRef.current === generation) {
+        projectGenerationRef.current += 1;
+        abortRef.current?.abort();
+        abortRef.current = null;
+      }
+    };
   }, [projectId]);
 
   // Persist every transcript change. Keyed by project so switching projects
@@ -111,6 +125,7 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
   const sendMessage = useCallback(
     async (text: string) => {
       if (!projectId || text.trim().length === 0) return;
+      const generation = projectGenerationRef.current;
 
       // Echo FIRST, before any await. The prompt has to appear on the very
       // next paint — not after the request resolves, and not conditionally on
@@ -128,14 +143,15 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
           throw new Error("Chat response had no body");
         }
         for await (const event of parseSseStream(response.body, controller.signal)) {
+          if (generation !== projectGenerationRef.current) return;
           dispatch(event);
         }
       } catch (cause) {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || generation !== projectGenerationRef.current) return;
         const message = cause instanceof Error ? cause.message : "Chat stream failed unexpectedly.";
         setStreamError(message);
       } finally {
-        setIsStreaming(false);
+        if (generation === projectGenerationRef.current) setIsStreaming(false);
       }
     },
     [client, projectId]

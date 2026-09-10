@@ -46,7 +46,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createTwoFilesPatch } from "diff";
 import {
   PROJECT_LAYOUT,
@@ -63,6 +63,7 @@ import { OPENSCAD_IMAGE, OPENSCAD_VERSION } from "../types.js";
 import type { ParamValues, ParamsFile, ValidationGateResult, ValidationReport } from "../types.js";
 import { PARAMS_ACTIVE_PRESET, PARAMS_FILE_FORMAT_VERSION } from "../types.js";
 import { ScadForgeError, withTypedError } from "../errors.js";
+import { normalizeLineEndings } from "../lf.js";
 import {
   exportsDir,
   historyDir,
@@ -73,8 +74,15 @@ import {
   rootParamsPath,
   snapshotDir
 } from "./paths.js";
-import { readDerivedEnrichment } from "./derived.js";
+import { readDerivedEnrichment, writeDerivedValidation } from "./derived.js";
 import { withParamsLock } from "./params-lock.js";
+import {
+  attachRendersToSnapshot,
+  resolveSnapshotMeshPath,
+  resolveSnapshotRenderPath,
+  resolveSnapshotValidationPath,
+  snapshotMeshPath
+} from "./attachments.js";
 
 // ── ProjectManifest (project.json) ──────────────────────────────────────────
 
@@ -300,8 +308,14 @@ async function writeSnapshotFiles(
   const viewsDirPath = join(dir, PROJECT_LAYOUT.snapshot.viewsDir);
   await mkdir(viewsDirPath, { recursive: true });
 
+  // Normalize to LF-only (Issue #40) BEFORE writing, so the snapshot, root
+  // `model.scad`, and the `diff.patch` against the parent all carry identical
+  // bytes -- the CLI runner and `--export-format=param` parser then never see
+  // a CRLF file the store did not intend.
+  const content = normalizeLineEndings(input.content);
+
   // model.scad
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), input.content, "utf8");
+  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), content, "utf8");
 
   // params.json (Customizer preset format, matching the project root convention)
   const paramsFile: ParamsFile = {
@@ -324,7 +338,7 @@ async function writeSnapshotFiles(
       `${parent}/model.scad`,
       `${id}/model.scad`,
       parentContent,
-      input.content
+      content
     );
     await writeFile(join(dir, PROJECT_LAYOUT.snapshot.diffFile), patch, "utf8");
     diffPatchRel = PROJECT_LAYOUT.snapshot.diffFile;
@@ -393,7 +407,7 @@ async function writeSnapshotFiles(
   await writeFile(join(dir, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(manifest, null, 2), "utf8");
 
   // Update root model.scad / params.json to the current state.
-  await writeFile(rootModelPath(projectDir), input.content, "utf8");
+  await writeFile(rootModelPath(projectDir), content, "utf8");
   await writeFile(rootParamsPath(projectDir), JSON.stringify(paramsFile, null, 2), "utf8");
 
   // Update project.json head.
@@ -488,7 +502,16 @@ export async function listSnapshots(projectDir: string): Promise<SnapshotManifes
  * `project.json`, and without the lock it could interleave with a concurrent
  * `set_params`/params-update's own read-merge-write of the same files.
  */
-export async function revertToSnapshot(projectDir: string, targetId: SnapshotId): Promise<SnapshotManifest> {
+export interface RevertToSnapshotOptions {
+  /** Rebuilds render URLs for the newly-created snapshot id. */
+  buildRenderUrl?: CreateSnapshotInput["buildRenderUrl"];
+}
+
+export async function revertToSnapshot(
+  projectDir: string,
+  targetId: SnapshotId,
+  options: RevertToSnapshotOptions = {}
+): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
       const target = await readSnapshotManifest(projectDir, targetId);
@@ -500,15 +523,66 @@ export async function revertToSnapshot(projectDir: string, targetId: SnapshotId)
       const paramsFile = JSON.parse(paramsRaw) as ParamsFile;
       const params = (paramsFile.parameterSets[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
 
-      return withParamsLock(projectDir, () =>
-        createSnapshot(projectDir, {
+      return withParamsLock(projectDir, async () => {
+        // Resolve read locations before creating the new snapshot. Each
+        // resolver checks the post-creation `derived/` tree first and then
+        // the legacy `history/` location, so both project shapes restore.
+        // Missing artifacts are ordinary: a snapshot may never have been
+        // rendered or validated, and a stale legacy pointer must not make the
+        // model/params revert fail.
+        const renderSources = (
+          await Promise.all(
+            target.renders.map(async (render) => {
+              const sourcePath = await resolveSnapshotRenderPath(projectDir, targetId, render.view);
+              return sourcePath ? { render, sourcePath } : null;
+            })
+          )
+        ).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+        const validationSource = target.validation
+          ? await resolveSnapshotValidationPath(projectDir, targetId)
+          : null;
+        const meshSource = await resolveSnapshotMeshPath(projectDir, targetId);
+
+        const reverted = await createSnapshot(projectDir, {
           content: modelContent,
           params,
           message: `Revert to ${targetId}`,
           origin: "revert",
           pass: null
-        })
-      );
+        });
+
+        if (renderSources.length > 0) {
+          await attachRendersToSnapshot(
+            projectDir,
+            reverted.id,
+            renderSources.map(({ render, sourcePath }) => ({
+              view: render.view,
+              sourcePath,
+              render_ms: render.render_ms,
+              width: render.width,
+              height: render.height
+            })),
+            { buildRenderUrl: options.buildRenderUrl }
+          );
+        }
+
+        if (validationSource && target.validation) {
+          const report = JSON.parse(await readFile(validationSource, "utf8")) as ValidationReport;
+          await writeDerivedValidation(projectDir, reverted.id, report, target.validation);
+        }
+
+        if (meshSource) {
+          const destination = snapshotMeshPath(projectDir, reverted.id);
+          await mkdir(dirname(destination), { recursive: true });
+          await copyFile(meshSource, destination);
+        }
+
+        // Re-read through the normal merge surface so the caller immediately
+        // receives the restored render refs and validation summary. The raw
+        // `history/<new-id>/manifest.json` remains the immutable creation
+        // record; all copied enrichment lives under `derived/<new-id>/`.
+        return readSnapshotManifest(projectDir, reverted.id);
+      });
     },
     "SNAPSHOT_NOT_FOUND",
     `failed to revert to snapshot '${targetId}'`

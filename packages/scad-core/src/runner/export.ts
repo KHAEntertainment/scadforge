@@ -6,7 +6,7 @@
 import { copyFile, mkdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { DEFAULT_RENDER_TIMEOUT_MS } from "../types.js";
-import type { ExportRunRequest, ExportRunResult } from "../types.js";
+import type { ExportRunRequest, ExportRunResult, ValidationResult } from "../types.js";
 import { ScadForgeError } from "../errors.js";
 import { validateMesh } from "../validate/validate.js";
 import { exportMeshWithValidationStl } from "./mesh-export.js";
@@ -19,10 +19,23 @@ import { stageWork } from "./workdir.js";
  * is set. Never throws a bare Error: subprocess/filesystem failures surface
  * as `ExportRunResult.ok === false` with a typed `error_code`.
  */
-export async function exportRun(
+export interface ExportRunWithValidationResult {
+  result: ExportRunResult;
+  /** Full validation result for the exact mesh used by this export. */
+  validation: ValidationResult | null;
+}
+
+/**
+ * Runs the export while retaining the full validation report that produced
+ * the gate in `result.validation`. The ordinary {@link exportRun} wrapper
+ * deliberately keeps its frozen public result unchanged; server adapters
+ * that must build an export-time validation summary use this richer helper
+ * without rendering or validating the geometry a second time.
+ */
+export async function exportRunWithValidation(
   request: ExportRunRequest,
   options?: { libraryPaths?: readonly string[] }
-): Promise<ExportRunResult> {
+): Promise<ExportRunWithValidationResult> {
   const timeoutMs = request.timeoutMs ?? DEFAULT_RENDER_TIMEOUT_MS;
   const start = process.hrtime.bigint();
   const elapsedMs = () => Number(process.hrtime.bigint() - start) / 1e6;
@@ -37,15 +50,18 @@ export async function exportRun(
     } catch (err) {
       const typed = ScadForgeError.normalize(err, "EXPORT_FAILED", "export failed");
       return {
-        ok: false,
-        path: null,
-        format: request.format,
-        bytes: null,
-        export_ms: elapsedMs(),
-        validation: null,
-        validation_overridden: false,
-        error_code: typed.error_code,
-        message: typed.message
+        result: {
+          ok: false,
+          path: null,
+          format: request.format,
+          bytes: null,
+          export_ms: elapsedMs(),
+          validation: null,
+          validation_overridden: false,
+          error_code: typed.error_code,
+          message: typed.message
+        },
+        validation: null
       };
     }
 
@@ -55,15 +71,18 @@ export async function exportRun(
     } catch (err) {
       const typed = ScadForgeError.normalize(err, "MESH_PARSE_FAILED", "export: validation failed");
       return {
-        ok: false,
-        path: null,
-        format: request.format,
-        bytes: null,
-        export_ms: elapsedMs(),
-        validation: null,
-        validation_overridden: false,
-        error_code: typed.error_code,
-        message: typed.message
+        result: {
+          ok: false,
+          path: null,
+          format: request.format,
+          bytes: null,
+          export_ms: elapsedMs(),
+          validation: null,
+          validation_overridden: false,
+          error_code: typed.error_code,
+          message: typed.message
+        },
+        validation: null
       };
     }
 
@@ -73,15 +92,18 @@ export async function exportRun(
 
     if (gateFailed && !overridden) {
       return {
-        ok: false,
-        path: null,
-        format: request.format,
-        bytes: null,
-        export_ms: elapsedMs(),
-        validation: gate,
-        validation_overridden: false,
-        error_code: "VALIDATION_FAILED",
-        message: `export refused: ${gate.failures.map((f) => f.message).join("; ") || "validation gate failed"}`
+        result: {
+          ok: false,
+          path: null,
+          format: request.format,
+          bytes: null,
+          export_ms: elapsedMs(),
+          validation: gate,
+          validation_overridden: false,
+          error_code: "VALIDATION_FAILED",
+          message: `export refused: ${gate.failures.map((f) => f.message).join("; ") || "validation gate failed"}`
+        },
+        validation
       };
     }
 
@@ -91,29 +113,42 @@ export async function exportRun(
       await copyFile(meshResult.formatPath, destPath);
       const bytes = (await stat(destPath)).size;
       return {
-        ok: true,
-        path: destPath,
-        format: request.format,
-        bytes,
-        export_ms: elapsedMs(),
-        validation: gate,
-        validation_overridden: overridden
+        result: {
+          ok: true,
+          path: destPath,
+          format: request.format,
+          bytes,
+          export_ms: elapsedMs(),
+          validation: gate,
+          validation_overridden: overridden
+        },
+        validation
       };
     } catch (err) {
       const typed = ScadForgeError.normalize(err, "EXPORT_FAILED", "failed to write export output");
       return {
-        ok: false,
-        path: null,
-        format: request.format,
-        bytes: null,
-        export_ms: elapsedMs(),
-        validation: gate,
-        validation_overridden: overridden,
-        error_code: typed.error_code,
-        message: typed.message
+        result: {
+          ok: false,
+          path: null,
+          format: request.format,
+          bytes: null,
+          export_ms: elapsedMs(),
+          validation: gate,
+          validation_overridden: overridden,
+          error_code: typed.error_code,
+          message: typed.message
+        },
+        validation
       };
     }
   } finally {
     await work.cleanup();
   }
+}
+
+export async function exportRun(
+  request: ExportRunRequest,
+  options?: { libraryPaths?: readonly string[] }
+): Promise<ExportRunResult> {
+  return (await exportRunWithValidation(request, options)).result;
 }

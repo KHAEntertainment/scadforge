@@ -13,12 +13,20 @@ function makeClient(): ApiClient {
     createProject: vi.fn(),
     getProject: vi.fn(),
     listSnapshots: vi.fn(),
+    getSnapshot: vi.fn(),
     getSnapshotDiff: vi.fn(),
     revertSnapshot: vi.fn(),
     openChatStream: vi.fn(),
     exportModel: vi.fn(),
+    getParams: vi.fn(),
+    updateParams: vi.fn(),
+    getSource: vi.fn(),
+    preflightSource: vi.fn(),
+    updateSource: vi.fn(),
+    build: vi.fn(),
     fetchExportFile: vi.fn(),
-    resolveUrl: vi.fn((path: string) => `http://api.test${path}`)
+    resolveUrl: vi.fn((path: string) => `http://api.test${path}`),
+    headRaw: vi.fn()
   } as ApiClient;
 }
 

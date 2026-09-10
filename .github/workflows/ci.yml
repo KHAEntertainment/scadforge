@@ -41,9 +41,36 @@ jobs:
 
   docker-smoke-render:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Build pinned OpenSCAD image + smoke render
         run: bash docker/ci-smoke-render.sh
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build integration dependencies
+        run: pnpm -r build
+
+      - name: M2 parameter and preview agreement integration
+        run: node evals/scenario-a2/run.mjs --no-compose
+
+      - name: Upload M2 integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-a2-evidence
+          path: evals/scenario-a2/evidence/
+          if-no-files-found: warn

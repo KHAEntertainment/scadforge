@@ -1,0 +1,61 @@
+# Scenario A end-to-end run
+# prompt: A wall-mount bracket for a 32 mm pipe with two M4 screw slots
+# started: 2026-09-08T20:17:20.032Z
+# node: v26.7.0  platform: darwin/arm64
+
+[+  0.004s] Scenario A — projects root: /private/tmp/scadforge-m2-review-projects
+[+  0.004s] Prompt: "A wall-mount bracket for a 32 mm pipe with two M4 screw slots"
+[+  0.004s] ── compose up (pinned OpenSCAD)
+[+  0.005s]    compose step skipped (--no-compose)
+[+  0.005s]    compose up (pinned OpenSCAD): 0.00s
+[+  0.005s] ── start server
+[+  1.985s]    server healthy at http://127.0.0.1:3299 ({"ok":true,"version":"0.0.0","openscad_image":"docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7","openscad_version":"2026.01.19 (git e43242666)"})
+[+  1.985s]    start server: 1.98s
+[+  1.985s] ── create project
+[+   2.05s]    create project: 0.07s
+[+  2.051s]    project id: scenario-a-bracket
+[+  2.051s] ── agent turn (LIVE)
+[+  2.177s]    SSE turn_started
+[+165.426s]    SSE tool_call read_project() pass=0
+[+166.651s]    SSE tool_result read_project ok=true — 0 parameters, head 0001
+[+183.348s]    SSE tool_call write_scad(Wall-mount bracket for 32mm pipe with C-shaped snap cradle and two vertical M4 slots) pass=1
+[+ 185.51s]    SSE snapshot_created 0002
+[+185.558s]    SSE tool_result write_scad ok=true — Wall-mount bracket for 32mm pipe with C-shaped snap cradle and two vertical M4 slots
+[+187.315s]    SSE tool_call render_views(default views) pass=1
+[+187.433s]    SSE tool_call validate_mesh() pass=1
+[+197.674s]    SSE tool_result render_views ok=true — 4 of 4 views rendered
+[+200.013s]    SSE tool_result validate_mesh ok=true — amber: manifold=true components=1
+[+214.902s]    SSE assistant_text
+[+217.909s]    SSE turn_done status=completed passes=1
+[+217.914s]    agent turn (LIVE): 215.86s
+[+217.916s]    turn status: completed after 1 pass(es)
+[+217.916s]    usage: {"per_pass":[{"pass":0,"duration_ms":181128,"tool_calls":1,"images":0,"input_tokens":2,"output_tokens":13408,"cache_read_input_tokens":0,"cache_creation_input_tokens":25627},{"pass":1,"duration_ms":31520,"tool_calls":3,"images":4,"input_tokens":6,"output_tokens":3189,"cache_read_input_tokens":148327,"cache_creation_input_tokens":80245}],"by_model":{"claude-haiku-4-5-20251001":{"input_tokens":915,"output_tokens":18,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"claude-sonnet-5":{"input_tokens":8,"output_tokens":16597,"cache_read_input_tokens":148327,"cache_creation_input_tokens":105872}},"cost_usd":0.6201443999999999}
+[+217.916s] ── AC1 — model.scad + Customizer schema
+[AC1a] model.scad written with real geometry → PASS — 4299 bytes
+[+218.873s]    param schema (16): pipe_diameter, pipe_clearance, cradle_wall, cradle_width, gap_angle, plate_width, plate_height, plate_thickness, corner_radius, screw_hole_dia, slot_travel, slot_edge_margin, countersink, countersink_dia, countersink_depth, $fn
+[AC1b] Customizer schema exposes pipe diameter, wall, slot and screw-size parameters → PASS — 16 parameters
+[+218.873s]    AC1 — model.scad + Customizer schema: 0.96s
+[+ 218.88s] ── AC2 — 4 view PNGs
+[+218.896s]    served PNGs: iso:14780B, front:5107B, right:6528B, section:5543B
+[AC2] all 4 view PNGs exist and are served → PASS — snapshot 0002
+[+218.897s]    AC2 — 4 view PNGs: 0.02s
+[+218.897s] ── AC3 — validation
+[+218.897s]    validate_mesh tool results: 1; last summary: amber: manifold=true components=1
+[+218.897s]    persisted validation: {"badge":"amber","manifold":true,"components":1,"volume_mm3":33571.5562,"warning_count":1}
+[AC3] ValidationReport.manifold === true && components === 1 → PASS — badge=amber manifold=true components=1 volume=33571.5562mm³
+[+218.897s]    AC3 — validation: 0.00s
+[+218.897s] ── AC4 — snapshot history + diff
+[+218.897s]    snapshots: 0001, 0002
+[AC4] snapshot 0001+ recorded, with a unified diff against its parent → PASS — 2 snapshots; 0002 carries a 116-line diff
+[+218.909s]    AC4 — snapshot history + diff: 0.01s
+[+218.909s] ── AC5 — 3MF export
+[+220.836s]    export: scenario-a-bracket-0002.3mf (12128B recorded, 12128B served)
+[AC5] 3MF exported through the validation gate and non-empty → PASS — scenario-a-bracket-0002.3mf: 12128 bytes served
+[+220.836s]    AC5 — 3MF export: 1.93s
+[+221.138s] ── 6/6 assertions passed
+
+# ── server stdout/stderr ──
+ScadForge server listening on http://localhost:3299
+  projects root: /private/tmp/scadforge-m2-review-projects
+  provider:      claude-agent-sdk (model: sonnet)
+  max passes:    2

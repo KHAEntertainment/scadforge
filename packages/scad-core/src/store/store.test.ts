@@ -16,6 +16,15 @@ import {
   revertToSnapshot
 } from "./store.js";
 import { snapshotDir, rootParamsPath } from "./paths.js";
+import {
+  attachRendersToSnapshot,
+  attachValidationToSnapshot,
+  resolveSnapshotMeshPath,
+  resolveSnapshotRenderPath,
+  resolveSnapshotValidationPath,
+  SNAPSHOT_MESH_FILE,
+  snapshotMeshPath
+} from "./attachments.js";
 
 let projectDir: string;
 
@@ -160,6 +169,238 @@ describe("project store (filesystem, temp dir)", () => {
 
     const project = await readProjectManifest(projectDir);
     expect(project.head).toBe("0004");
+  });
+
+  it("revert restores every available derived artifact into the NEW snapshot with URLs for the new id", async () => {
+    await initProject(projectDir, {
+      id: "p",
+      name: "n",
+      provider: providerConfig,
+      content: "cube([10,10,10]);\n",
+      params: { size: 10 }
+    });
+
+    const sourcePng = join(projectDir, "source-iso.png");
+    const pngBytes = Buffer.from("89504e470d0a1a0a0000000d49484452", "hex");
+    const meshBytes = Buffer.from("target mesh bytes");
+    await writeFile(sourcePng, pngBytes);
+    await attachRendersToSnapshot(
+      projectDir,
+      "0001",
+      [{ view: "iso", sourcePath: sourcePng, render_ms: 42, width: 1024, height: 768 }],
+      { buildRenderUrl: (id, view) => `/api/projects/p/snapshots/${id}/views/${view}` }
+    );
+    await attachValidationToSnapshot(projectDir, "0001", {
+      report: {
+        manifold: true,
+        status: "NoError",
+        volume_mm3: 1000,
+        surface_area: 600,
+        bbox: { min: [0, 0, 0], max: [10, 10, 10] },
+        triangle_count: 12,
+        components: 1,
+        genus: 0
+      },
+      gate: { ok: true, badge: "green", failures: [], warnings: [] },
+      export_ms: 10,
+      validate_ms: 2
+    });
+    await writeFile(snapshotMeshPath(projectDir, "0001"), meshBytes);
+
+    await createSnapshot(projectDir, {
+      content: "cube([20,20,20]);\n",
+      params: { size: 20 },
+      message: "edited",
+      origin: "manual",
+      pass: null
+    });
+
+    const oldManifestPath = join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile);
+    const oldManifestBefore = await readFile(oldManifestPath);
+    const oldRenderBefore = await readFile((await resolveSnapshotRenderPath(projectDir, "0001", "iso"))!);
+    const oldValidationBefore = await readFile((await resolveSnapshotValidationPath(projectDir, "0001"))!);
+    const oldMeshBefore = await readFile((await resolveSnapshotMeshPath(projectDir, "0001"))!);
+
+    const reverted = await revertToSnapshot(projectDir, "0001", {
+      buildRenderUrl: (id, view) => `/api/projects/p/snapshots/${id}/views/${view}`
+    });
+
+    expect(reverted.id).toBe("0003");
+    expect(reverted.renders).toEqual([
+      expect.objectContaining({
+        view: "iso",
+        url: "/api/projects/p/snapshots/0003/views/iso",
+        width: 1024,
+        height: 768,
+        bytes: pngBytes.byteLength,
+        render_ms: 42
+      })
+    ]);
+    expect(reverted.validation).toEqual({
+      badge: "green",
+      manifold: true,
+      components: 1,
+      volume_mm3: 1000,
+      warning_count: 0
+    });
+    await expect(readFile((await resolveSnapshotRenderPath(projectDir, "0003", "iso"))!)).resolves.toEqual(pngBytes);
+    await expect(readFile((await resolveSnapshotValidationPath(projectDir, "0003"))!)).resolves.toEqual(
+      oldValidationBefore
+    );
+    await expect(readFile((await resolveSnapshotMeshPath(projectDir, "0003"))!)).resolves.toEqual(meshBytes);
+
+    // Restoring forward only reads the source snapshot: both immutable history
+    // and the source's derived artifacts stay byte-identical.
+    await expect(readFile(oldManifestPath)).resolves.toEqual(oldManifestBefore);
+    await expect(readFile((await resolveSnapshotRenderPath(projectDir, "0001", "iso"))!)).resolves.toEqual(
+      oldRenderBefore
+    );
+    await expect(readFile((await resolveSnapshotValidationPath(projectDir, "0001"))!)).resolves.toEqual(
+      oldValidationBefore
+    );
+    await expect(readFile((await resolveSnapshotMeshPath(projectDir, "0001"))!)).resolves.toEqual(oldMeshBefore);
+  });
+
+  it("revert copies legacy history-backed artifacts into the NEW derived tree and leaves legacy bytes untouched", async () => {
+    await initProject(projectDir, {
+      id: "p",
+      name: "n",
+      provider: providerConfig,
+      content: "cube([8,8,8]);\n",
+      params: { size: 8 }
+    });
+
+    // Emulate a project created before derived/ existed: all three artifact
+    // kinds and their manifest metadata live directly in history/0001.
+    const legacyDir = snapshotDir(projectDir, "0001");
+    const legacyViewsDir = join(legacyDir, PROJECT_LAYOUT.snapshot.viewsDir);
+    const legacyRender = Buffer.from("legacy png bytes");
+    const legacyMesh = Buffer.from("legacy mesh bytes");
+    const legacyReport = {
+      manifold: true,
+      status: "NoError" as const,
+      volume_mm3: 512,
+      surface_area: 384,
+      bbox: { min: [0, 0, 0] as [number, number, number], max: [8, 8, 8] as [number, number, number] },
+      triangle_count: 12,
+      components: 1,
+      genus: 0
+    };
+    await mkdir(legacyViewsDir, { recursive: true });
+    await writeFile(join(legacyViewsDir, "iso.png"), legacyRender);
+    await writeFile(
+      join(legacyDir, PROJECT_LAYOUT.snapshot.validationFile),
+      JSON.stringify(legacyReport, null, 2),
+      "utf8"
+    );
+    await writeFile(join(legacyDir, SNAPSHOT_MESH_FILE), legacyMesh);
+
+    const legacyManifestPath = join(legacyDir, PROJECT_LAYOUT.snapshot.manifestFile);
+    const legacyManifest = JSON.parse(await readFile(legacyManifestPath, "utf8"));
+    legacyManifest.renders = [
+      {
+        view: "iso",
+        file: "views/iso.png",
+        url: "/api/projects/p/snapshots/0001/views/iso",
+        width: 640,
+        height: 480,
+        bytes: legacyRender.byteLength,
+        render_ms: 7
+      }
+    ];
+    legacyManifest.validation = {
+      badge: "green",
+      manifold: true,
+      components: 1,
+      volume_mm3: 512,
+      warning_count: 0
+    };
+    legacyManifest.files.validation_json = PROJECT_LAYOUT.snapshot.validationFile;
+    await writeFile(legacyManifestPath, JSON.stringify(legacyManifest, null, 2), "utf8");
+
+    await createSnapshot(projectDir, {
+      content: "cube([9,9,9]);\n",
+      params: { size: 9 },
+      message: "edited",
+      origin: "manual",
+      pass: null
+    });
+
+    const oldManifestBefore = await readFile(legacyManifestPath);
+    const oldRenderBefore = await readFile(join(legacyViewsDir, "iso.png"));
+    const oldValidationBefore = await readFile(join(legacyDir, PROJECT_LAYOUT.snapshot.validationFile));
+    const oldMeshBefore = await readFile(join(legacyDir, SNAPSHOT_MESH_FILE));
+
+    const reverted = await revertToSnapshot(projectDir, "0001", {
+      buildRenderUrl: (id, view) => `/api/projects/p/snapshots/${id}/views/${view}`
+    });
+    expect(reverted.id).toBe("0003");
+    expect(reverted.renders[0]?.url).toBe("/api/projects/p/snapshots/0003/views/iso");
+    expect(reverted.validation?.volume_mm3).toBe(512);
+    await expect(readFile((await resolveSnapshotRenderPath(projectDir, "0003", "iso"))!)).resolves.toEqual(
+      legacyRender
+    );
+    await expect(readFile((await resolveSnapshotValidationPath(projectDir, "0003"))!)).resolves.toEqual(
+      oldValidationBefore
+    );
+    await expect(readFile((await resolveSnapshotMeshPath(projectDir, "0003"))!)).resolves.toEqual(legacyMesh);
+
+    // The restored copies are derived, never inserted into the new immutable
+    // history directory, and every legacy source byte remains untouched.
+    await expect(readFile(join(snapshotDir(projectDir, "0003"), "views", "iso.png"))).rejects.toThrow();
+    await expect(
+      readFile(join(snapshotDir(projectDir, "0003"), PROJECT_LAYOUT.snapshot.validationFile))
+    ).rejects.toThrow();
+    await expect(readFile(join(snapshotDir(projectDir, "0003"), SNAPSHOT_MESH_FILE))).rejects.toThrow();
+    await expect(readFile(legacyManifestPath)).resolves.toEqual(oldManifestBefore);
+    await expect(readFile(join(legacyViewsDir, "iso.png"))).resolves.toEqual(oldRenderBefore);
+    await expect(readFile(join(legacyDir, PROJECT_LAYOUT.snapshot.validationFile))).resolves.toEqual(
+      oldValidationBefore
+    );
+    await expect(readFile(join(legacyDir, SNAPSHOT_MESH_FILE))).resolves.toEqual(oldMeshBefore);
+  });
+
+  it("revert gracefully omits artifact metadata whose legacy bytes are absent", async () => {
+    await initProject(projectDir, {
+      id: "p",
+      name: "n",
+      provider: providerConfig,
+      content: "cube(1);\n"
+    });
+    const manifestPath = join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile);
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.renders = [
+      {
+        view: "iso",
+        file: "views/iso.png",
+        url: "/stale/0001/iso",
+        width: 1,
+        height: 1,
+        bytes: 123,
+        render_ms: null
+      }
+    ];
+    manifest.validation = {
+      badge: "green",
+      manifold: true,
+      components: 1,
+      volume_mm3: 1,
+      warning_count: 0
+    };
+    manifest.files.validation_json = PROJECT_LAYOUT.snapshot.validationFile;
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+    await createSnapshot(projectDir, {
+      content: "cube(2);\n",
+      params: {},
+      message: "edited",
+      origin: "manual",
+      pass: null
+    });
+
+    const reverted = await revertToSnapshot(projectDir, "0001");
+    expect(reverted.renders).toEqual([]);
+    expect(reverted.validation).toBeNull();
+    await expect(resolveSnapshotMeshPath(projectDir, reverted.id)).resolves.toBeNull();
   });
 
   // Issue #44: `revertToSnapshot` also writes root `params.json` (it REPLACES

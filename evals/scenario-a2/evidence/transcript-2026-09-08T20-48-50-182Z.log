@@ -1,0 +1,52 @@
+# Scenario A2 — M2 integration harness (Issue #35)
+# started: 2026-09-08T20:48:18.278Z
+# flags: keep=false no-compose=true negative-control=false
+# node: v22.23.2  platform: darwin/arm64
+
+[+   0.36s] Scenario A2 — projects root: /var/folders/qk/1wvgxm3j61q4t530m19__cmm0000gn/T/scadforge-scenario-a2-lhldWH
+[+  0.362s] ── start server
+[+  2.022s]    server healthy at http://127.0.0.1:3298 ({"ok":true,"version":"0.0.0","openscad_image":"docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7","openscad_version":"2026.01.19 (git e43242666)"})
+[+  2.022s]    start server: 1.66s
+[+  2.025s] ── create project
+[+  2.108s]    create project: 0.08s
+[+  2.108s]    project id: scenario-a2-clamp; initial snapshot: 0001; params.json values={}
+[+  2.108s] ── AC1 — Customizer schema
+[AC1] Customizer schema exposes `wall` (type/initial/min/max/step from the fixture's Customizer annotation) → PASS — wall: type=number initial=3 min=1 max=10 step=0.5; values={}
+[+  5.596s]    AC1 — Customizer schema: 3.49s
+[+  5.605s] ── render + validate original snapshot (wall=3)
+[+ 20.107s]    rendered 4/4 views onto 0001
+[+ 21.077s]    validate_mesh(wall=3): manifold=true volume=9291.6851mm³
+[+ 21.077s]    render + validate original snapshot (wall=3): 15.47s
+[+ 21.077s] ── capture original snapshot fingerprint
+[+ 21.115s]    original 0001: scad=2250B, renders=iso@d2f336ae,front@4ca02898,right@002a15ff,section@aa5d9e94, mesh=6d9a752b
+[+ 21.115s]    capture original snapshot fingerprint: 0.04s
+[+ 21.115s] ── AC2/AC3/AC7 — param sweep (export preview vs WASM)
+[+ 24.091s]    wall=2: server vol=6814.2572mm³ bbox=[39,36,20] | wasm vol=6814.2572mm³ bbox=[39,36,20]
+[+ 25.501s]    wall=4.5: server vol=13244.3444mm³ bbox=[44,41,20] | wasm vol=13244.3444mm³ bbox=[44,41,20]
+[+ 26.567s]    wall=6: server vol=17478.9329mm³ bbox=[47,44,20] | wasm vol=17478.9329mm³ bbox=[47,44,20]
+[AC2-wall2] WASM/server volume+bbox(min/max corners) agree within tolerance at wall=2 → PASS — Δvol=0.0000mm³ (0.000%, tol 0.5%); Δcorners=[0.0000,0.0000,0.0000,0.0000,0.0000,0.0000]mm (tol 0.1mm)
+[AC2-wall4.5] WASM/server volume+bbox(min/max corners) agree within tolerance at wall=4.5 → PASS — Δvol=0.0000mm³ (0.000%, tol 0.5%); Δcorners=[0.0000,0.0000,0.0000,0.0000,0.0000,0.0000]mm (tol 0.1mm)
+[AC2-wall6] WASM/server volume+bbox(min/max corners) agree within tolerance at wall=6 → PASS — Δvol=0.0000mm³ (0.000%, tol 0.5%); Δcorners=[0.0000,0.0000,0.0000,0.0000,0.0000,0.0000]mm (tol 0.1mm)
+[AC3] server volume strictly increases with `wall` across the swept settings → PASS — volumes: wall=2→6814.2572mm³, wall=4.5→13244.3444mm³, wall=6→17478.9329mm³
+[AC7-wall2] ExportResponse.validation reflects the actual preview override (wall=2), not a stale head snapshot → PASS — ExportResponse.validation.volume_mm3=6814.2572 vs actual exported-mesh volume=6814.2572mm³ (tol 0.5%)
+[AC7-wall4.5] ExportResponse.validation reflects the actual preview override (wall=4.5), not a stale head snapshot → PASS — ExportResponse.validation.volume_mm3=13244.3444 vs actual exported-mesh volume=13244.3444mm³ (tol 0.5%)
+[AC7-wall6] ExportResponse.validation reflects the actual preview override (wall=6), not a stale head snapshot → PASS — ExportResponse.validation.volume_mm3=17478.9329 vs actual exported-mesh volume=17478.9329mm³ (tol 0.5%)
+[+ 26.567s]    AC2/AC3/AC7 — param sweep (export preview vs WASM): 5.45s
+[+ 26.567s] ── AC4 — set_params via the real tool-handler seam
+[+ 28.513s]    set_params(wall=4) via tool handler → snapshot 0002, unknown_params=[]
+[AC4a] set_params (real tool-handler seam) is visible over REST GET .../params → PASS — handler result wall=4; REST GET wall=4
+[AC4b] the real parameter edit (wall 3→4mm) changes authoritative (server-rendered) geometry in the expected direction → PASS — wall=3 → 9291.6851mm³; wall=4 → 11895.4587mm³
+[+  30.39s]    AC4 — set_params via the real tool-handler seam: 3.82s
+[+  30.39s] ── AC5/AC6/AC8 — revert + immutability
+[+ 30.438s]    reverted to 0001 → new snapshot 0003
+[AC5] revert creates a NEW snapshot restoring scad+params, verified via the API → PASS — new snapshot 0003 (original 0001, pre-revert head 0002); scad matches=true; values={} (original {})
+[AC6] revert restores the target snapshot's render PNGs and persisted mesh byte-for-byte → PASS — reverted 0003: renders=[iso@d2f336ae,front@4ca02898,right@002a15ff,section@aa5d9e94] vs original [iso@d2f336ae,front@4ca02898,right@002a15ff,section@aa5d9e94]; mesh reverted=6d9a752b original=6d9a752b
+[AC8] the original snapshot's scad/renders/mesh are byte-identical after set_params + revert (history is immutable) → PASS — original 0001 unchanged: scad=true, renders=true, mesh=true
+[+ 31.603s]    AC5/AC6/AC8 — revert + immutability: 1.21s
+[+ 31.904s] ── 13/13 assertions passed
+
+# ── server stdout/stderr ──
+ScadForge server listening on http://localhost:3298
+  projects root: /var/folders/qk/1wvgxm3j61q4t530m19__cmm0000gn/T/scadforge-scenario-a2-lhldWH
+  provider:      claude-agent-sdk (model: sdk default)
+  max passes:    2

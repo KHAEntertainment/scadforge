@@ -1,0 +1,122 @@
+{
+  "prompt": "A wall-mount bracket for a 32 mm pipe with two M4 screw slots",
+  "started": "2026-09-08T20:17:20.032Z",
+  "duration_ms": 221162,
+  "node": "v26.7.0",
+  "platform": "darwin/arm64",
+  "timings_ms": {
+    "compose up (pinned OpenSCAD)": 1,
+    "start server": 1980,
+    "create project": 65,
+    "agent turn (LIVE)": 215863,
+    "AC1 — model.scad + Customizer schema": 957,
+    "AC2 — 4 view PNGs": 17,
+    "AC3 — validation": 0,
+    "AC4 — snapshot history + diff": 12,
+    "AC5 — 3MF export": 1927
+  },
+  "assertions": [
+    {
+      "id": "AC1a",
+      "description": "model.scad written with real geometry",
+      "ok": true,
+      "detail": "4299 bytes"
+    },
+    {
+      "id": "AC1b",
+      "description": "Customizer schema exposes pipe diameter, wall, slot and screw-size parameters",
+      "ok": true,
+      "detail": "16 parameters"
+    },
+    {
+      "id": "AC2",
+      "description": "all 4 view PNGs exist and are served",
+      "ok": true,
+      "detail": "snapshot 0002"
+    },
+    {
+      "id": "AC3",
+      "description": "ValidationReport.manifold === true && components === 1",
+      "ok": true,
+      "detail": "badge=amber manifold=true components=1 volume=33571.5562mm³"
+    },
+    {
+      "id": "AC4",
+      "description": "snapshot 0001+ recorded, with a unified diff against its parent",
+      "ok": true,
+      "detail": "2 snapshots; 0002 carries a 116-line diff"
+    },
+    {
+      "id": "AC5",
+      "description": "3MF exported through the validation gate and non-empty",
+      "ok": true,
+      "detail": "scenario-a-bracket-0002.3mf: 12128 bytes served"
+    }
+  ],
+  "summary": "6/6 assertions passed",
+  "turn": {
+    "project_id": "scenario-a-bracket",
+    "event_types": [
+      "turn_started",
+      "tool_call",
+      "tool_result",
+      "tool_call",
+      "snapshot_created",
+      "tool_result",
+      "tool_call",
+      "tool_call",
+      "tool_result",
+      "tool_result",
+      "assistant_text",
+      "turn_done"
+    ],
+    "turn_done": {
+      "type": "turn_done",
+      "turn_id": "2dda9ae9-592f-4727-b0b1-fe922f2e02d8",
+      "status": "completed",
+      "passes_used": 1,
+      "summary": "Built a wall-mount pipe bracket for a 32 mm pipe. Design:\n\n- **Wall plate**: 64 × 90 mm, 5 mm thick, rounded corners (6 mm radius), back face flush against the wall.\n- **Pipe cradle**: a C-shaped ring fused to the plate's front face, sized to the pipe (32 mm Ø + 0.4 mm clearance), 4 mm wall thickness, 18 mm tall band, with a 50° open gap facing away from the wall so the pipe snaps in.\n- **Mounting**: two vertical M4 slots (4.5 mm dia., 8 mm of vertical travel for adjustment) positioned above and below the cradle, 14 mm from the top/bottom edges — plus an optional flush counterbore pocket (8.5 mm dia., 2.6 mm deep) for screw heads, toggleable via a `countersink` parameter.\n\nAll key dimensions (pipe size/clearance, cradle wall/width/gap angle, plate size/thickness/corners, screw hole size/slot travel/edge margin, countersink) are exposed as Customizer parameters so it can be resized for other pipe diameters or screw types.\n\nValidation: manifold, single solid, volume ≈ 33.6 cm³, no failures (the nonzero genus is expected — it's just the two through-slots counted as topological holes). Renders confirm the pipe channel is open at the front for snap-fit installation and the slots pass cleanly through the plate.",
+      "usage": {
+        "per_pass": [
+          {
+            "pass": 0,
+            "duration_ms": 181128,
+            "tool_calls": 1,
+            "images": 0,
+            "input_tokens": 2,
+            "output_tokens": 13408,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 25627
+          },
+          {
+            "pass": 1,
+            "duration_ms": 31520,
+            "tool_calls": 3,
+            "images": 4,
+            "input_tokens": 6,
+            "output_tokens": 3189,
+            "cache_read_input_tokens": 148327,
+            "cache_creation_input_tokens": 80245
+          }
+        ],
+        "by_model": {
+          "claude-haiku-4-5-20251001": {
+            "input_tokens": 915,
+            "output_tokens": 18,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0
+          },
+          "claude-sonnet-5": {
+            "input_tokens": 8,
+            "output_tokens": 16597,
+            "cache_read_input_tokens": 148327,
+            "cache_creation_input_tokens": 105872
+          }
+        },
+        "cost_usd": 0.6201443999999999
+      },
+      "duration_ms": 215691
+    }
+  },
+  "error": null
+}

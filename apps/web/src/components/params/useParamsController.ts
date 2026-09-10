@@ -29,6 +29,13 @@ export interface ParamsControllerResult {
   saving: boolean;
   /** Message from the most recently REJECTED PUT; cleared on the next successful one. */
   saveError: string | null;
+  /**
+   * True once the first `GET /params` has succeeded, so the owner can treat
+   * `debouncedValues` as the authoritative override bag. Before that, an empty
+   * `debouncedValues` means "not loaded yet" (or "load failed"), not "loaded
+   * and empty", and the owner should fall back to `liveSource.params` instead.
+   */
+  initialized: boolean;
   setValue: (name: string, value: ParamValue) => void;
 }
 
@@ -64,7 +71,9 @@ export interface ParamsControllerResult {
 export function useParamsController(
   client: ApiClient,
   projectId: string | null,
-  headSnapshotId: string | null
+  headSnapshotId: string | null,
+  /** Invoked once after each successful PUT, so the owner can refresh History / advance the working head (each save snapshots by default). */
+  onSaved?: () => void
 ): ParamsControllerResult {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -75,6 +84,7 @@ export function useParamsController(
   const [dirty, setDirty] = useState<ReadonlySet<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [initialized, setInitialized] = useState(false);
 
   /** Last values the SERVER has confirmed (a GET, or a successful PUT's echo) — the revert target on a rejected PUT. */
   const committedRef = useRef<ParamValues>({});
@@ -84,7 +94,13 @@ export function useParamsController(
   const inFlightRef = useRef(false);
   const resendRef = useRef(false);
   const lastReconciledSnapshotRef = useRef<string | null>(null);
+  /** Latest `onSaved`, held so `flush` stays referentially stable even when the caller passes an inline callback. */
+  const onSavedRef = useRef(onSaved);
+  /** Monotonic load token: an out-of-order `getParams` reply must never overwrite a newer load's state. */
+  const loadSeqRef = useRef(0);
+  const projectGenerationRef = useRef(0);
 
+  onSavedRef.current = onSaved;
   valuesRef.current = values;
 
   const load = useCallback(
@@ -92,22 +108,29 @@ export function useParamsController(
       if (!projectId) return;
       if (mode === "reset") setLoading(true);
       setLoadError(null);
+      const seq = ++loadSeqRef.current;
       client
         .getParams(projectId)
         .then((res) => {
+          if (seq !== loadSeqRef.current) return; // a newer load superseded this one
           setTitle(res.title);
           setParameters(res.parameters);
           committedRef.current = res.values;
+          setInitialized(true);
           if (mode === "reconcile") {
             // Conflict policy (see doc comment above): keep any locally-dirty
-            // value, adopt everything else from the server.
-            setValues((prev) => {
+            // value, adopt everything else from the server. `debouncedValues`
+            // is reconciled the SAME way so the WASM live preview (which reads
+            // the debounced bag) is not left on the pre-head values.
+            const merge = (prev: ParamValues): ParamValues => {
               const next: ParamValues = { ...res.values };
               for (const name of dirtyRef.current) {
                 if (name in prev) next[name] = prev[name];
               }
               return next;
-            });
+            };
+            setValues(merge);
+            setDebouncedValues(merge);
           } else {
             setValues(res.values);
             setDebouncedValues(res.values);
@@ -116,17 +139,28 @@ export function useParamsController(
           }
         })
         .catch((cause) => {
+          if (seq !== loadSeqRef.current) return;
           setLoadError(cause instanceof Error ? cause.message : "Failed to load parameters.");
         })
-        .finally(() => {
-          if (mode === "reset") setLoading(false);
-        });
+      .finally(() => {
+        // A head reconciliation can supersede the initial project reset load
+        // (for example when snapshots hydrate in the same render). In that
+        // case the reset response is intentionally ignored, so only clearing
+        // loading for `mode === "reset"` would leave the tab stuck forever.
+        // Whichever request is current owns the loading lifecycle.
+        if (seq === loadSeqRef.current) setLoading(false);
+      });
     },
     [client, projectId]
   );
 
   // Project (or first) load: full reset.
   useEffect(() => {
+    projectGenerationRef.current += 1;
+    // Requests for the previous project may still settle, but they must not
+    // hold the new project's send queue hostage or mutate shared state.
+    inFlightRef.current = false;
+    resendRef.current = false;
     lastReconciledSnapshotRef.current = null;
     if (debounceTimerRef.current) {
       clearTimeout(debounceTimerRef.current);
@@ -134,6 +168,7 @@ export function useParamsController(
     }
     dirtyRef.current = new Set();
     setDirty(new Set());
+    setInitialized(false);
     load("reset");
     // `load` is memoized on the same [client, projectId] pair this effect is
     // keyed on, so including it does not change when this effect re-runs.
@@ -157,6 +192,8 @@ export function useParamsController(
 
   const flush = useCallback(() => {
     if (!projectId) return;
+    const generation = projectGenerationRef.current;
+    const requestProjectId = projectId;
     const names = Array.from(dirtyRef.current);
     if (names.length === 0) return;
     if (inFlightRef.current) {
@@ -173,8 +210,9 @@ export function useParamsController(
     for (const name of names) diff[name] = valuesRef.current[name];
 
     client
-      .updateParams(projectId, { values: diff })
+      .updateParams(requestProjectId, { values: diff })
       .then((res) => {
+        if (generation !== projectGenerationRef.current) return;
         setSaveError(null);
         committedRef.current = res.values;
         // Keep dirty only for names the user changed again WHILE this
@@ -192,29 +230,43 @@ export function useParamsController(
           }
           return next;
         });
+        onSavedRef.current?.();
       })
       .catch((cause) => {
+        if (generation !== projectGenerationRef.current) return;
         // Server authority: a rejected value (wrong type, out of range,
         // unknown name) is never left showing in the UI as if it were
-        // accepted — revert exactly the values this request attempted.
+        // accepted — but a NEWER edit made while this PUT was in flight is
+        // the user's latest intent and must not be reverted. Only names whose
+        // current value still equals this request's `diff` are rolled back to
+        // the last committed value; anything re-edited stays dirty and is
+        // resent by `.finally` below.
         setSaveError(cause instanceof Error ? cause.message : "Failed to save parameters.");
         // Computed synchronously, BEFORE the `setValues` call below: its
         // updater function runs on React's own schedule, not necessarily
         // before the `dirtyRef`/`setDirty` lines that follow it.
+        const namesToRevert = names.filter((name) => valuesRef.current[name] === diff[name]);
         const remainingDirty = new Set(dirtyRef.current);
-        for (const name of names) remainingDirty.delete(name);
+        for (const name of namesToRevert) remainingDirty.delete(name);
         dirtyRef.current = remainingDirty;
         setDirty(new Set(remainingDirty));
-        setValues((prev) => {
+        // Roll back BOTH the visible control and the debounced live-preview
+        // bag. The debounce already copied the rejected value into the latter
+        // before the PUT ran, so leaving it would keep Live compiling the
+        // refused geometry long after the control (and server) reverted.
+        const rollback = (prev: ParamValues): ParamValues => {
           const next = { ...prev };
-          for (const name of names) {
+          for (const name of namesToRevert) {
             if (name in committedRef.current) next[name] = committedRef.current[name];
             else delete next[name];
           }
           return next;
-        });
+        };
+        setValues(rollback);
+        setDebouncedValues(rollback);
       })
       .finally(() => {
+        if (generation !== projectGenerationRef.current) return;
         inFlightRef.current = false;
         setSaving(false);
         if (resendRef.current) {
@@ -250,6 +302,7 @@ export function useParamsController(
     dirty,
     saving,
     saveError,
+    initialized,
     setValue
   };
 }

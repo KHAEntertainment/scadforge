@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { SnapshotManifest } from "@scadforge/protocol";
 import type { ApiClient } from "../../lib/apiClient.js";
 import { SnapshotList } from "./SnapshotList.js";
@@ -45,17 +45,24 @@ export function HistoryPanel({
   onSelected
 }: HistoryPanelProps) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const headId = snapshots[0]?.id ?? null;
+  const previousHeadIdRef = useRef<string | null>(null);
 
   useEffect(() => {
+    const previousHeadId = previousHeadIdRef.current;
+    previousHeadIdRef.current = headId;
     setSelectedId((prev) => {
       if (snapshots.length === 0) return null;
+      // A new head is a new working result, so move the History detail to it.
+      // Same-id list refreshes only enrich existing records and must preserve
+      // a deliberate historical selection.
+      if (previousHeadId !== null && headId !== previousHeadId) return headId;
       if (prev && snapshots.some((s) => s.id === prev)) return prev;
       return snapshots[0].id;
     });
-  }, [snapshots]);
+  }, [headId, snapshots]);
 
   const diffState = useSnapshotDiff(client, projectId, selectedId);
-  const headId = snapshots[0]?.id ?? null;
 
   /**
    * Only a DELIBERATE pick is reported upward — not the default selection the

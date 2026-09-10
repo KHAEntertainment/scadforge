@@ -57,12 +57,21 @@ export async function runParamExport(
 
 /** Minimal structural validation — enough to catch a malformed/truncated export without a full schema library. */
 function validateParamSchemaShape(value: unknown): ParamSchema {
-  if (typeof value !== "object" || value === null || !("parameters" in value) || !Array.isArray((value as { parameters?: unknown }).parameters)) {
+  if (typeof value !== "object" || value === null) {
     throw new ScadForgeError("RENDER_FAILED", "param export JSON did not match the expected {title, parameters[]} shape");
   }
-  const withTitle = value as { title?: unknown; parameters: unknown[] };
+  const withTitle = value as { title?: unknown; parameters?: unknown };
+  // OpenSCAD omits `parameters` entirely for a valid model with no
+  // Customizer declarations. Normalize that CLI representation at this
+  // boundary so every consumer still receives the frozen schema shape.
+  if (withTitle.parameters !== undefined && !Array.isArray(withTitle.parameters)) {
+    throw new ScadForgeError("RENDER_FAILED", "param export JSON did not match the expected {title, parameters[]} shape");
+  }
+  if (withTitle.title === undefined && withTitle.parameters === undefined) {
+    throw new ScadForgeError("RENDER_FAILED", "param export JSON did not match the expected {title, parameters[]} shape");
+  }
   return {
     title: typeof withTitle.title === "string" ? withTitle.title : "",
-    parameters: withTitle.parameters as ParamSchema["parameters"]
+    parameters: (withTitle.parameters ?? []) as ParamSchema["parameters"]
   };
 }

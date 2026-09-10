@@ -14,6 +14,7 @@ function makeController(overrides: Partial<ParamsControllerResult> = {}): Params
     dirty: new Set(),
     saving: false,
     saveError: null,
+    initialized: true,
     setValue: vi.fn(),
     ...overrides
   };
