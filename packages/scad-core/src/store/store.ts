@@ -45,7 +45,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createTwoFilesPatch } from "diff";
 import {
@@ -75,6 +75,7 @@ import {
   snapshotDir
 } from "./paths.js";
 import { readDerivedEnrichment, writeDerivedValidation } from "./derived.js";
+import { withFileLock } from "./file-lock.js";
 import { withParamsLock } from "./params-lock.js";
 import {
   attachRendersToSnapshot,
@@ -595,15 +596,41 @@ export async function revertToSnapshot(
 export async function recordExport(projectDir: string, record: ExportRecord): Promise<void> {
   await withTypedError(
     async () => {
-      const indexPath = join(exportsDir(projectDir), "index.json");
-      let records: ExportRecord[] = [];
-      try {
-        records = JSON.parse(await readFile(indexPath, "utf8"));
-      } catch {
-        records = [];
-      }
-      records.push(record);
-      await writeFile(indexPath, JSON.stringify(records, null, 2), "utf8");
+      const exportsDirectory = exportsDir(projectDir);
+      const indexPath = join(exportsDirectory, "index.json");
+      // The ledger is read-merge-written, so every append must hold the
+      // exports lock (Issue #48): without it, two concurrent exports both
+      // read the SAME current array, each push only its own record, and
+      // whichever `writeFile` lands last wins wholesale -- silently losing
+      // the other's entry. Cross-process safe (see file-lock.ts).
+      await withFileLock(join(metaDir(projectDir), "exports.lock"), "exports", async () => {
+        let records: ExportRecord[];
+        try {
+          records = JSON.parse(await readFile(indexPath, "utf8"));
+          if (!Array.isArray(records)) throw new Error("ledger is valid JSON but not an array");
+        } catch (err) {
+          if (typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "ENOENT") {
+            records = []; // no ledger yet -- the normal first-export case
+          } else {
+            // A corrupt or partially-written ledger is DETECTED, never
+            // silently parsed as empty (that would overwrite it with a
+            // one-record array, both losing every prior entry and
+            // destroying the evidence). The bytes on disk are left
+            // untouched for inspection/repair.
+            throw new ScadForgeError(
+              "INTERNAL_ERROR",
+              `exports ledger '${indexPath}' is corrupt (${err instanceof Error ? err.message : String(err)}) -- refusing to append; inspect or repair the file manually`
+            );
+          }
+        }
+        records.push(record);
+        // Atomic replace: a reader never sees a half-written ledger, and a
+        // crash mid-write leaves the previous complete version in place.
+        await mkdir(exportsDirectory, { recursive: true });
+        const tmpPath = `${indexPath}.tmp`;
+        await writeFile(tmpPath, JSON.stringify(records, null, 2), "utf8");
+        await rename(tmpPath, indexPath);
+      });
     },
     "INTERNAL_ERROR",
     "failed to record export"
