@@ -20,6 +20,7 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,8 +63,13 @@ function isForbiddenLicense(licenseField) {
 // Dependency buckets `pnpm list --json` nests a project/dependency node
 // under. `unsavedDependencies` covers pnpm reporting hoisted/linked
 // tooling that shows up without a matching declared range; included so a
-// GPL package hiding there is not missed.
-const DEP_BUCKET_KEYS = ["dependencies", "devDependencies", "optionalDependencies", "unsavedDependencies"];
+// GPL package hiding there is not missed. `peerDependencies` is included
+// for pnpm versions / nested nodes that report it — but NOTE (verified
+// empirically against pnpm v11): a workspace package's own *declared*
+// peers are NOT surfaced in any `pnpm list` bucket, nor recorded in the
+// lockfile importer. That latent gap is closed separately by
+// checkDeclaredPeers() below.
+const DEP_BUCKET_KEYS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "unsavedDependencies"];
 
 /**
  * Recursively collects { name, version, path } for every dependency node
@@ -140,6 +146,62 @@ function selectOwnRoot(roots, absDir) {
 }
 
 /**
+ * Issue #10: `pnpm list --json` (pnpm v11, verified empirically) reports
+ * no bucket for a workspace package's declared `peerDependencies`, and the
+ * lockfile importer omits them — so a GPL peer declared by an enforced
+ * package would sail through the bucket walk. Scan declared peers
+ * directly: resolve each one's installed package.json via Node's own
+ * resolution from the enforced package's directory (falling back to plain
+ * node_modules lookups for packages whose `exports` map hides
+ * package.json), and check its real license. A declared-but-uninstalled
+ * peer is NOT a violation — its license is unknowable, consistent with
+ * the gate's missing-license handling.
+ * @param {string} absDir Absolute path of the enforced package.
+ * @returns {Array<{ name: string, version: string, license: unknown }>}
+ */
+function checkDeclaredPeers(absDir) {
+  let declared;
+  try {
+    declared = JSON.parse(readFileSync(join(absDir, "package.json"), "utf8")).peerDependencies ?? {};
+  } catch {
+    return []; // checkPackage already reports a missing package.json.
+  }
+  const requireFromPkg = createRequire(join(absDir, "package.json"));
+  const violations = [];
+  for (const name of Object.keys(declared)) {
+    let peerPkgPath;
+    try {
+      peerPkgPath = requireFromPkg.resolve(`${name}/package.json`);
+    } catch {
+      peerPkgPath = undefined;
+    }
+    if (!peerPkgPath) {
+      for (const candidate of [
+        join(absDir, "node_modules", name, "package.json"),
+        join(repoRoot, "node_modules", name, "package.json")
+      ]) {
+        if (existsSync(candidate)) {
+          peerPkgPath = candidate;
+          break;
+        }
+      }
+    }
+    if (!peerPkgPath) continue; // declared but not installed — unknowable
+    let pkg;
+    try {
+      pkg = JSON.parse(readFileSync(peerPkgPath, "utf8"));
+    } catch {
+      continue; // unreadable/malformed — unknowable, not a violation
+    }
+    const license = pkg.license ?? pkg.licenses;
+    if (isForbiddenLicense(license)) {
+      violations.push({ name, version: pkg.version ?? "unknown", license });
+    }
+  }
+  return violations;
+}
+
+/**
  * @param {string} pkgDir Path relative to repo root, e.g. "packages/agent"
  * @returns {{ ok: boolean, violations: Array<{ name: string, version: string, license: unknown }>, error?: string }}
  */
@@ -181,10 +243,21 @@ function checkPackage(pkgDir) {
   }
 
   const violations = [];
+  const seen = new Set();
   for (const { name, version, path: depPath } of deps.values()) {
     const license = readInstalledLicense(name, version, depPath);
     if (isForbiddenLicense(license)) {
       violations.push({ name, version, license });
+      seen.add(name);
+    }
+  }
+
+  // Declared peers are invisible to `pnpm list` (see checkDeclaredPeers);
+  // merge their violations without double-reporting a name already caught.
+  for (const v of checkDeclaredPeers(absDir)) {
+    if (!seen.has(v.name)) {
+      violations.push(v);
+      seen.add(v.name);
     }
   }
 
@@ -477,6 +550,59 @@ function runSelfTest() {
     }
     results.push(["collectSourceFiles on a missing directory does not throw", collectThrew === false]);
     results.push(["collectSourceFiles on a missing directory returns empty", Array.isArray(collectResult) && collectResult.length === 0]);
+
+    // (l) — Issue #10 — collectDeps collects a `peerDependencies` bucket
+    // (reported by some pnpm versions / nested nodes even though pnpm v11
+    // omits a workspace package's own declared peers).
+    const peerBucketTree = { peerDependencies: { "gpl-peer-bucket": { version: "9.9.9" } } };
+    const peerCollected = new Map();
+    collectDeps(peerBucketTree, peerCollected);
+    results.push([
+      "collectDeps collects peerDependencies bucket",
+      peerCollected.has("gpl-peer-bucket@9.9.9")
+    ]);
+
+    // (m) — Issue #10 — declared-peer scan: a GPL package declared only in
+    // an enforced package's `peerDependencies` (invisible to `pnpm list`
+    // under pnpm v11) MUST be flagged; a clean peer MUST NOT; a declared
+    // but uninstalled peer MUST be ignored (license unknowable).
+    const peerConsumerDir = join(scratch, "peer-consumer");
+    mkdirSync(join(peerConsumerDir, "node_modules", "gpl-peer-dep"), { recursive: true });
+    mkdirSync(join(peerConsumerDir, "node_modules", "clean-peer-dep"), { recursive: true });
+    writeFileSync(
+      join(peerConsumerDir, "package.json"),
+      JSON.stringify({
+        name: "peer-consumer",
+        version: "1.0.0",
+        license: "Apache-2.0",
+        peerDependencies: {
+          "gpl-peer-dep": "^1.0.0",
+          "clean-peer-dep": "^1.0.0",
+          "not-installed-peer": "^1.0.0"
+        }
+      })
+    );
+    writeFileSync(
+      join(peerConsumerDir, "node_modules", "gpl-peer-dep", "package.json"),
+      JSON.stringify({ name: "gpl-peer-dep", version: "1.2.0", license: "GPL-3.0-only" })
+    );
+    writeFileSync(
+      join(peerConsumerDir, "node_modules", "clean-peer-dep", "package.json"),
+      JSON.stringify({ name: "clean-peer-dep", version: "1.0.0", license: "MIT" })
+    );
+    const peerViolations = checkDeclaredPeers(peerConsumerDir);
+    results.push([
+      "declared GPL peer dependency flagged",
+      peerViolations.some((v) => v.name === "gpl-peer-dep" && v.version === "1.2.0")
+    ]);
+    results.push([
+      "declared clean peer dependency not flagged",
+      !peerViolations.some((v) => v.name === "clean-peer-dep")
+    ]);
+    results.push([
+      "declared but uninstalled peer ignored",
+      !peerViolations.some((v) => v.name === "not-installed-peer")
+    ]);
 
     console.log("License-gate self-test results:");
     let allPassed = true;
