@@ -1,10 +1,11 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PROJECT_LAYOUT } from "@scadforge/protocol";
 import { ScadForgeError } from "../errors.js";
 import {
+  ORPHANED_CLAIM_MIN_AGE_MS,
   createSnapshot,
   initProject,
   listSnapshots,
@@ -358,5 +359,87 @@ describe("project store (filesystem, temp dir)", () => {
     // The pre-existing (contested) directory's contents were never touched.
     const sentinel = await readFile(join(contestedDir, "sentinel.txt"), "utf8");
     expect(sentinel).toBe("pre-existing, must survive");
+  }, 20000);
+
+  it("recovers from an orphaned claim directory left by a hard kill (issue #28)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    // Simulate a SIGKILL between claimNextSnapshotId's exclusive mkdir and
+    // the manifest write: history/0002 exists with partial snapshot files but
+    // NO manifest.json, and project.json.head never advanced past 0001.
+    // Backdate the directory past the reclaim age so it is unambiguously dead
+    // claim debris, not an in-flight writer from another process.
+    const orphan = snapshotDir(projectDir, "0002");
+    await mkdir(orphan, { recursive: true });
+    await writeFile(join(orphan, PROJECT_LAYOUT.snapshot.modelFile), "cube(2);\n", "utf8");
+    const past = new Date(Date.now() - 2 * ORPHANED_CLAIM_MIN_AGE_MS);
+    await utimes(orphan, past, past);
+
+    // Before the fix this wedged permanently: every retry recomputed id 0002
+    // against the unchanged head and hit EEXIST until CONFLICT. Now the dead
+    // claim is reclaimed and creation succeeds again.
+    const recovered = await createSnapshot(projectDir, {
+      content: "cube(3);\n",
+      params: {},
+      message: "recovered after orphaned claim",
+      origin: "manual",
+      pass: null
+    });
+
+    expect(recovered.id).toBe("0002"); // the reclaimed id is reused -- sequence stays gapless
+    expect(recovered.message).toBe("recovered after orphaned claim");
+
+    // The committed 0001 snapshot was never touched.
+    const first = await readSnapshotManifest(projectDir, "0001");
+    expect(first.origin).toBe("initial");
+
+    // The store keeps working: the next snapshot gets 0003.
+    const next = await createSnapshot(projectDir, {
+      content: "cube(4);\n",
+      params: {},
+      message: "after recovery",
+      origin: "manual",
+      pass: null
+    });
+    expect(next.id).toBe("0003");
+    expect(next.parent).toBe("0002");
+  }, 20000);
+
+  it("never reclaims a stale directory that contains a manifest.json (issue #28)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    // Simulate a torn commit: history/0002 carries a manifest.json but
+    // project.json.head never advanced. However stale, the manifest makes it
+    // a real snapshot -- reclaiming it would destroy committed history.
+    const torn = snapshotDir(projectDir, "0002");
+    await mkdir(torn, { recursive: true });
+    const tornManifest = {
+      id: "0002",
+      parent: "0001",
+      timestamp: new Date().toISOString(),
+      origin: "manual",
+      message: "torn commit",
+      files: {},
+      params: {}
+    };
+    await writeFile(join(torn, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(tornManifest), "utf8");
+    const past = new Date(Date.now() - 2 * ORPHANED_CLAIM_MIN_AGE_MS);
+    await utimes(torn, past, past);
+
+    // The claim must NOT reclaim it: the loop still exhausts and surfaces the
+    // typed CONFLICT rather than silently overwriting real history.
+    await expect(
+      createSnapshot(projectDir, {
+        content: "cube(2);\n",
+        params: {},
+        message: "must not destroy the torn commit",
+        origin: "manual",
+        pass: null
+      })
+    ).rejects.toMatchObject({ error_code: "CONFLICT" });
+
+    // The manifest-bearing directory survived intact.
+    const manifest = JSON.parse(await readFile(join(torn, PROJECT_LAYOUT.snapshot.manifestFile), "utf8"));
+    expect(manifest.id).toBe("0002");
   }, 20000);
 });

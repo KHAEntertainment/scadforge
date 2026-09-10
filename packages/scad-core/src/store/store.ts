@@ -179,6 +179,9 @@ export interface CreateSnapshotInput {
 /** Max attempts to claim a snapshot id before failing with `CONFLICT` (see the concurrency policy above). */
 export const SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS = 50;
 
+/** Minimum age (ms) of a manifest-less snapshot directory before it is treated as an orphaned claim and reclaimed (issue #28). */
+export const ORPHANED_CLAIM_MIN_AGE_MS = 60_000;
+
 function isEexist(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "EEXIST";
 }
@@ -187,6 +190,28 @@ function isEexist(err: unknown): boolean {
 function backoffDelay(attempt: number): Promise<void> {
   const ms = Math.min(5 + attempt * 5, 100) + Math.floor(Math.random() * 10);
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+/**
+ * A directory that blocks an id claim is reclaimable only when it is an
+ * ORPHANED CLAIM (issue #28): it carries no `manifest.json` (a committed
+ * snapshot always has one -- it is written before `project.json.head`
+ * advances, so its presence means the id is genuinely taken and must never
+ * be touched) AND it has been quiet longer than `ORPHANED_CLAIM_MIN_AGE_MS`
+ * (a live writer keeps the directory's mtime fresh while it creates files,
+ * so a directory this old with no manifest can only be the debris of a
+ * process that died between the exclusive mkdir and either the manifest
+ * write or the cleanup path).
+ */
+async function isReclaimableOrphanClaim(dir: string): Promise<boolean> {
+  const hasManifest = await stat(join(dir, PROJECT_LAYOUT.snapshot.manifestFile)).then(
+    () => true,
+    () => false
+  );
+  if (hasManifest) return false;
+  const dirStat = await stat(dir).catch(() => null);
+  if (!dirStat) return false; // vanished (a concurrent reclaimer freed it) -- just retry the mkdir
+  return Date.now() - dirStat.mtimeMs >= ORPHANED_CLAIM_MIN_AGE_MS;
 }
 
 /**
@@ -209,6 +234,17 @@ async function claimNextSnapshotId(projectDir: string): Promise<{ id: SnapshotId
       return { id, parent };
     } catch (err) {
       if (isEexist(err)) {
+        if (await isReclaimableOrphanClaim(dir)) {
+          // Issue #28: a previous process died between this exclusive mkdir
+          // and either the manifest write or the cleanup path. Its
+          // manifest-less debris wedges every future claim of this id --
+          // the head never advanced, so each retry recomputes the same id
+          // forever. Reclaim the debris and let the loop retry the exclusive
+          // mkdir on the freed name; a concurrent reclaimer that wins the
+          // race simply costs us another EEXIST round-trip.
+          await rm(dir, { recursive: true, force: true }).catch(() => {});
+          continue;
+        }
         if (attempt < SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS - 1) await backoffDelay(attempt);
         continue; // another writer (this process or another) claimed `id` first; re-read head and retry
       }
