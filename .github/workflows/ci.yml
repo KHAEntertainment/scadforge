@@ -36,6 +36,9 @@ jobs:
       - name: License gate self-test
         run: node scripts/check-licenses.mjs --self-test
 
+      - name: License gate end-to-end injection check
+        run: node scripts/check-licenses.e2e.mjs
+
       - name: License gate
         run: node scripts/check-licenses.mjs
 

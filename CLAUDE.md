@@ -10,6 +10,7 @@ pnpm -r build         # build all packages
 pnpm -r test          # vitest everywhere; @docker-tagged tests need the OpenSCAD container
 pnpm lint             # eslint
 node scripts/check-licenses.mjs   # license gate (also runs in CI)
+node scripts/check-licenses.e2e.mjs   # proves the gate fails on a real injected GPL dep, then reverts (also runs in CI)
 ```
 
 Always prefer RTK wrappers: `rtk git`, `rtk gh`, `rtk npm`, `rtk tsc`, `rtk lint`, or `rtk proxy <cmd>`.
