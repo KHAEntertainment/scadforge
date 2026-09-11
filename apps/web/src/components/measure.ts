@@ -11,6 +11,17 @@
  * planes perpendicular to the chosen axis — honest, noise-free, and exactly
  * right for the bracket-style models this app produces. Automatic
  * per-feature dimensioning is deliberately out of scope.
+ *
+ * Hybrid display: each axis's measurement anchors to the bbox edge it
+ * measures — the edge highlights, endpoint dots pin it to the model
+ * corners, and the mm label hugs the edge midpoint. Focus mode adds
+ * face-center dots plus a straight dashed connector through the part.
+ *
+ * Camera-aware edge pick (PR follow-up to #62): for each axis, label the
+ * one of the four parallel bbox edges whose midpoint projects most
+ * positively along the camera direction. Recomputed as the camera orbits
+ * so the visible edge is always the labelled one — the failure mode the
+ * static pick exhibited at oblique angles.
  */
 
 export type Axis = "x" | "y" | "z";
@@ -26,6 +37,12 @@ export interface BBoxPoint {
 export interface BBox {
   min: BBoxPoint;
   max: BBoxPoint;
+}
+
+export interface Vec3 {
+  x: number;
+  y: number;
+  z: number;
 }
 
 /** True only for a finite, non-inverted box — a degenerate/empty mesh yields NaN or inverted bounds and must not produce NaN geometry. */
@@ -50,67 +67,166 @@ export function formatMm(value: number): string {
   return Number.isInteger(rounded) ? `${rounded}` : rounded.toFixed(1);
 }
 
-export interface DimensionLine {
+/** A single bbox edge as a 3-tuple pair; coordinates are world-space mm. */
+export type Edge = [[number, number, number], [number, number, number]];
+
+export interface EdgeDimension {
   axis: Axis;
-  /** Flat xyz segment pairs: main line first, then the two axis-aligned extension lines connecting it to the model's edges. */
-  segments: number[];
-  /** Midpoint of the main line, nudged outward — where the mm label sits. */
+  /** The bbox edge being measured — coincides with real model geometry on bracket-style parts. */
+  edge: Edge;
+  /** Anchor dots at the edge endpoints pin the highlight to the model corners. */
+  endpoints: Edge;
+  /** Edge midpoint nudged slightly outward — the label hugs its edge. */
   labelPosition: [number, number, number];
   /** Face-to-face distance along this axis (the bounding-box extent). */
   sizeMm: number;
 }
 
+/** The four parallel bbox edges for a given axis — candidates for the camera-aware pick. */
+export function parallelEdges(box: BBox, axis: Axis): Edge[] {
+  const { min, max } = box;
+  switch (axis) {
+    case "x":
+      // Edges running along X at the four (Y, Z) corner combinations.
+      return [
+        [[min.x, min.y, min.z], [max.x, min.y, min.z]],
+        [[min.x, min.y, max.z], [max.x, min.y, max.z]],
+        [[min.x, max.y, min.z], [max.x, max.y, min.z]],
+        [[min.x, max.y, max.z], [max.x, max.y, max.z]]
+      ];
+    case "y":
+      return [
+        [[min.x, min.y, min.z], [min.x, max.y, min.z]],
+        [[min.x, min.y, max.z], [min.x, max.y, max.z]],
+        [[max.x, min.y, min.z], [max.x, max.y, min.z]],
+        [[max.x, min.y, max.z], [max.x, max.y, max.z]]
+      ];
+    case "z":
+      return [
+        [[min.x, min.y, min.z], [min.x, min.y, max.z]],
+        [[min.x, max.y, min.z], [min.x, max.y, max.z]],
+        [[max.x, min.y, min.z], [max.x, min.y, max.z]],
+        [[max.x, max.y, min.z], [max.x, max.y, max.z]]
+      ];
+  }
+}
+
+/** Midpoint of an edge in world space. */
+export function edgeMidpoint(edge: Edge): [number, number, number] {
+  return [
+    (edge[0][0] + edge[1][0]) / 2,
+    (edge[0][1] + edge[1][1]) / 2,
+    (edge[0][2] + edge[1][2]) / 2
+  ];
+}
+
 /**
- * Drafting-style dimension lines for the three bounding-box extents.
+ * Pick the edge of the four parallel bbox edges for `axis` whose midpoint
+ * projects most positively along `cameraDirection` (the unit vector from
+ * the bbox centre toward the camera). Ties broken by smallest squared
+ * distance to that direction so the result is deterministic.
  *
- * Each line is offset outward from one box edge along exactly ONE other
- * axis, so the extension lines that connect it to the model stay
- * axis-aligned (diagonal extensions read as clutter in 3D):
- *
- * - X extent: offset -Y from the front-bottom edge
- * - Y extent: offset +X from the right-bottom edge
- * - Z extent: offset +Y from the back-right vertical edge
+ * Pure — the camera direction is a plain {x,y,z} so tests don't need a
+ * three.js camera. Pass `null` (or a zero vector) to fall back to a
+ * stable, axis-sensible default (front-bottom for X, right-bottom for Y,
+ * back-right for Z — what the prototype shipped).
  */
-export function dimensionLines(box: BBox): DimensionLine[] {
+export function selectCameraFacingEdge(box: BBox, axis: Axis, cameraDirection: Vec3 | null): Edge {
+  const edges = parallelEdges(box, axis);
+  const fallback = defaultEdge(box, axis);
+  if (!cameraDirection) return fallback;
+
+  const norm = Math.hypot(cameraDirection.x, cameraDirection.y, cameraDirection.z);
+  if (!Number.isFinite(norm) || norm === 0) return fallback;
+
+  const dx = cameraDirection.x / norm;
+  const dy = cameraDirection.y / norm;
+  const dz = cameraDirection.z / norm;
+
+  let best = fallback;
+  let bestScore = -Infinity;
+  for (const edge of edges) {
+    const [mx, my, mz] = edgeMidpoint(edge);
+    const score = mx * dx + my * dy + mz * dz;
+    if (score > bestScore) {
+      bestScore = score;
+      best = edge;
+    }
+  }
+  return best;
+}
+
+/** The prototype's stable default pick when no camera direction is available. */
+function defaultEdge(box: BBox, axis: Axis): Edge {
+  const { min, max } = box;
+  switch (axis) {
+    case "x":
+      return [[min.x, min.y, min.z], [max.x, min.y, min.z]];
+    case "y":
+      return [[max.x, min.y, min.z], [max.x, max.y, min.z]];
+    case "z":
+      return [[max.x, max.y, min.z], [max.x, max.y, max.z]];
+  }
+}
+
+/**
+ * Build the edge-anchored dimension description for a given axis. The
+ * label position hugs the edge midpoint, nudged outward by a small
+ * fraction of the bbox diagonal (always finite even for a point mesh).
+ *
+ * `cameraDirection` is the unit vector from bbox centre toward the camera;
+ * passing `null` selects the deterministic default edge.
+ */
+export function edgeDimension(box: BBox, axis: Axis, cameraDirection: Vec3 | null): EdgeDimension {
   const size = bboxSize(box);
   const diagonal = Math.sqrt(size.x ** 2 + size.y ** 2 + size.z ** 2);
-  // A point-mesh (zero diagonal) still gets a usable, non-zero gap.
-  const gap = Math.max(diagonal * 0.12, 1);
+  const nudge = Math.max(diagonal * 0.06, 0.5);
 
-  const { min, max } = box;
-  const lines: DimensionLine[] = [
-    {
-      axis: "x",
-      segments: [
-        min.x, min.y - gap, min.z, max.x, min.y - gap, min.z,
-        min.x, min.y - gap, min.z, min.x, min.y, min.z,
-        max.x, min.y - gap, min.z, max.x, min.y, min.z
-      ],
-      labelPosition: [(min.x + max.x) / 2, min.y - gap * 1.6, min.z],
-      sizeMm: size.x
-    },
-    {
-      axis: "y",
-      segments: [
-        max.x + gap, min.y, min.z, max.x + gap, max.y, min.z,
-        max.x + gap, min.y, min.z, max.x, min.y, min.z,
-        max.x + gap, max.y, min.z, max.x, max.y, min.z
-      ],
-      labelPosition: [max.x + gap * 1.6, (min.y + max.y) / 2, min.z],
-      sizeMm: size.y
-    },
-    {
-      axis: "z",
-      segments: [
-        max.x, max.y + gap, min.z, max.x, max.y + gap, max.z,
-        max.x, max.y + gap, min.z, max.x, max.y, min.z,
-        max.x, max.y + gap, max.z, max.x, max.y, max.z
-      ],
-      labelPosition: [max.x, max.y + gap * 1.6, (min.z + max.z) / 2],
-      sizeMm: size.z
-    }
+  const edge = selectCameraFacingEdge(box, axis, cameraDirection);
+  const [m0, m1] = edge;
+  const mid: [number, number, number] = [(m0[0] + m1[0]) / 2, (m0[1] + m1[1]) / 2, (m0[2] + m1[2]) / 2];
+
+  // Nudge the label outward along the camera direction (or the default
+  // edge's perpendicular-to-axis vector when no camera is given). The
+  // sign of the nudge component is the same as the edge midpoint's
+  // component on that axis, so the label always lands just outside the
+  // model on the camera-facing side.
+  let outward: Vec3;
+  if (cameraDirection) {
+    outward = cameraDirection;
+  } else {
+    outward = outwardAxisDefault(axis);
+  }
+  const labelPosition: [number, number, number] = [
+    mid[0] + outward.x * nudge,
+    mid[1] + outward.y * nudge,
+    mid[2] + outward.z * nudge
   ];
-  return lines;
+
+  return { axis, edge, endpoints: edge, labelPosition, sizeMm: size[axis] };
+}
+
+/** A default outward direction per axis — the prototype's hand-picked nudge. */
+function outwardAxisDefault(axis: Axis): Vec3 {
+  switch (axis) {
+    case "x":
+      return { x: 0, y: -1, z: -1 };
+    case "y":
+      return { x: 1, y: 0, z: -1 };
+    case "z":
+      return { x: 1, y: 1, z: 0 };
+  }
+}
+
+/** Build dimensions for all three axes in one call. Convenience for the overlay. */
+export function edgeDimensions(box: BBox, cameraDirection: Vec3 | null): EdgeDimension[] {
+  return AXES.map((axis) => edgeDimension(box, axis, cameraDirection));
+}
+
+/** The center points of the two face planes perpendicular to `axis` — connector endpoints for the focused face-to-face readout. */
+export function faceCenters(box: BBox, axis: Axis): [[number, number, number], [number, number, number]] {
+  const planes = facePlanes(box, axis);
+  return [planes[0].position, planes[1].position];
 }
 
 /** The two face planes perpendicular to `axis` — the surfaces a face-to-face measurement spans. */
