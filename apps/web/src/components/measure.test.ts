@@ -120,26 +120,30 @@ describe("edgeDimension (hybrid display)", () => {
     }
   });
 
-  it("labels hug their edge: at its midpoint along the axis, nudged only slightly outward", () => {
+  it("labels hug their edge: at its midpoint along the axis, nudged perpendicular to the edge outside the bbox", () => {
     const [xDim] = edgeDimensions(BRACKET, null);
+    // Label sits at the X midpoint of the edge.
     expect(xDim.labelPosition[0]).toBeCloseTo((BRACKET.min.x + BRACKET.max.x) / 2);
-    // Nudge is small relative to the model (unlike the old full-gap offset).
-    const nudgeY = BRACKET.min.y - xDim.labelPosition[1];
-    expect(nudgeY).toBeLessThan(20);
-    expect(nudgeY).toBeGreaterThan(0);
+    // The label is OUTSIDE the bbox perpendicular to the X axis — the
+    // dimension line is the bbox edge itself, the label sits beside it,
+    // never on top of the model.
+    expect(xDim.labelPosition[1]).not.toBeCloseTo((xDim.edge[0][1] + xDim.edge[1][1]) / 2);
+    // For the default X edge (front-bottom, min Y), the label is on the
+    // -Y side, well outside the bbox.
+    expect(xDim.labelPosition[1]).toBeLessThan(BRACKET.min.y);
   });
 
-  it("camera direction nudges the label toward the camera-facing side", () => {
-    const noCam = edgeDimension(BRACKET, "x", null);
+  it("camera direction picks the camera-facing edge and nudges the label toward the camera", () => {
     const fromFront = edgeDimension(BRACKET, "x", { x: 0, y: -1, z: 0 });
     const fromBack = edgeDimension(BRACKET, "x", { x: 0, y: 1, z: 0 });
-    // From the front, the camera-facing edge is the minY one — same as the
-    // default — so the label stays on the front side of the model.
+    // From the front, the camera-facing edge is the minY one.
     expect(fromFront.edge[0][1]).toBe(BRACKET.min.y);
-    expect(fromFront.labelPosition[1]).toBeCloseTo(noCam.labelPosition[1]);
-    // From the back, both the edge and the label move to the +Y side.
+    // The label sits perpendicular to the edge, on the camera side —
+    // outside the bbox on the Y axis.
+    expect(fromFront.labelPosition[1]).toBeLessThan(BRACKET.min.y);
+    // From the back, both the edge AND the label move to the +Y side.
     expect(fromBack.edge[0][1]).toBe(BRACKET.max.y);
-    expect(fromBack.labelPosition[1]).toBeGreaterThan(noCam.labelPosition[1]);
+    expect(fromBack.labelPosition[1]).toBeGreaterThan(BRACKET.max.y);
   });
 
   it("counterexample: a degenerate zero-size box still yields finite geometry", () => {

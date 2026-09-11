@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useFrame, useThree } from "@react-three/fiber";
+import { useEffect, useMemo, useState } from "react";
+import { useThree } from "@react-three/fiber";
 import { Html, Line } from "@react-three/drei";
 import { DoubleSide } from "three";
 import { bboxSize, edgeDimensions, faceCenters, facePlanes, formatMm, type Axis, type BBox, type Vec3 } from "./measure.js";
@@ -38,12 +38,21 @@ const CONNECTOR_COLOR = "#0f62fe";
  */
 export function DimensionOverlay({ box, focus }: { box: BBox; focus: MeasureFocus }) {
   const camera = useThree((state) => state.camera);
-  // Triggers a re-render once per frame so the camera-aware edge pick
-  // follows the orbit controls. The actual `edges` are recomputed below
-  // when the camera direction changes; this counter only forces React
-  // to flush.
-  const [, setTick] = useState(0);
-  useFrame(() => setTick((t) => (t + 1) % 1_000_000));
+  const controls = useThree((state) => state.controls) as { addEventListener?: (event: string, fn: () => void) => void; removeEventListener?: (event: string, fn: () => void) => void } | null;
+
+  // The camera position is mutated by OrbitControls, not by React state,
+  // so a plain `useMemo` of it would freeze at mount. Subscribe to the
+  // controls' "change" event (fires every drag tick + on damping settle)
+  // and bump a React state counter so the Line geometry's points prop
+  // updates with the new camera-aware edge pick.
+  const [cameraVersion, setCameraVersion] = useState(0);
+
+  useEffect(() => {
+    if (!controls?.addEventListener) return;
+    const onChange = () => setCameraVersion((v) => (v + 1) % 1_000_000);
+    controls.addEventListener("change", onChange);
+    return () => controls.removeEventListener?.("change", onChange);
+  }, [controls]);
 
   const cameraDirection: Vec3 = useMemo(() => {
     const center = {
@@ -56,7 +65,10 @@ export function DimensionOverlay({ box, focus }: { box: BBox; focus: MeasureFocu
       y: camera.position.y - center.y,
       z: camera.position.z - center.z
     };
-  }, [camera.position.x, camera.position.y, camera.position.z, box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z]);
+    // cameraVersion is the dependency that actually invalidates this
+    // memo as the user orbits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraVersion, camera, box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z]);
 
   const edges = useMemo(() => edgeDimensions(box, cameraDirection), [box, cameraDirection]);
   const planes = useMemo(() => (focus === "all" ? [] : facePlanes(box, focus)), [box, focus]);

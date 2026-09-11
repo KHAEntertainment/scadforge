@@ -171,8 +171,10 @@ function defaultEdge(box: BBox, axis: Axis): Edge {
 
 /**
  * Build the edge-anchored dimension description for a given axis. The
- * label position hugs the edge midpoint, nudged outward by a small
- * fraction of the bbox diagonal (always finite even for a point mesh).
+ * label position hugs the edge midpoint, nudged perpendicular to the
+ * measured edge by a fraction of the bbox diagonal — large enough to
+ * sit clearly outside the model (a small nudge can land the label on
+ * the model's face and drei's occlusion test then hides it).
  *
  * `cameraDirection` is the unit vector from bbox centre toward the camera;
  * passing `null` selects the deterministic default edge.
@@ -180,22 +182,29 @@ function defaultEdge(box: BBox, axis: Axis): Edge {
 export function edgeDimension(box: BBox, axis: Axis, cameraDirection: Vec3 | null): EdgeDimension {
   const size = bboxSize(box);
   const diagonal = Math.sqrt(size.x ** 2 + size.y ** 2 + size.z ** 2);
-  const nudge = Math.max(diagonal * 0.06, 0.5);
+  const nudge = Math.max(diagonal * 0.15, 1);
 
   const edge = selectCameraFacingEdge(box, axis, cameraDirection);
   const [m0, m1] = edge;
   const mid: [number, number, number] = [(m0[0] + m1[0]) / 2, (m0[1] + m1[1]) / 2, (m0[2] + m1[2]) / 2];
 
-  // Nudge the label outward along the camera direction (or the default
-  // edge's perpendicular-to-axis vector when no camera is given). The
-  // sign of the nudge component is the same as the edge midpoint's
-  // component on that axis, so the label always lands just outside the
-  // model on the camera-facing side.
-  let outward: Vec3;
+  // The label sits perpendicular to the measured edge, pushed toward the
+  // camera side. Using only the camera direction (no edge-along component)
+  // guarantees the label clears the bbox on both free axes of the edge.
+  const center = {
+    x: (box.min.x + box.max.x) / 2,
+    y: (box.min.y + box.max.y) / 2,
+    z: (box.min.z + box.max.z) / 2
+  };
+  let outward: Vec3 = cameraDirection ?? defaultOutward(edge, mid, center);
   if (cameraDirection) {
-    outward = cameraDirection;
-  } else {
-    outward = outwardAxisDefault(axis);
+    // Zero out the along-edge component so the label moves purely
+    // perpendicular to the edge — that's the direction the model isn't
+    // blocking.
+    const alongAxisIndex = axisIndex(axis);
+    outward = perpendicularAxis(outward, alongAxisIndex);
+    // Re-magnitude so the nudge stays a constant geometric distance.
+    outward = normalize(outward);
   }
   const labelPosition: [number, number, number] = [
     mid[0] + outward.x * nudge,
@@ -204,6 +213,31 @@ export function edgeDimension(box: BBox, axis: Axis, cameraDirection: Vec3 | nul
   ];
 
   return { axis, edge, endpoints: edge, labelPosition, sizeMm: size[axis] };
+}
+
+/** Default outward direction when no camera is given: from the edge midpoint away from the bbox centre, in the plane perpendicular to the measured axis. */
+function defaultOutward(edge: Edge, mid: [number, number, number], center: { x: number; y: number; z: number }): Vec3 {
+  const dx = mid[0] - center.x;
+  const dy = mid[1] - center.y;
+  const dz = mid[2] - center.z;
+  return normalize({ x: dx, y: dy, z: dz });
+}
+
+/** Zero out the component along the measured axis; keep the perpendicular components. */
+function perpendicularAxis(v: Vec3, axis: 0 | 1 | 2): Vec3 {
+  if (axis === 0) return { x: 0, y: v.y, z: v.z };
+  if (axis === 1) return { x: v.x, y: 0, z: v.z };
+  return { x: v.x, y: v.y, z: 0 };
+}
+
+function normalize(v: Vec3): Vec3 {
+  const n = Math.hypot(v.x, v.y, v.z);
+  if (!Number.isFinite(n) || n === 0) return { x: 0, y: 0, z: 0 };
+  return { x: v.x / n, y: v.y / n, z: v.z / n };
+}
+
+function axisIndex(axis: Axis): 0 | 1 | 2 {
+  return axis === "x" ? 0 : axis === "y" ? 1 : 2;
 }
 
 /** A default outward direction per axis — the prototype's hand-picked nudge. */
