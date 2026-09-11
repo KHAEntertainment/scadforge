@@ -240,18 +240,6 @@ function axisIndex(axis: Axis): 0 | 1 | 2 {
   return axis === "x" ? 0 : axis === "y" ? 1 : 2;
 }
 
-/** A default outward direction per axis — the prototype's hand-picked nudge. */
-function outwardAxisDefault(axis: Axis): Vec3 {
-  switch (axis) {
-    case "x":
-      return { x: 0, y: -1, z: -1 };
-    case "y":
-      return { x: 1, y: 0, z: -1 };
-    case "z":
-      return { x: 1, y: 1, z: 0 };
-  }
-}
-
 /** Build dimensions for all three axes in one call. Convenience for the overlay. */
 export function edgeDimensions(box: BBox, cameraDirection: Vec3 | null): EdgeDimension[] {
   return AXES.map((axis) => edgeDimension(box, axis, cameraDirection));

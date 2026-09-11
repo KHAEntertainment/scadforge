@@ -65,9 +65,6 @@ export function DimensionOverlay({ box, focus }: { box: BBox; focus: MeasureFocu
       y: camera.position.y - center.y,
       z: camera.position.z - center.z
     };
-    // cameraVersion is the dependency that actually invalidates this
-    // memo as the user orbits.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameraVersion, camera, box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z]);
 
   const edges = useMemo(() => edgeDimensions(box, cameraDirection), [box, cameraDirection]);
