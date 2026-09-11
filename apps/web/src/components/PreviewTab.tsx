@@ -4,6 +4,8 @@ import { Viewer3D } from "./Viewer3D.js";
 import { ValidationPanel } from "./ValidationPanel.js";
 import { PreviewErrorBoundary } from "./PreviewErrorBoundary.js";
 import { useWasmPreview } from "../wasm/index.js";
+import { bboxSize, formatMm, AXES, type BBox } from "./measure.js";
+import type { MeasureFocus } from "./DimensionOverlay.js";
 import type { SnapshotMeshStatus } from "../hooks/useSnapshotMesh.js";
 
 /** The four fixed views shown as buttons (Issue #18 AC — `section` is excluded from this round's view switcher). */
@@ -132,6 +134,9 @@ function PreviewTabBody({
 }) {
   const isLive = mode === "live";
   const [showGrid, setShowGrid] = useState(true);
+  const [measure, setMeasure] = useState(false);
+  const [measureAxis, setMeasureAxis] = useState<MeasureFocus>("all");
+  const [measuredBBox, setMeasuredBBox] = useState<BBox | null>(null);
 
   // `enabled: isLive` — the worker is only spawned while the Live tab is
   // actually selected, not on every project/param change.
@@ -155,6 +160,7 @@ function PreviewTabBody({
    * its URL avoids the churn entirely.
    */
   const viewerUrl = mode === "live" ? (isStale ? stlUrl : wasm.objectUrl) : stlUrl;
+  const measuredSizes = measuredBBox ? bboxSize(measuredBBox) : null;
 
   return (
     <div className="preview-tab">
@@ -185,8 +191,45 @@ function PreviewTabBody({
         ))}
         <span className="preview-view-spacer" />
         <button type="button" className={showGrid ? "active" : ""} onClick={() => setShowGrid((value) => !value)} aria-pressed={showGrid}>Grid</button>
+        <button
+          type="button"
+          className={measure ? "active" : ""}
+          onClick={() => setMeasure((value) => !value)}
+          aria-pressed={measure}
+          data-testid="measure-toggle"
+        >
+          Measure
+        </button>
         <button type="button" onClick={() => onModeChange("orbit")}>Fit</button>
       </div>
+
+      {measure ? (
+        <div className="measure-controls" role="group" aria-label="Measurement axis">
+          <span className="measure-controls-label">Face-to-face:</span>
+          {(["all", ...AXES] as const).map((axis) => (
+            <button
+              key={axis}
+              type="button"
+              className={measureAxis === axis ? "active" : ""}
+              onClick={() => setMeasureAxis(axis)}
+              aria-pressed={measureAxis === axis}
+              data-testid={`measure-axis-${axis}`}
+            >
+              {axis === "all" ? "All" : axis.toUpperCase()}
+            </button>
+          ))}
+          <span className="measure-readout" data-testid="measure-readout">
+            {measuredSizes ? (
+              <>
+                {AXES.map((axis) => `${axis.toUpperCase()} ${formatMm(measuredSizes[axis])} mm`).join(" · ")}{" "}
+                <span className="measure-readout-source">(derived from preview mesh)</span>
+              </>
+            ) : (
+              "No mesh to measure yet."
+            )}
+          </span>
+        </div>
+      ) : null}
 
       {mode === "live" ? (
         // Server-authority fallback (CLAUDE.md rule 6, binding): while the
@@ -206,7 +249,13 @@ function PreviewTabBody({
         {/* Hidden rather than unmounted while a PNG is shown, so the WebGL
             context survives every mode switch (see `viewerUrl` above). */}
         <div className={showPng ? "preview-viewer preview-viewer--hidden" : "preview-viewer"}>
-          <Viewer3D stlUrl={viewerUrl} emptyMessage={meshPlaceholderMessage(meshStatus, snapshotId)} />
+          <Viewer3D
+            stlUrl={viewerUrl}
+            emptyMessage={meshPlaceholderMessage(meshStatus, snapshotId)}
+            measure={measure}
+            measureAxis={measureAxis}
+            onBoundingBox={setMeasuredBBox}
+          />
         </div>
         {showPng ? (
           activePng ? (

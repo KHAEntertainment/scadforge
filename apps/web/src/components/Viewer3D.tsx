@@ -1,8 +1,10 @@
-import { Component, Suspense, useEffect, type ReactNode } from "react";
+import { Component, Suspense, useEffect, useMemo, type ReactNode } from "react";
 import { Canvas, useLoader, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { Vector3, type BufferGeometry, type PerspectiveCamera } from "three";
+import { DimensionOverlay, type MeasureFocus } from "./DimensionOverlay.js";
+import { isValidBBox, type BBox } from "./measure.js";
 
 export interface Viewer3DProps {
   /** HTTP path to the server-exported STL. `null` when no render has happened yet. */
@@ -14,6 +16,16 @@ export interface Viewer3DProps {
    * case (Issue #41).
    */
   emptyMessage?: string;
+  /** Show dimension brackets + mm labels derived from the displayed mesh. */
+  measure?: boolean;
+  /** Which axis's face-to-face measurement to focus; "all" shows all three dimensions equally. */
+  measureAxis?: MeasureFocus;
+  /**
+   * Reports the displayed mesh's bounding box (plain data, mm) whenever a
+   * mesh loads, and `null` when it unloads — lets DOM UI outside the canvas
+   * (the measure readout) stay in sync with what is actually on screen.
+   */
+  onBoundingBox?: (box: BBox | null) => void;
 }
 
 function ViewerPlaceholder({ message }: { message: string }) {
@@ -97,20 +109,37 @@ function FitCamera({ geometry }: { geometry: BufferGeometry }) {
   return null;
 }
 
-function StlMesh({ url }: { url: string }) {
+function StlMesh({ url, measure = false, measureAxis = "all", onBoundingBox }: { url: string } & Pick<Viewer3DProps, "measure" | "measureAxis" | "onBoundingBox">) {
   const geometry = useLoader(STLLoader, url) as BufferGeometry;
+
+  const bbox: BBox | null = useMemo(() => {
+    geometry.computeBoundingBox();
+    const box = geometry.boundingBox;
+    if (!box) return null;
+    const plain: BBox = { min: { x: box.min.x, y: box.min.y, z: box.min.z }, max: { x: box.max.x, y: box.max.y, z: box.max.z } };
+    return isValidBBox(plain) ? plain : null;
+  }, [geometry]);
+
+  // Report the measured box upward (and clear it on unload) so the DOM
+  // readout outside the canvas reflects exactly what the viewer shows.
+  useEffect(() => {
+    onBoundingBox?.(bbox);
+    return () => onBoundingBox?.(null);
+  }, [bbox, onBoundingBox]);
+
   return (
     <>
       <FitCamera geometry={geometry} />
       <mesh geometry={geometry}>
         <meshStandardMaterial color="#c9c9d4" />
       </mesh>
+      {measure && bbox ? <DimensionOverlay box={bbox} focus={measureAxis} /> : null}
     </>
   );
 }
 
 /** SDP §9 Preview: three.js orbit view of the server-authoritative mesh. */
-export function Viewer3D({ stlUrl, emptyMessage }: Viewer3DProps) {
+export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = "all", onBoundingBox }: Viewer3DProps) {
   if (!stlUrl) {
     return (
       <ViewerPlaceholder
@@ -126,7 +155,7 @@ export function Viewer3D({ stlUrl, emptyMessage }: Viewer3DProps) {
           <Canvas camera={{ position: [80, 80, 80], fov: 45 }}>
             <ambientLight intensity={0.6} />
             <directionalLight position={[100, 150, 100]} intensity={0.8} />
-            <StlMesh url={stlUrl} />
+            <StlMesh url={stlUrl} measure={measure} measureAxis={measureAxis} onBoundingBox={onBoundingBox} />
             <OrbitControls makeDefault enableDamping />
           </Canvas>
         </Suspense>
