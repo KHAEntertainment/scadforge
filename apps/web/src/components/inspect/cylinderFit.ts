@@ -359,8 +359,10 @@ type RobustFitOutcome =
  * *inside* the fit by more than `maxDeviationMm` and refits, until
  * stable (capped). The survivors are the polygon's own vertices — used
  * for segments, arc, center, diameter and hole/outside — and every
- * dropped point is then checked against the sagitta band computed from
- * that final, stable fit. A point outside by more than `maxDeviationMm`
+ * dropped point must lie on a polygon chord within the sagitta band of
+ * that final, stable fit. The survivors must also span the full axial
+ * extent; inward axial rings cannot be erased as seam noise.
+ * A point outside by more than `maxDeviationMm`
  * is never a chord point, so it fails immediately, on the spot. Ellipses
  * and tangent flats (slots) still fail: their residuals land outside the
  * circle somewhere, or a dropped point lands well past the sagitta band.
@@ -430,17 +432,55 @@ function fitCircleRobust(axis: Axis, vertices: readonly Vec3[]): RobustFitOutcom
 
   // Rule 4: every dropped point must be consistent with a chord point of
   // the FINAL kept-vertex circle — inside by no more than
-  // sagittaMm(radius, segments) + maxDeviationMm, and never outside it
+  // sagittaMm(radius, segments) + maxDeviationMm, on a polygon chord, and never outside it
   // (a chord point is never further out than the circle itself).
   const keptAngles = keptIndices.map((i) => Math.atan2(points2D[i][1] - fit.cy, points2D[i][0] - fit.cx));
   const segments = segmentsFromAngles(keptAngles);
   const sagittaBoundMm = sagittaMm(fit.radius, segments) + maxDeviationMm;
 
+  const polygonAngles = uniqueSortedAngles(keptAngles);
   for (const i of droppedIndices) {
     const [x, y] = points2D[i];
     const inwardMm = fit.radius - Math.hypot(x - fit.cx, y - fit.cy);
     if (inwardMm < 0 || inwardMm > sagittaBoundMm) {
       return { status: "not-circular", deviationMm: Math.abs(inwardMm) };
+    }
+
+    // A radial band alone also admits a smaller end ring of a frustum.
+    // A boolean seam must lie on the actual chord between adjacent
+    // retained polygon corners, not merely somewhere inside the circle.
+    const angle = Math.atan2(y - fit.cy, x - fit.cx);
+    let lo = 0;
+    let hi = polygonAngles.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (polygonAngles[mid] < angle) lo = mid + 1;
+      else hi = mid;
+    }
+    let a = polygonAngles[(lo + polygonAngles.length - 1) % polygonAngles.length];
+    let b = polygonAngles[lo % polygonAngles.length];
+    const gap = (b - a + TAU) % TAU;
+    const step = TAU / segments;
+    if (gap > 1.5 * step) {
+      // A boolean cut can truncate the terminal facet of a partial arc,
+      // leaving its other polygon corner outside the grown region. Extend
+      // only that one terminal facet, never the chord across the missing arc.
+      const fromA = (angle - a + TAU) % TAU;
+      const toB = (b - angle + TAU) % TAU;
+      if (Math.min(fromA, toB) > step) {
+        return { status: "not-circular", deviationMm: Math.abs(inwardMm) };
+      }
+      if (fromA < toB) b = a + step;
+      else a = b - step;
+    }
+    const ax = fit.cx + fit.radius * Math.cos(a);
+    const ay = fit.cy + fit.radius * Math.sin(a);
+    const dx = fit.radius * Math.cos(b) + fit.cx - ax;
+    const dy = fit.radius * Math.sin(b) + fit.cy - ay;
+    const t = Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)));
+    const chordDeviation = Math.hypot(x - ax - t * dx, y - ay - t * dy);
+    if (!Number.isFinite(chordDeviation) || chordDeviation > maxDeviationMm) {
+      return { status: "not-circular", deviationMm: Math.max(Math.abs(inwardMm), chordDeviation) };
     }
   }
 
@@ -451,8 +491,15 @@ function fitCircleRobust(axis: Axis, vertices: readonly Vec3[]): RobustFitOutcom
     if (deviation > maxDeviationOfKeptMm) maxDeviationOfKeptMm = deviation;
   }
 
-  const axialValues = keptIndices.map((i) => axialCoord(vertices[i], axis));
-  const axialMid = (Math.min(...axialValues) + Math.max(...axialValues)) / 2;
+  const axialValues = vertices.map((v) => axialCoord(v, axis));
+  const keptAxialValues = keptIndices.map((i) => axialCoord(vertices[i], axis));
+  const axialMin = Math.min(...axialValues);
+  const axialMax = Math.max(...axialValues);
+  const lostSpan = Math.max(Math.min(...keptAxialValues) - axialMin, axialMax - Math.max(...keptAxialValues));
+  if (lostSpan > maxDeviationMm) {
+    return { status: "not-circular", deviationMm: Math.max(...droppedIndices.map((i) => Math.abs(fit.radius - Math.hypot(points2D[i][0] - fit.cx, points2D[i][1] - fit.cy)))) };
+  }
+  const axialMid = (axialMin + axialMax) / 2;
 
   return {
     status: "fit",
@@ -504,7 +551,7 @@ export function evaluateCylinder(axis: Axis, vertices: readonly Vec3[], normals:
   }
 
   const surface = classifySurface(axis, keptVertices, keptNormals, fit.center);
-  const axialValues = keptVertices.map((v) => axialCoord(v, axis));
+  const axialValues = vertices.map((v) => axialCoord(v, axis));
   const axialLengthMm = Math.max(...axialValues) - Math.min(...axialValues);
 
   return {

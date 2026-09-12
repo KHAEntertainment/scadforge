@@ -1,14 +1,15 @@
 import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Canvas, useLoader, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
-import { Vector3, type BufferGeometry, type PerspectiveCamera } from "three";
+import { Raycaster, Vector2, Vector3, type Mesh, type BufferGeometry, type PerspectiveCamera } from "three";
 import { DimensionOverlay, type MeasureFocus } from "./DimensionOverlay.js";
 import { isValidBBox, type BBox } from "./measure.js";
 import { inspectSurface } from "./inspect/surfaceRegion.js";
 import { SurfaceHighlight } from "./inspect/SurfaceHighlight.js";
-import { INSPECTION_THRESHOLDS } from "./inspect/thresholds.js";
+import { useStlGeometry } from "./useStlGeometry.js";
+import { bindInspectionPointerEvents } from "./inspectionPointerEvents.js";
 import type { InspectionOutcome } from "./inspect/inspectionTypes.js";
+export { isInspectClick } from "./inspectionPointerEvents.js";
 
 export interface Viewer3DProps {
   /** HTTP path to the server-exported STL. `null` when no render has happened yet. */
@@ -48,24 +49,9 @@ export interface Viewer3DProps {
 }
 
 /**
- * A pointer whose travel between mouse-down and mouse-up is at most
- * `clickMaxDeltaPx` (r3f's `event.delta`) counts as a click, not a drag —
- * so orbiting the camera never selects a surface. Exported for direct
- * unit testing: the canvas itself can't run under jsdom, so this is the
- * one piece of the click-vs-drag decision worth pulling out and testing
- * on its own, the same way `measure.ts` carries `DimensionOverlay.tsx`'s
- * pure logic.
- */
-export function isInspectClick(deltaPx: number): boolean {
-  return deltaPx <= INSPECTION_THRESHOLDS.clickMaxDeltaPx;
-}
-
-/**
  * Whether a keydown event should clear the current inspection selection.
- * Pulled out and exported for the same reason as `isInspectClick`: a real
- * OS-level keypress can't be driven from automation, so this is the piece
- * of the Esc-clears logic a unit test can actually exercise — the S2-6
- * human walk covers the real keyboard end to end.
+ * Unit tests exercise this predicate; the native qualification walk
+ * covers the real keyboard end to end.
  */
 export function isEscapeKey(event: Pick<KeyboardEvent, "key">): boolean {
   return event.key === "Escape";
@@ -80,8 +66,8 @@ function ViewerPlaceholder({ message }: { message: string }) {
 }
 
 /**
- * `useLoader` throws (via Suspense) while pending and rejects the nearest
- * error boundary on failure — a plain try/catch cannot see either. This
+ * The geometry hook forwards an asynchronous load failure to this
+ * error boundary on the following render. This
  * boundary turns a failed/missing STL fetch into the same graceful
  * placeholder instead of crashing the viewer (Issue #18 self-check).
  */
@@ -153,21 +139,28 @@ function FitCamera({ geometry }: { geometry: BufferGeometry }) {
 }
 
 interface StlMeshProps {
-  url: string;
+  geometry: BufferGeometry;
   measure?: boolean;
   measureAxis?: MeasureFocus;
   onBoundingBox?: (box: BBox | null) => void;
   inspect?: boolean;
-  /** The current inspection outcome, owned by `Viewer3D` (so `onPointerMissed` on the sibling `<Canvas>` can clear it too). */
+  /** The current inspection outcome, owned by `Viewer3D` so empty-canvas gestures can clear it too. */
   outcome?: InspectionOutcome | null;
   /** A mesh click that passed the click-vs-drag check, with a hit triangle. */
   onSurfaceClick?: (geometry: BufferGeometry, faceIndex: number) => void;
   /** Fires once per loaded geometry (including the first), so any prior selection is dropped when the mesh changes underneath it. */
   onGeometryChange?: () => void;
+  onEmptyClick: () => void;
 }
 
-function StlMesh({ url, measure = false, measureAxis = "all", onBoundingBox, inspect = false, outcome = null, onSurfaceClick, onGeometryChange }: StlMeshProps) {
-  const geometry = useLoader(STLLoader, url) as BufferGeometry;
+function StlMesh({ url, ...props }: Omit<StlMeshProps, "geometry"> & { url: string }) {
+  const geometry = useStlGeometry(url);
+  return geometry ? <LoadedStlMesh geometry={geometry} {...props} /> : null;
+}
+
+function LoadedStlMesh({ geometry, measure = false, measureAxis = "all", onBoundingBox, inspect = false, outcome = null, onSurfaceClick, onGeometryChange, onEmptyClick }: StlMeshProps) {
+  const mesh = useRef<Mesh>(null);
+  const { camera, gl } = useThree();
 
   const bbox: BBox | null = useMemo(() => {
     geometry.computeBoundingBox();
@@ -190,19 +183,26 @@ function StlMesh({ url, measure = false, measureAxis = "all", onBoundingBox, ins
     onGeometryChange?.();
   }, [geometry, onGeometryChange]);
 
-  const handleClick = useCallback(
-    (event: ThreeEvent<MouseEvent>) => {
-      if (!isInspectClick(event.delta) || event.faceIndex == null) return;
-      event.stopPropagation();
-      onSurfaceClick?.(geometry, event.faceIndex);
-    },
-    [geometry, onSurfaceClick]
-  );
+  useEffect(() => {
+    if (!inspect) return;
+    const raycaster = new Raycaster();
+    const pointer = new Vector2();
+    return bindInspectionPointerEvents(gl.domElement, (event) => {
+      const bounds = gl.domElement.getBoundingClientRect();
+      if (!mesh.current || bounds.width <= 0 || bounds.height <= 0) return null;
+      pointer.set((event.clientX - bounds.left) / bounds.width * 2 - 1, -(event.clientY - bounds.top) / bounds.height * 2 + 1);
+      camera.updateMatrixWorld();
+      mesh.current.updateWorldMatrix(true, false);
+      raycaster.setFromCamera(pointer, camera);
+      return raycaster.intersectObject(mesh.current, false)[0]?.faceIndex ?? null;
+    }, (faceIndex) => onSurfaceClick?.(geometry, faceIndex), onEmptyClick);
+  }, [inspect, geometry, camera, gl, onSurfaceClick, onEmptyClick]);
 
   return (
     <>
       <FitCamera geometry={geometry} />
-      <mesh geometry={geometry} onClick={inspect ? handleClick : undefined}>
+      <mesh ref={mesh}>
+        <primitive object={geometry} attach="geometry" />
         <meshStandardMaterial color="#c9c9d4" />
       </mesh>
       {measure && bbox ? <DimensionOverlay box={bbox} focus={measureAxis} /> : null}
@@ -267,7 +267,7 @@ export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = 
     <div className="viewer-3d" data-testid="viewer-3d">
       <ViewerErrorBoundary>
         <Suspense fallback={<ViewerPlaceholder message="Loading model…" />}>
-          <Canvas camera={{ position: [80, 80, 80], fov: 45 }} onPointerMissed={inspect ? clearInspection : undefined}>
+          <Canvas camera={{ position: [80, 80, 80], fov: 45 }}>
             <ambientLight intensity={0.6} />
             <directionalLight position={[100, 150, 100]} intensity={0.8} />
             <StlMesh
@@ -279,6 +279,7 @@ export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = 
               outcome={outcome}
               onSurfaceClick={handleSurfaceClick}
               onGeometryChange={clearInspection}
+              onEmptyClick={clearInspection}
             />
             <OrbitControls makeDefault enableDamping />
           </Canvas>

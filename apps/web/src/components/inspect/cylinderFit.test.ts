@@ -293,6 +293,14 @@ describe("evaluateCylinder", () => {
 // S2-3 `@docker` fixture run: the clamp's outer ring (every wall) and its
 // wall-2 pipe bore (a screw hole breaking into it) both carry such seams.
 describe("evaluateCylinder — robust fit against boolean-seam vertices (S2-1 fixup 2)", () => {
+  it("refuses an inward axial ring even when retained rings still span the full height", () => {
+    const outer = fullRing("z", [0, 0], 20.05, 48, [0, 10]);
+    const inner = fullRing("z", [0, 0], 20, 48, [5, 5]);
+    const outcome = evaluateCylinder("z", [...outer.vertices, ...inner.vertices], [...outer.normals, ...inner.normals]);
+    expect(isRefusal(outcome)).toBe(true);
+    if (isRefusal(outcome)) expect(outcome.code).toBe("not-circular");
+  });
+
   it("recognizes a ring with extra seam vertices sitting exactly on facet chords, recovering the exact diameter and center", () => {
     const axis: Axis = "z";
     const fn = 48;
@@ -326,6 +334,8 @@ describe("evaluateCylinder — robust fit against boolean-seam vertices (S2-1 fi
       expect(outcome.evidence.segments).toBe(fn);
       expect(outcome.evidence.arcDegrees).toBe(360);
       expect(outcome.evidence.maxDeviationMm).toBeLessThan(1e-6);
+      expect(outcome.evidence.axialLengthMm).toBe(20);
+      expect(outcome.center.z).toBe(10);
     }
   });
 

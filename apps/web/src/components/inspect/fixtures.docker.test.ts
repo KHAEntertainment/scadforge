@@ -14,7 +14,7 @@
 // evals/surface-inspection/README.md's numbers were produced.
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -277,8 +277,28 @@ describe.skipIf(!dockerAvailable())("@docker S2-3 fixture inspection (clamp + hi
   }, 10 * 60_000);
 
   afterAll(async () => {
+    for (const geometry of geometries.values()) geometry.dispose();
     if (tmpRoot) await rm(tmpRoot, { recursive: true, force: true });
   });
+
+  it.each([0.02, 0.05, -0.05])("refuses every real-STL triangle of a shallow frustum (radius delta %s)", async (delta) => {
+    const source = join(tmpRoot, "frustum.scad");
+    await writeFile(source, "cylinder(h=10, r1=20+delta, r2=20, $fn=48);");
+    const workDir = join(tmpRoot, `frustum-${delta}`);
+    await mkdir(workDir);
+    const geometry = stlToGeometry(await renderToStl(source, { delta }, workDir));
+    try {
+      let walls = 0;
+      for (let face = 0; face < geometry.getAttribute("position").count / 3; face++) {
+        const outcome = inspectSurface(geometry, face);
+        expect(outcome.status).toBe("refused");
+        if (outcome.status === "refused" && outcome.refusal.code !== "planar") walls++;
+      }
+      expect(walls).toBe(96);
+    } finally {
+      geometry.dispose();
+    }
+  }, 120_000);
 
   describe("hinge", () => {
     for (const [sampleName, sample] of Object.entries(hingeExpected.samples)) {

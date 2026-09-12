@@ -146,6 +146,8 @@ function buildWeldedMesh(geometry: BufferGeometry): WeldedMesh {
   }
 
   const neighbors = buildAdjacency(triangles);
+  positionOnly.dispose();
+  welded.dispose();
   return { positions, triangles, faceNormals, neighbors };
 }
 
@@ -154,6 +156,11 @@ function getWeldedMesh(geometry: BufferGeometry): WeldedMesh {
   if (cached) return cached;
   const built = buildWeldedMesh(geometry);
   weldCache.set(geometry, built);
+  const release = () => {
+    weldCache.delete(geometry);
+    geometry.removeEventListener("dispose", release);
+  };
+  geometry.addEventListener("dispose", release);
   return built;
 }
 
