@@ -284,30 +284,211 @@ export function classifySurface(axis: Axis, vertices: readonly Vec3[], normals: 
   return radialDotSum < 0 ? "hole" : "outside";
 }
 
-function isFiniteFit(fit: { center: Vec3; radius: number; maxDeviationMm: number }): boolean {
-  return (
-    Number.isFinite(fit.radius) &&
-    Number.isFinite(fit.maxDeviationMm) &&
-    Number.isFinite(fit.center.x) &&
-    Number.isFinite(fit.center.y) &&
-    Number.isFinite(fit.center.z)
-  );
+/**
+ * Sagitta (mm): how far a regular polygon's straight facet CHORD dips
+ * inside its true circumscribed circle, for `segments` sides of
+ * circumradius `radius`. A boolean seam vertex (where another body meets
+ * the wall) lands somewhere on that chord, not on the circle itself — up
+ * to this far inside (S2-1 fixup 2).
+ */
+export function sagittaMm(radius: number, segments: number): number {
+  if (!Number.isFinite(radius) || !Number.isFinite(segments) || segments <= 0) return 0;
+  return radius * (1 - Math.cos(Math.PI / segments));
+}
+
+function isFiniteFit2D(fit: CircleFit2D): boolean {
+  return Number.isFinite(fit.cx) && Number.isFinite(fit.cy) && Number.isFinite(fit.radius);
+}
+
+/** Sorted, deduplicated angles (radians) — same epsilon/convention as `angularStepsDeg`'s dedup, factored out so the robust fit below can reuse it on raw 2D angles before any Vec3/axis plumbing exists for the kept subset. */
+function uniqueSortedAngles(angles: readonly number[]): number[] {
+  const sorted = [...angles].sort((a, b) => a - b);
+  const ANGLE_EPS = 1e-6;
+  const unique: number[] = [];
+  for (const angle of sorted) {
+    if (unique.length === 0 || angle - unique[unique.length - 1] > ANGLE_EPS) {
+      unique.push(angle);
+    }
+  }
+  return unique;
+}
+
+/** Full-circle-equivalent segment count from a raw set of angles (radians) — the same "360° ÷ median step" formula as `angularCoverage`, usable before the kept subset has been turned back into Vec3s. */
+function segmentsFromAngles(angles: readonly number[]): number {
+  const unique = uniqueSortedAngles(angles);
+  if (unique.length < 2) return unique.length;
+  const steps: number[] = [];
+  for (let i = 0; i < unique.length; i++) {
+    const next = unique[(i + 1) % unique.length];
+    const rawGap = i === unique.length - 1 ? next + TAU - unique[i] : next - unique[i];
+    steps.push(radToDeg(rawGap));
+  }
+  const medianStepDeg = median(steps);
+  return medianStepDeg > 0 ? Math.round(360 / medianStepDeg) : steps.length;
+}
+
+const MAX_ROBUST_FIT_ITERATIONS = 10;
+
+interface RobustFit {
+  center: Vec3;
+  radius: number;
+  /** Over the kept vertices only. */
+  maxDeviationMm: number;
+  /** Indices into the `vertices` array passed to `fitCircleRobust`. */
+  keptIndices: number[];
+}
+
+type RobustFitOutcome =
+  | { status: "fit"; fit: RobustFit }
+  /** Singular fit (collinear points) — evaluateCylinder treats this as a flat region. */
+  | { status: "degenerate" }
+  | { status: "not-circular"; deviationMm: number };
+
+/**
+ * Robust circle fit (S2-1 fixup 2, `tickets/s2-1-cylinder-fit/fixup-2`).
+ *
+ * The original assumption — every region vertex lies on the modeled
+ * circle — holds for the polygon's own vertices, but not for **seam
+ * vertices** a boolean operation adds where another body meets the wall
+ * (the clamp's ring meets its backplate at every wall value; at wall 2 a
+ * screw hole breaks into the bore). Those sit on the facet CHORD between
+ * two real vertices, up to `sagittaMm(radius, segments)` inside the true
+ * circle.
+ *
+ * Fits on everything, then repeatedly drops whichever kept point lies
+ * *inside* the fit by more than `maxDeviationMm` and refits, until
+ * stable (capped). The survivors are the polygon's own vertices — used
+ * for segments, arc, center, diameter and hole/outside — and every
+ * dropped point is then checked against the sagitta band computed from
+ * that final, stable fit. A point outside by more than `maxDeviationMm`
+ * is never a chord point, so it fails immediately, on the spot. Ellipses
+ * and tangent flats (slots) still fail: their residuals land outside the
+ * circle somewhere, or a dropped point lands well past the sagitta band.
+ */
+function fitCircleRobust(axis: Axis, vertices: readonly Vec3[]): RobustFitOutcome {
+  const maxDeviationMm = INSPECTION_THRESHOLDS.maxDeviationMm;
+  const points2D = vertices.map((v) => project2D(v, axis));
+
+  let keptIndices = vertices.map((_, i) => i);
+  const droppedIndices: number[] = [];
+  let fit = fitCircle2D(keptIndices.map((i) => points2D[i]));
+
+  // Converge the drop/refit cycle to a stable set FIRST (rules 1–2), and
+  // only THEN check the stable set for a genuine outside violation (rule
+  // 5). A seam that traces a whole intersection curve (not just one chord
+  // point — e.g. a screw hole boring straight through a ring wall) pulls
+  // the very first, unrefined fit toward its own noise; on that skewed
+  // fit, plenty of perfectly good polygon vertices can transiently read
+  // as "outside" even though nothing is actually wrong with them. Only a
+  // point that is STILL outside the fit once the inward-lying noise has
+  // been removed is a genuine defect (an ellipse still fails here: with
+  // its short-axis points removed as "inside", the long-axis points
+  // remain clearly outside the tightened fit).
+  for (let iter = 0; iter < MAX_ROBUST_FIT_ITERATIONS; iter++) {
+    if (!isFiniteFit2D(fit)) return { status: "degenerate" };
+
+    const stillKept: number[] = [];
+    const newlyDropped: number[] = [];
+    for (const i of keptIndices) {
+      const [x, y] = points2D[i];
+      const inwardMm = fit.radius - Math.hypot(x - fit.cx, y - fit.cy);
+      if (inwardMm > maxDeviationMm) newlyDropped.push(i);
+      else stillKept.push(i);
+    }
+
+    if (newlyDropped.length === 0) break; // stable: fit already matches keptIndices exactly
+
+    // Rule 6, checked before refitting on the reduced set so a
+    // near-degenerate remainder reports `not-circular`, never `planar`
+    // (a genuinely singular fitCircle2D call would say "degenerate").
+    const remainingAngles = stillKept.map((i) => Math.atan2(points2D[i][1] - fit.cy, points2D[i][0] - fit.cx));
+    if (uniqueSortedAngles(remainingAngles).length < 3) {
+      return { status: "not-circular", deviationMm: fit.maxDeviationMm };
+    }
+
+    droppedIndices.push(...newlyDropped);
+    keptIndices = stillKept;
+    fit = fitCircle2D(keptIndices.map((i) => points2D[i]));
+  }
+
+  if (!isFiniteFit2D(fit)) return { status: "degenerate" };
+
+  // Rule 5: a point OUTSIDE the now-stable fit by more than the limit is
+  // never a chord point (chords only ever sit inside), so it disqualifies
+  // the region — an ellipse, or any shape that isn't a circle plus inward
+  // seam noise, fails here even after every legitimately-inward point has
+  // already been dropped above.
+  let worstOutsideMm = 0;
+  for (const i of keptIndices) {
+    const [x, y] = points2D[i];
+    const inwardMm = fit.radius - Math.hypot(x - fit.cx, y - fit.cy);
+    if (inwardMm < -maxDeviationMm) worstOutsideMm = Math.max(worstOutsideMm, -inwardMm);
+  }
+  if (worstOutsideMm > 0) {
+    return { status: "not-circular", deviationMm: worstOutsideMm };
+  }
+
+  // Rule 4: every dropped point must be consistent with a chord point of
+  // the FINAL kept-vertex circle — inside by no more than
+  // sagittaMm(radius, segments) + maxDeviationMm, and never outside it
+  // (a chord point is never further out than the circle itself).
+  const keptAngles = keptIndices.map((i) => Math.atan2(points2D[i][1] - fit.cy, points2D[i][0] - fit.cx));
+  const segments = segmentsFromAngles(keptAngles);
+  const sagittaBoundMm = sagittaMm(fit.radius, segments) + maxDeviationMm;
+
+  for (const i of droppedIndices) {
+    const [x, y] = points2D[i];
+    const inwardMm = fit.radius - Math.hypot(x - fit.cx, y - fit.cy);
+    if (inwardMm < 0 || inwardMm > sagittaBoundMm) {
+      return { status: "not-circular", deviationMm: Math.abs(inwardMm) };
+    }
+  }
+
+  let maxDeviationOfKeptMm = 0;
+  for (const i of keptIndices) {
+    const [x, y] = points2D[i];
+    const deviation = Math.abs(Math.hypot(x - fit.cx, y - fit.cy) - fit.radius);
+    if (deviation > maxDeviationOfKeptMm) maxDeviationOfKeptMm = deviation;
+  }
+
+  const axialValues = keptIndices.map((i) => axialCoord(vertices[i], axis));
+  const axialMid = (Math.min(...axialValues) + Math.max(...axialValues)) / 2;
+
+  return {
+    status: "fit",
+    fit: {
+      center: unproject2D(fit.cx, fit.cy, axialMid, axis),
+      radius: fit.radius,
+      maxDeviationMm: maxDeviationOfKeptMm,
+      keptIndices
+    }
+  };
 }
 
 /**
  * Takes an axis and a region's vertices and normals, and returns a
  * `CylinderInspection` or a `Refusal` using the thresholds in
  * `thresholds.ts`. Check order is segments → arc → deviation, so the
- * reported reason is the most basic failure.
+ * reported reason is the most basic failure — computed from the ROBUST
+ * fit's kept vertices (S2-1 fixup 2), which excludes boolean-seam noise
+ * that the plain `fitCircleInPlane` fit would otherwise count against
+ * `maxDeviationMm`.
  */
 export function evaluateCylinder(axis: Axis, vertices: readonly Vec3[], normals: readonly Vec3[]): CylinderInspection | Refusal {
-  const fit = fitCircleInPlane(axis, vertices);
-  if (!isFiniteFit(fit)) {
+  const robust = fitCircleRobust(axis, vertices);
+  if (robust.status === "degenerate") {
     // A singular fit (collinear points in the plane) means a flat region.
     return planarRefusal();
   }
+  if (robust.status === "not-circular") {
+    return notCircularRefusal(robust.deviationMm);
+  }
 
-  const { arcDegrees, segments } = angularCoverage(axis, vertices, fit.center);
+  const { fit } = robust;
+  const keptVertices = fit.keptIndices.map((i) => vertices[i]);
+  const keptNormals = fit.keptIndices.map((i) => normals[i]);
+
+  const { arcDegrees, segments } = angularCoverage(axis, keptVertices, fit.center);
 
   if (segments < INSPECTION_THRESHOLDS.minSegments) {
     return tooCoarseRefusal(segments);
@@ -315,12 +496,15 @@ export function evaluateCylinder(axis: Axis, vertices: readonly Vec3[], normals:
   if (arcDegrees < INSPECTION_THRESHOLDS.minArcDegrees) {
     return partialArcRefusal(arcDegrees);
   }
+  // By construction every kept vertex is already within maxDeviationMm
+  // both ways; kept for defense-in-depth and to keep the documented check
+  // order (segments → arc → deviation) literally true in code.
   if (fit.maxDeviationMm > INSPECTION_THRESHOLDS.maxDeviationMm) {
     return notCircularRefusal(fit.maxDeviationMm);
   }
 
-  const surface = classifySurface(axis, vertices, normals, fit.center);
-  const axialValues = vertices.map((v) => axialCoord(v, axis));
+  const surface = classifySurface(axis, keptVertices, keptNormals, fit.center);
+  const axialValues = keptVertices.map((v) => axialCoord(v, axis));
   const axialLengthMm = Math.max(...axialValues) - Math.min(...axialValues);
 
   return {

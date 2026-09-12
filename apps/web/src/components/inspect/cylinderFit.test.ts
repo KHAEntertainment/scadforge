@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Axis, Vec3 } from "../measure.js";
-import { angularCoverage, classifySurface, evaluateCylinder, fitCircleInPlane } from "./cylinderFit.js";
+import { angularCoverage, classifySurface, evaluateCylinder, fitCircleInPlane, sagittaMm } from "./cylinderFit.js";
 import { INSPECTION_THRESHOLDS } from "./thresholds.js";
 import type { Refusal } from "./inspectionTypes.js";
 
@@ -283,6 +283,87 @@ describe("evaluateCylinder", () => {
     if (isRefusal(outcome)) {
       expect(outcome.code).toBe("planar");
       expect(outcome.message).toBe("This is a flat surface. Surface inspection measures cylindrical walls only.");
+    }
+  });
+});
+
+// S2-1 fixup 2 (tickets/s2-1-cylinder-fit/fixup-2): boolean seams — where
+// another body meets the wall — add vertices that sit on the facet CHORD
+// between two real polygon vertices, not on the circle itself. Found by the
+// S2-3 `@docker` fixture run: the clamp's outer ring (every wall) and its
+// wall-2 pipe bore (a screw hole breaking into it) both carry such seams.
+describe("evaluateCylinder — robust fit against boolean-seam vertices (S2-1 fixup 2)", () => {
+  it("recognizes a ring with extra seam vertices sitting exactly on facet chords, recovering the exact diameter and center", () => {
+    const axis: Axis = "z";
+    const fn = 48;
+    const radius = 20;
+    const { vertices, normals } = fullRing(axis, [0, 0], radius, fn, [0, 20]);
+
+    // Simulated boolean seam: extra vertices at several angular midpoints
+    // between adjacent real vertices (i.e. on the facet chord), at the
+    // sagitta depth, across a handful of axial rows in between the two
+    // real ones -- exactly the shape a body intersecting the wall leaves.
+    const sagitta = sagittaMm(radius, fn);
+    const seamVertices: Vec3[] = [];
+    const seamNormals: Vec3[] = [];
+    for (const facetIndex of [3, 10, 25, 40]) {
+      const midAngle = ((facetIndex + 0.5) / fn) * TAU;
+      const cos = Math.cos(midAngle);
+      const sin = Math.sin(midAngle);
+      const chordRadius = radius - sagitta;
+      for (const axial of [3, 9, 15]) {
+        seamVertices.push(fromUV(axis, chordRadius * cos, chordRadius * sin, axial));
+        seamNormals.push(fromUV(axis, cos, sin, 0));
+      }
+    }
+
+    const outcome = evaluateCylinder(axis, [...vertices, ...seamVertices], [...normals, ...seamNormals]);
+    expect(isRefusal(outcome)).toBe(false);
+    if (!isRefusal(outcome)) {
+      expect(outcome.diameterMm).toBeCloseTo(radius * 2, 6);
+      expect(outcome.center.x).toBeCloseTo(0, 6);
+      expect(outcome.center.y).toBeCloseTo(0, 6);
+      expect(outcome.evidence.segments).toBe(fn);
+      expect(outcome.evidence.arcDegrees).toBe(360);
+      expect(outcome.evidence.maxDeviationMm).toBeLessThan(1e-6);
+    }
+  });
+
+  it("refuses not-circular immediately when a single vertex sits 0.02mm outside the fit (rule 5)", () => {
+    const axis: Axis = "z";
+    const fn = 48;
+    const radius = 20;
+    const { vertices, normals } = fullRing(axis, [0, 0], radius, fn, [0, 20]);
+
+    const pushed = vertices.map((v) => ({ ...v }));
+    const angle = Math.atan2(pushed[0].y, pushed[0].x);
+    const pushedRadius = radius + 0.02; // comfortably past maxDeviationMm (0.01)
+    pushed[0] = { x: pushedRadius * Math.cos(angle), y: pushedRadius * Math.sin(angle), z: pushed[0].z };
+
+    const outcome = evaluateCylinder(axis, pushed, normals);
+    expect(isRefusal(outcome)).toBe(true);
+    if (isRefusal(outcome)) {
+      expect(outcome.code).toBe("not-circular");
+    }
+  });
+
+  it("refuses not-circular when a dropped vertex lies inside by more than the sagitta band (rule 4)", () => {
+    const axis: Axis = "z";
+    const fn = 48;
+    const radius = 20;
+    const { vertices, normals } = fullRing(axis, [0, 0], radius, fn, [0, 20]);
+
+    const sagitta = sagittaMm(radius, fn);
+    const tooDeepMm = sagitta + INSPECTION_THRESHOLDS.maxDeviationMm + 0.01; // clearly past the allowed band
+    const pushed = vertices.map((v) => ({ ...v }));
+    const angle = Math.atan2(pushed[0].y, pushed[0].x);
+    const pushedRadius = radius - tooDeepMm;
+    pushed[0] = { x: pushedRadius * Math.cos(angle), y: pushedRadius * Math.sin(angle), z: pushed[0].z };
+
+    const outcome = evaluateCylinder(axis, pushed, normals);
+    expect(isRefusal(outcome)).toBe(true);
+    if (isRefusal(outcome)) {
+      expect(outcome.code).toBe("not-circular");
     }
   });
 });
