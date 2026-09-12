@@ -22,6 +22,8 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { cursor: no
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 
 .app { min-height: 100dvh; display: flex; flex-direction: column; background: #fff; }
+/* Bound the desktop workspace so a readout takes space from the canvas. */
+@media (min-width: 901px) { .app { height: 100dvh; } }
 .studio-header { min-height: 56px; display: flex; align-items: center; gap: 16px; padding: 8px 16px; border-bottom: 1px solid var(--border); background: #fff; }
 .brand-lockup { display: flex; align-items: center; gap: 8px; min-width: 132px; font-size: 16px; font-weight: 600; white-space: nowrap; }
 .brand-mark { display: grid; place-items: center; width: 28px; height: 28px; background: var(--blue); color: #fff; font-size: 11px; letter-spacing: -.04em; }
