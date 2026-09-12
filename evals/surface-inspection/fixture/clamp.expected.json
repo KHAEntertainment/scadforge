@@ -52,7 +52,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 32,
             "center": [
               0,
@@ -79,7 +79,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 36,
             "center": [
               0,
@@ -106,10 +106,10 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
-              -20,
+              -19,
               -9,
               0
             ]
@@ -133,10 +133,10 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
-              -20,
+              -19,
               9,
               0
             ]
@@ -230,7 +230,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 32,
             "center": [
               0,
@@ -257,7 +257,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 40,
             "center": [
               0,
@@ -284,10 +284,10 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
-              -22,
+              -21,
               -10,
               0
             ]
@@ -311,10 +311,10 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
-              -22,
+              -21,
               10,
               0
             ]
@@ -408,7 +408,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 32,
             "center": [
               0,
@@ -435,7 +435,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 44,
             "center": [
               0,
@@ -462,10 +462,10 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
-              -24,
+              -23,
               -11,
               0
             ]
@@ -489,10 +489,10 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
-              -24,
+              -23,
               11,
               0
             ]

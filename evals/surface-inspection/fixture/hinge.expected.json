@@ -49,7 +49,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 3,
             "center": [
               -16,
@@ -76,7 +76,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 3,
             "center": [
               0,
@@ -103,7 +103,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 3,
             "center": [
               16,
@@ -130,7 +130,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 6,
             "center": [
               -16,
@@ -157,7 +157,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 6,
             "center": [
               0,
@@ -184,7 +184,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 6,
             "center": [
               16,
@@ -211,7 +211,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 4,
             "center": [
               -12,
@@ -242,8 +242,8 @@
           }
         },
         {
-          "feature": "hex_boss",
-          "description": "Hex boss flat face ($fn = 6)",
+          "feature": "hex_boss_slanted",
+          "description": "Hex boss slanted face ($fn = 6), normal at 30deg — not axis-aligned",
           "ray": {
             "origin": [
               11.6603,
@@ -260,6 +260,27 @@
             "status": "refused",
             "code": "too-coarse",
             "message": "This curve has only 6 segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it."
+          }
+        },
+        {
+          "feature": "hex_boss_axis_aligned",
+          "description": "Hex boss face ($fn = 6) whose normal is exactly +Y — refuses at axis selection, before polygon detection",
+          "ray": {
+            "origin": [
+              0,
+              5.4641,
+              11
+            ],
+            "direction": [
+              0,
+              -1,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
           }
         },
         {
@@ -347,7 +368,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
               -16,
@@ -374,7 +395,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
               0,
@@ -401,7 +422,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 4.5,
             "center": [
               16,
@@ -428,7 +449,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 8.5,
             "center": [
               -16,
@@ -455,7 +476,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 8.5,
             "center": [
               0,
@@ -482,7 +503,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 8.5,
             "center": [
               16,
@@ -509,7 +530,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 4,
             "center": [
               -12,
@@ -540,8 +561,8 @@
           }
         },
         {
-          "feature": "hex_boss",
-          "description": "Hex boss flat face ($fn = 6)",
+          "feature": "hex_boss_slanted",
+          "description": "Hex boss slanted face ($fn = 6), normal at 30deg — not axis-aligned",
           "ray": {
             "origin": [
               11.6603,
@@ -558,6 +579,27 @@
             "status": "refused",
             "code": "too-coarse",
             "message": "This curve has only 6 segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it."
+          }
+        },
+        {
+          "feature": "hex_boss_axis_aligned",
+          "description": "Hex boss face ($fn = 6) whose normal is exactly +Y — refuses at axis selection, before polygon detection",
+          "ray": {
+            "origin": [
+              0,
+              5.4641,
+              11
+            ],
+            "direction": [
+              0,
+              -1,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
           }
         },
         {
@@ -645,7 +687,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 6,
             "center": [
               -16,
@@ -672,7 +714,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 6,
             "center": [
               0,
@@ -699,7 +741,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 6,
             "center": [
               16,
@@ -726,7 +768,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 13,
             "center": [
               -16,
@@ -753,7 +795,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 13,
             "center": [
               0,
@@ -780,7 +822,7 @@
           "expected": {
             "status": "recognized",
             "surface": "outside",
-            "axis": "X",
+            "axis": "x",
             "diameterMm": 13,
             "center": [
               16,
@@ -807,7 +849,7 @@
           "expected": {
             "status": "recognized",
             "surface": "hole",
-            "axis": "Z",
+            "axis": "z",
             "diameterMm": 4,
             "center": [
               -12,
@@ -838,8 +880,8 @@
           }
         },
         {
-          "feature": "hex_boss",
-          "description": "Hex boss flat face ($fn = 6)",
+          "feature": "hex_boss_slanted",
+          "description": "Hex boss slanted face ($fn = 6), normal at 30deg — not axis-aligned",
           "ray": {
             "origin": [
               11.6603,
@@ -856,6 +898,27 @@
             "status": "refused",
             "code": "too-coarse",
             "message": "This curve has only 6 segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it."
+          }
+        },
+        {
+          "feature": "hex_boss_axis_aligned",
+          "description": "Hex boss face ($fn = 6) whose normal is exactly +Y — refuses at axis selection, before polygon detection",
+          "ray": {
+            "origin": [
+              0,
+              5.4641,
+              11
+            ],
+            "direction": [
+              0,
+              -1,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
           }
         },
         {
