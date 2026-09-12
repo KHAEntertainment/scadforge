@@ -13,7 +13,7 @@ import { BufferGeometry } from "three";
 import { mergeVertices } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { Axis, Vec3 } from "../measure.js";
 import { INSPECTION_THRESHOLDS } from "./thresholds.js";
-import { evaluateCylinder } from "./cylinderFit.js";
+import { angularStepsDeg, evaluateCylinder, fitCircleInPlane } from "./cylinderFit.js";
 import { notAxisAlignedRefusal, planarRefusal, tooCoarseRefusal } from "./refusals.js";
 import type { InspectionOutcome } from "./inspectionTypes.js";
 
@@ -179,24 +179,20 @@ function selectAxis(normal: Vec3): AxisSelection {
  * Grow the region of edge-adjacent triangles starting at `seedTriangle`,
  * admitting a neighbor only if its normal stays perpendicular to `axis`
  * (within `maxAxialNormalComponent`) and its angle to the triangle it
- * was reached from is at most `maxFacetStepDeg`. Growth naturally stops
- * at end caps (normal no longer perpendicular to the axis), sharp edges
+ * was reached from is at most `maxStepDeg`. Growth naturally stops at
+ * end caps (normal no longer perpendicular to the axis), sharp edges
  * (angle too large) and boolean seams (the far side's normal fails
  * either check) — no special-casing needed for any of them.
  *
- * Also reports the smallest angle of any neighbor that was otherwise
- * perpendicular to the axis but rejected purely for exceeding
- * `maxFacetStepDeg` — evidence of a coarser polygon just beyond the
- * region's edge (a hex boss's 60° facet-to-facet step, say). `null`
- * means growth exhausted every axis-perpendicular neighbor without ever
- * hitting that ceiling, i.e. the region's boundary is a genuine
- * end/cap/seam, not a step too coarse to admit.
+ * `maxStepDeg` is a parameter, not always `maxFacetStepDeg`: the
+ * coarse-polygon probe below re-runs this same growth with a wider
+ * angle ceiling to test for a coarser regular polygon once the normal
+ * (31°) region has already come back flat.
  */
-function growRegion(mesh: WeldedMesh, seedTriangle: number, axis: Axis): { triangles: number[]; minRejectedStepDeg: number | null } {
+function growRegion(mesh: WeldedMesh, seedTriangle: number, axis: Axis, maxStepDeg: number): number[] {
   const threshold = INSPECTION_THRESHOLDS.maxAxialNormalComponent;
   const visited = new Set<number>([seedTriangle]);
   const queue: number[] = [seedTriangle];
-  let minRejectedStepDeg: number | null = null;
 
   while (queue.length > 0) {
     const current = queue.shift() as number;
@@ -205,17 +201,31 @@ function growRegion(mesh: WeldedMesh, seedTriangle: number, axis: Axis): { trian
       if (visited.has(neighbor)) continue;
       const neighborNormal = mesh.faceNormals[neighbor];
       if (Math.abs(vecAxis(neighborNormal, axis)) > threshold) continue;
-      const step = angleBetweenDeg(currentNormal, neighborNormal);
-      if (step > INSPECTION_THRESHOLDS.maxFacetStepDeg) {
-        if (minRejectedStepDeg === null || step < minRejectedStepDeg) minRejectedStepDeg = step;
-        continue;
-      }
+      if (angleBetweenDeg(currentNormal, neighborNormal) > maxStepDeg) continue;
       visited.add(neighbor);
       queue.push(neighbor);
     }
   }
 
-  return { triangles: Array.from(visited), minRejectedStepDeg };
+  return Array.from(visited);
+}
+
+function median(values: readonly number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+/** Distinct facet normal directions in the region (pairwise-clustered, not exact-equality, since floats), used to tell "several distinct facets" apart from "one flat facet sampled repeatedly". */
+function distinctNormalCount(mesh: WeldedMesh, regionTriangles: readonly number[]): number {
+  const CLUSTER_DEG = 0.5;
+  const uniqueNormals: Vec3[] = [];
+  for (const t of regionTriangles) {
+    const normal = mesh.faceNormals[t];
+    const isDuplicate = uniqueNormals.some((u) => angleBetweenDeg(u, normal) < CLUSTER_DEG);
+    if (!isDuplicate) uniqueNormals.push(normal);
+  }
+  return uniqueNormals.length;
 }
 
 /** The largest pairwise angle (degrees) between any two triangles' normals in the region. */
@@ -258,6 +268,42 @@ function regionVerticesAndNormals(mesh: WeldedMesh, regionTriangles: readonly nu
 }
 
 /**
+ * Reached only when the normal (31°) region came back flat. A flat
+ * region is ambiguous on its own: it could be a genuinely flat surface
+ * (a chamfer strip), or it could be one facet — or a few — of a coarser
+ * regular polygon whose next facet was rejected by `maxFacetStepDeg`
+ * (a hex boss's 60° step, an octagon's 45°). Re-growing from the same
+ * seed with a wider angle ceiling (`coarseProbeMaxStepDeg`) settles
+ * which: if what comes back is a genuine regular polygon — several
+ * distinct facets, its vertices fit a circle, and every angular step
+ * around that circle is close to the median (an irregular shape like a
+ * chamfered box corner alternates long and short steps) — refuse
+ * `too-coarse` with the segment count from that fit. Otherwise the
+ * region really is flat: refuse `planar`.
+ */
+function coarsePolygonOrPlanar(mesh: WeldedMesh, seedTriangle: number, axis: Axis): InspectionOutcome {
+  const probeTriangles = growRegion(mesh, seedTriangle, axis, INSPECTION_THRESHOLDS.coarseProbeMaxStepDeg);
+
+  if (distinctNormalCount(mesh, probeTriangles) >= 3) {
+    const { vertices: probeVertices } = regionVerticesAndNormals(mesh, probeTriangles);
+    const fit = fitCircleInPlane(axis, probeVertices);
+    const fitIsFinite = Number.isFinite(fit.radius) && Number.isFinite(fit.maxDeviationMm) && Number.isFinite(fit.center.x) && Number.isFinite(fit.center.y) && Number.isFinite(fit.center.z);
+
+    if (fitIsFinite && fit.maxDeviationMm <= INSPECTION_THRESHOLDS.maxDeviationMm) {
+      const steps = angularStepsDeg(axis, probeVertices, fit.center);
+      const medianStepDeg = median(steps);
+      const isRegular = steps.every((step) => Math.abs(step - medianStepDeg) <= INSPECTION_THRESHOLDS.coarseProbeStepToleranceDeg);
+
+      if (isRegular && medianStepDeg > 0) {
+        return { status: "refused", refusal: tooCoarseRefusal(Math.round(360 / medianStepDeg)) };
+      }
+    }
+  }
+
+  return { status: "refused", refusal: planarRefusal() };
+}
+
+/**
  * From a clicked triangle on the displayed STL geometry, to a
  * recognized cylinder or a refusal. Synchronous and pure with respect
  * to its inputs; the only state is the weld/adjacency cache, built
@@ -276,26 +322,13 @@ export function inspectSurface(geometry: BufferGeometry, triangleIndex: number):
   }
 
   const axis = selection.axis;
-  const { triangles: regionTriangleIndices, minRejectedStepDeg } = growRegion(mesh, triangleIndex, axis);
-
-  // Growth was blocked by a facet step too coarse to admit (not by
-  // running out of axis-perpendicular neighbors): that is itself
-  // evidence of a polygonal prism, not a flat surface. Refusing
-  // too-coarse here, before the circle fit, matters because a region
-  // this small (often just the seed facet, i.e. two points once
-  // projected) makes the fit singular -- indistinguishable, to the fit
-  // alone, from a genuinely flat region.
-  if (minRejectedStepDeg !== null) {
-    const estimatedSegments = Math.round(360 / minRejectedStepDeg);
-    if (estimatedSegments < INSPECTION_THRESHOLDS.minSegments) {
-      return { status: "refused", refusal: tooCoarseRefusal(estimatedSegments) };
-    }
-  }
+  const regionTriangleIndices = growRegion(mesh, triangleIndex, axis, INSPECTION_THRESHOLDS.maxFacetStepDeg);
 
   if (normalSpreadDeg(mesh, regionTriangleIndices) < INSPECTION_THRESHOLDS.maxFacetStepDeg) {
-    // The region's normals barely vary -- a flat or chamfered strip
-    // that happens to be perpendicular to an axis, not a curved wall.
-    return { status: "refused", refusal: planarRefusal() };
+    // Flat at the normal growth threshold -- ambiguous between a
+    // genuine flat surface and a coarser polygon whose next facet this
+    // threshold correctly excluded. The probe settles it.
+    return coarsePolygonOrPlanar(mesh, triangleIndex, axis);
   }
 
   const { vertices, normals } = regionVerticesAndNormals(mesh, regionTriangleIndices);

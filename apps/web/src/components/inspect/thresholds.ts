@@ -18,7 +18,22 @@ export const INSPECTION_THRESHOLDS = {
   /** Minimum arc coverage (degrees) to confirm a cylindrical feature; partial arcs below this are deferred (D5). */
   minArcDegrees: 180,
   /** Maximum circle-fit deviation (mm) before facets are judged not circular. Catches ellipses and tangent flats (slots). */
-  maxDeviationMm: 0.01
+  maxDeviationMm: 0.01,
+  /**
+   * Coordinator-added (S2-2 fixup 1). Angular step admitted while
+   * probing a flat 31°-region for a coarser regular polygon (a hex
+   * boss, an octagon), tried only after the normal growth threshold
+   * already found the region flat. Admits 5+ sided regular polygons
+   * (up to 72°); excludes 90° box corners.
+   */
+  coarseProbeMaxStepDeg: 75,
+  /**
+   * Coordinator-added (S2-2 fixup 1). How close every vertex-to-vertex
+   * angular step in a coarse-polygon probe region must be to the median
+   * step to call it a regular polygon rather than an irregular shape
+   * (e.g. a chamfered box corner's alternating long/short steps).
+   */
+  coarseProbeStepToleranceDeg: 1
 } as const;
 
 export type InspectionThresholds = typeof INSPECTION_THRESHOLDS;

@@ -152,6 +152,22 @@ function conePatch(fn: number, baseRadius: number, height: number): Tri[] {
   return tris;
 }
 
+/** Extrudes a closed 2D outline (in order, wrapping) into a side wall between z0 and z1. */
+function extrudeOutline(outline: readonly [number, number][], z0: number, z1: number): Tri[] {
+  const tris: Tri[] = [];
+  for (let i = 0; i < outline.length; i++) {
+    const [x0, y0] = outline[i];
+    const [x1, y1] = outline[(i + 1) % outline.length];
+    const p0: Point = [x0, y0, z0];
+    const p1: Point = [x1, y1, z0];
+    const p2: Point = [x1, y1, z1];
+    const p3: Point = [x0, y0, z1];
+    tris.push([p0, p1, p2]);
+    tris.push([p0, p2, p3]);
+  }
+  return tris;
+}
+
 /**
  * A stadium (two semicircular arcs joined by two straight tangent
  * flats) outline, extruded into a side wall between z0 and z1. The
@@ -172,19 +188,55 @@ function stadiumWall(arcRadius: number, halfLength: number, arcStepDeg: number, 
     const rad = (deg * Math.PI) / 180;
     outline.push([-halfLength + arcRadius * Math.cos(rad), arcRadius * Math.sin(rad)]);
   }
+  return extrudeOutline(outline, z0, z1);
+}
 
-  const tris: Tri[] = [];
-  for (let i = 0; i < outline.length; i++) {
-    const [x0, y0] = outline[i];
-    const [x1, y1] = outline[(i + 1) % outline.length];
-    const p0: Point = [x0, y0, z0];
-    const p1: Point = [x1, y1, z0];
-    const p2: Point = [x1, y1, z1];
-    const p3: Point = [x0, y0, z1];
-    tris.push([p0, p1, p2]);
-    tris.push([p0, p2, p3]);
-  }
-  return tris;
+/**
+ * A box's side wall with equal 45° chamfers cut on all four vertical
+ * edges -- an irregular octagon-like outline: each vertex-to-vertex
+ * angular span alternates between a short chamfer and a long main
+ * face, unlike a true regular octagon's uniform steps.
+ */
+function chamferedBoxWall(half: number, chamfer: number, z0: number, z1: number): Tri[] {
+  const h = half;
+  const c = chamfer;
+  const outline: [number, number][] = [
+    [h - c, h],
+    [h, h - c],
+    [h, -(h - c)],
+    [h - c, -h],
+    [-(h - c), -h],
+    [-h, -(h - c)],
+    [-h, h - c],
+    [-(h - c), h]
+  ];
+  return extrudeOutline(outline, z0, z1);
+}
+
+/**
+ * A near-complete ring (all but one facet) unioned with a flat box
+ * face that shares only the vertical edge at angle 0 with the ring,
+ * extending outward in a direction unrelated to the ring's local
+ * radial or tangent direction there -- a realistic "cylinder meets a
+ * flat box wall parallel to the axis" seam, at a seam angle well past
+ * `maxFacetStepDeg`.
+ */
+function ringWithAxialBoxSeam(fn: number, radius: number, z0: number, z1: number): { tris: Tri[]; wallCount: number } {
+  const wallTris = ringWall(fn, radius, z0, z1, { coveredFacets: fn - 1 });
+  // The ring's own facet nearest this edge (facet 0, spanning angle 0
+  // to 360/fn) has a radial normal near angle 0. Shifting the box
+  // face's far edge to -Y gives it a normal near angle 180 -- a seam
+  // of roughly 176°, comfortably past both maxFacetStepDeg (31°) and
+  // the ticket's stated 60° floor.
+  const v0z0: Point = [radius, 0, z0];
+  const v0z1: Point = [radius, 0, z1];
+  const far0: Point = [radius, -radius, z0];
+  const far1: Point = [radius, -radius, z1];
+  const boxTris: Tri[] = [
+    [v0z0, far0, far1],
+    [v0z0, far1, v0z1]
+  ];
+  return { tris: [...wallTris, ...boxTris], wallCount: wallTris.length };
 }
 
 function expectRecognized(outcome: ReturnType<typeof inspectSurface>) {
@@ -240,11 +292,66 @@ describe("inspectSurface", () => {
     expect(refusal.code).toBe("planar");
   });
 
-  it("refuses too-coarse for a hex prism, whose 60° facet-to-facet step exceeds the growth threshold", () => {
+  it("refuses too-coarse for a hex prism, whose 60° facet-to-facet step exceeds the growth threshold -- via the coarse-polygon probe, not the normal fit", () => {
     const geometry = buildSTLLikeGeometry(ringWall(6, 10, 0, 10));
     const refusal = expectRefused(inspectSurface(geometry, 0));
     expect(refusal.code).toBe("too-coarse");
     expect(refusal.message).toContain("only 6 segments");
+  });
+
+  it("refuses planar for a hex prism's own cap, whose normal is along the axis (not a coarse-polygon case at all)", () => {
+    const fn = 6;
+    const wall = ringWall(fn, 10, 0, 10);
+    const cap = diskCap(fn, 10, 10);
+    const geometry = buildSTLLikeGeometry([...wall, ...cap]);
+    const refusal = expectRefused(inspectSurface(geometry, wall.length));
+    expect(refusal.code).toBe("planar");
+  });
+
+  it("refuses too-coarse for a regular octagon (45° steps)", () => {
+    const geometry = buildSTLLikeGeometry(ringWall(8, 10, 0, 10));
+    const refusal = expectRefused(inspectSurface(geometry, 0));
+    expect(refusal.code).toBe("too-coarse");
+    expect(refusal.message).toContain("only 8 segments");
+  });
+
+  it("refuses too-coarse for a regular 11-gon", () => {
+    const geometry = buildSTLLikeGeometry(ringWall(11, 10, 0, 10));
+    const refusal = expectRefused(inspectSurface(geometry, 0));
+    expect(refusal.code).toBe("too-coarse");
+    expect(refusal.message).toContain("only 11 segments");
+  });
+
+  it("refuses planar for a box with four 45° vertical-edge chamfers, seeded on a chamfer -- an irregular polygon (alternating steps), not a coarse regular one", () => {
+    const geometry = buildSTLLikeGeometry(chamferedBoxWall(10, 1, 0, 10));
+    // Outline edge 0 is a chamfer (see chamferedBoxWall); its 2 triangles are indices 0-1.
+    const refusal = expectRefused(inspectSurface(geometry, 0));
+    expect(refusal.code).toBe("planar");
+  });
+
+  it("recognizes a cylinder unioned with a box face parallel to the axis, at a seam well past maxFacetStepDeg: the failing case the coarse-polygon probe must not misfire on", () => {
+    const fn = 48;
+    const radius = 20;
+    const { tris, wallCount } = ringWithAxialBoxSeam(fn, radius, 0, 15);
+    const geometry = buildSTLLikeGeometry(tris);
+
+    // The seam is at least 60°, as the fixup requires -- facet 0 (the
+    // ring facet sharing the box face's edge, at angle 0) vs. the box
+    // face's own normal.
+    const ringFacetNormal = faceNormalArr(...tris[0]);
+    const boxFaceNormal = faceNormalArr(...tris[wallCount]);
+    const dot = ringFacetNormal[0] * boxFaceNormal[0] + ringFacetNormal[1] * boxFaceNormal[1] + ringFacetNormal[2] * boxFaceNormal[2];
+    const seamAngleDeg = (Math.acos(Math.min(1, Math.max(-1, dot))) * 180) / Math.PI;
+    expect(seamAngleDeg).toBeGreaterThanOrEqual(60);
+
+    // Seed away from the seam so growth has to walk toward it.
+    const outcome = inspectSurface(geometry, Math.floor(wallCount / 2));
+    const inspection = expectRecognized(outcome);
+    expect(inspection.diameterMm).toBeCloseTo(radius * 2, 2);
+    if (outcome.status === "recognized") {
+      expect(outcome.regionTriangles.length).toBe(wallCount);
+      for (const t of outcome.regionTriangles) expect(t).toBeLessThan(wallCount);
+    }
   });
 
   it("refuses not-circular for a stadium slot: tangent flats join both arcs into one region that doesn't fit a circle", () => {

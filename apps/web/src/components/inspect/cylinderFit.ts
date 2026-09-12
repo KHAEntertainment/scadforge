@@ -196,21 +196,16 @@ export function fitCircleInPlane(axis: Axis, vertices: readonly Vec3[]): { cente
 }
 
 /**
- * Arc coverage and the full-circle-equivalent segment count (360° ÷
- * median angular step) — so a partial arc of a 48-segment cylinder
- * still reports 48. Near-duplicate angles (the same angular position
- * sampled at multiple axial rows) are deduplicated before gaps are
- * measured.
- *
- * Arc coverage: from vertices alone, a covered facet step can't be
- * told apart from a genuinely missing one, so a fully closed ring
- * (whose "largest gap" between adjacent vertices is otherwise just its
- * own uniform facet step) is detected by comparing the largest gap
- * against the median step. Largest gap ≤ 1.5 × median → closed ring,
- * `arcDegrees = 360`. Otherwise the largest gap is a genuine missing
- * arc: `arcDegrees = 360 − largest gap`.
+ * Sorted angular steps (degrees) between consecutive vertices, deduped
+ * and measured circularly around `center` in the plane perpendicular to
+ * `axis` — the raw building block `angularCoverage` derives arc
+ * coverage and segment count from, exposed for other callers that need
+ * the per-step values directly (the surface-region coarse-polygon
+ * probe checks every step against the median, not just the largest).
+ * Near-duplicate angles (the same angular position sampled at multiple
+ * axial rows) are deduplicated first.
  */
-export function angularCoverage(axis: Axis, vertices: readonly Vec3[], center: Vec3): { arcDegrees: number; segments: number } {
+export function angularStepsDeg(axis: Axis, vertices: readonly Vec3[], center: Vec3): number[] {
   const [ccx, ccy] = project2D(center, axis);
 
   const angles = vertices
@@ -226,9 +221,7 @@ export function angularCoverage(axis: Axis, vertices: readonly Vec3[], center: V
     }
   }
 
-  if (uniqueAngles.length < 2) {
-    return { arcDegrees: 0, segments: uniqueAngles.length };
-  }
+  if (uniqueAngles.length < 2) return [];
 
   const stepsDeg: number[] = [];
   for (let i = 0; i < uniqueAngles.length; i++) {
@@ -236,12 +229,36 @@ export function angularCoverage(axis: Axis, vertices: readonly Vec3[], center: V
     const rawGap = i === uniqueAngles.length - 1 ? next + TAU - uniqueAngles[i] : next - uniqueAngles[i];
     stepsDeg.push(radToDeg(rawGap));
   }
+  return stepsDeg;
+}
+
+/**
+ * Arc coverage and the full-circle-equivalent segment count (360° ÷
+ * median angular step) — so a partial arc of a 48-segment cylinder
+ * still reports 48.
+ *
+ * Arc coverage: from vertices alone, a covered facet step can't be
+ * told apart from a genuinely missing one, so a fully closed ring
+ * (whose "largest gap" between adjacent vertices is otherwise just its
+ * own uniform facet step) is detected by comparing the largest gap
+ * against the median step. Largest gap ≤ 1.5 × median → closed ring,
+ * `arcDegrees = 360`. Otherwise the largest gap is a genuine missing
+ * arc: `arcDegrees = 360 − largest gap`.
+ */
+export function angularCoverage(axis: Axis, vertices: readonly Vec3[], center: Vec3): { arcDegrees: number; segments: number } {
+  const stepsDeg = angularStepsDeg(axis, vertices, center);
+  if (stepsDeg.length === 0) {
+    // Fewer than 2 distinct angular positions -- not enough data for a
+    // step. Unreachable via evaluateCylinder (a fit this degenerate is
+    // already caught as a singular fit), kept defensive for direct callers.
+    return { arcDegrees: 0, segments: 0 };
+  }
 
   const largestGapDeg = Math.max(...stepsDeg);
   const medianStepDeg = median(stepsDeg);
   const isClosedRing = largestGapDeg <= 1.5 * medianStepDeg;
   const arcDegrees = isClosedRing ? 360 : 360 - largestGapDeg;
-  const segments = medianStepDeg > 0 ? Math.round(360 / medianStepDeg) : uniqueAngles.length;
+  const segments = medianStepDeg > 0 ? Math.round(360 / medianStepDeg) : stepsDeg.length;
 
   return { arcDegrees, segments };
 }
