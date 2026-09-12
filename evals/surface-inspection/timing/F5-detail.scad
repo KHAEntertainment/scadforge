@@ -1,0 +1,1 @@
+w=80; quality=96; difference(){hull(){for(x=[4,w-4],y=[4,46])translate([x,y,0])cylinder(r=4,h=30,$fn=quality);}translate([2,2,2])cube([w-4,46,29]);for(x=[10:10:50])translate([x,25,-1])cylinder(d=4,h=4,$fn=quality);}
