@@ -1,0 +1,906 @@
+{
+  "fixture": "evals/surface-inspection/fixture/hinge.scad",
+  "renderedWith": {
+    "image": "docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7",
+    "backend": "Manifold",
+    "version": "2026.01.19 (git e43242666)"
+  },
+  "toleranceMm": 0.01,
+  "notes": "Rays verified with three's STLLoader + Raycaster against the real STL for each sample (see evals/surface-inspection/README.md). diameterMm/center are the exact closed-form modeled values, not the raycast hit distance (which reads slightly low due to $fn facet-chord error, well under the 0.01mm tolerance) — the recognizer's own circle fit is over polygon VERTICES, which sit exactly on the modeled circle, so it should match these values directly.",
+  "samples": {
+    "low": {
+      "params": {
+        "pin_d": 3,
+        "knuckle_wall": 1.5
+      },
+      "meshValidation": {
+        "components": 1,
+        "volume_mm3": 5660.8811,
+        "bbox": {
+          "min": [
+            -21,
+            -16,
+            0
+          ],
+          "max": [
+            21,
+            5,
+            14
+          ]
+        },
+        "genus": 5
+      },
+      "rays": [
+        {
+          "feature": "knuckle_bore_x-16",
+          "description": "Knuckle bore (through knuckle at x=-16)",
+          "ray": {
+            "origin": [
+              -16,
+              2,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 3,
+            "center": [
+              -16,
+              2,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_bore_x0",
+          "description": "Knuckle bore (through knuckle at x=0)",
+          "ray": {
+            "origin": [
+              0,
+              2,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 3,
+            "center": [
+              0,
+              2,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_bore_x16",
+          "description": "Knuckle bore (through knuckle at x=16)",
+          "ray": {
+            "origin": [
+              16,
+              2,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 3,
+            "center": [
+              16,
+              2,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x-16",
+          "description": "Knuckle outside surface (at x=-16)",
+          "ray": {
+            "origin": [
+              -16,
+              12.3823,
+              11.8236
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 6,
+            "center": [
+              -16,
+              2,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x0",
+          "description": "Knuckle outside surface (at x=0)",
+          "ray": {
+            "origin": [
+              0,
+              12.3823,
+              11.8236
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 6,
+            "center": [
+              0,
+              2,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x16",
+          "description": "Knuckle outside surface (at x=16)",
+          "ray": {
+            "origin": [
+              16,
+              12.3823,
+              11.8236
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 6,
+            "center": [
+              16,
+              2,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "countersink_straight",
+          "description": "Countersink straight cylindrical wall (below the cone)",
+          "ray": {
+            "origin": [
+              -12,
+              -8,
+              2.5
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "Z",
+            "diameterMm": 4,
+            "center": [
+              -12,
+              -8,
+              2.5
+            ]
+          }
+        },
+        {
+          "feature": "countersink_cone",
+          "description": "Countersink cone (tilted wall above the straight bore)",
+          "ray": {
+            "origin": [
+              -12,
+              -8,
+              6.5
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "not-axis-aligned",
+            "message": "This surface isn't a cylinder aligned with the X, Y or Z axis."
+          }
+        },
+        {
+          "feature": "hex_boss",
+          "description": "Hex boss flat face ($fn = 6)",
+          "ray": {
+            "origin": [
+              11.6603,
+              -1.2679,
+              11
+            ],
+            "direction": [
+              -0.866025,
+              -0.5,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "too-coarse",
+            "message": "This curve has only 6 segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it."
+          }
+        },
+        {
+          "feature": "stadium_slot",
+          "description": "Stadium slot wall (left round end, tangent-continuous into the flats)",
+          "ray": {
+            "origin": [
+              -1.5836,
+              -15.2218,
+              4
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "not-circular",
+            "message": "These facets don't fit a single circle, so no diameter is shown."
+          }
+        },
+        {
+          "feature": "leaf_top_face",
+          "description": "Leaf flat top face, away from every other feature",
+          "ray": {
+            "origin": [
+              -19,
+              -2,
+              18
+            ],
+            "direction": [
+              0,
+              0,
+              -1
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        }
+      ]
+    },
+    "mid": {
+      "params": {
+        "pin_d": 4.5,
+        "knuckle_wall": 2
+      },
+      "meshValidation": {
+        "components": 1,
+        "volume_mm3": 6229.1841,
+        "bbox": {
+          "min": [
+            -21,
+            -16,
+            -0.25
+          ],
+          "max": [
+            21,
+            7.5,
+            14
+          ]
+        },
+        "genus": 5
+      },
+      "rays": [
+        {
+          "feature": "knuckle_bore_x-16",
+          "description": "Knuckle bore (through knuckle at x=-16)",
+          "ray": {
+            "origin": [
+              -16,
+              3.25,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 4.5,
+            "center": [
+              -16,
+              3.25,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_bore_x0",
+          "description": "Knuckle bore (through knuckle at x=0)",
+          "ray": {
+            "origin": [
+              0,
+              3.25,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 4.5,
+            "center": [
+              0,
+              3.25,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_bore_x16",
+          "description": "Knuckle bore (through knuckle at x=16)",
+          "ray": {
+            "origin": [
+              16,
+              3.25,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 4.5,
+            "center": [
+              16,
+              3.25,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x-16",
+          "description": "Knuckle outside surface (at x=-16)",
+          "ray": {
+            "origin": [
+              -16,
+              14.6306,
+              12.5759
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 8.5,
+            "center": [
+              -16,
+              3.25,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x0",
+          "description": "Knuckle outside surface (at x=0)",
+          "ray": {
+            "origin": [
+              0,
+              14.6306,
+              12.5759
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 8.5,
+            "center": [
+              0,
+              3.25,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x16",
+          "description": "Knuckle outside surface (at x=16)",
+          "ray": {
+            "origin": [
+              16,
+              14.6306,
+              12.5759
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 8.5,
+            "center": [
+              16,
+              3.25,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "countersink_straight",
+          "description": "Countersink straight cylindrical wall (below the cone)",
+          "ray": {
+            "origin": [
+              -12,
+              -8,
+              2.5
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "Z",
+            "diameterMm": 4,
+            "center": [
+              -12,
+              -8,
+              2.5
+            ]
+          }
+        },
+        {
+          "feature": "countersink_cone",
+          "description": "Countersink cone (tilted wall above the straight bore)",
+          "ray": {
+            "origin": [
+              -12,
+              -8,
+              6.5
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "not-axis-aligned",
+            "message": "This surface isn't a cylinder aligned with the X, Y or Z axis."
+          }
+        },
+        {
+          "feature": "hex_boss",
+          "description": "Hex boss flat face ($fn = 6)",
+          "ray": {
+            "origin": [
+              11.6603,
+              -1.2679,
+              11
+            ],
+            "direction": [
+              -0.866025,
+              -0.5,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "too-coarse",
+            "message": "This curve has only 6 segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it."
+          }
+        },
+        {
+          "feature": "stadium_slot",
+          "description": "Stadium slot wall (left round end, tangent-continuous into the flats)",
+          "ray": {
+            "origin": [
+              -1.5836,
+              -15.2218,
+              4
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "not-circular",
+            "message": "These facets don't fit a single circle, so no diameter is shown."
+          }
+        },
+        {
+          "feature": "leaf_top_face",
+          "description": "Leaf flat top face, away from every other feature",
+          "ray": {
+            "origin": [
+              -19,
+              -2,
+              18
+            ],
+            "direction": [
+              0,
+              0,
+              -1
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        }
+      ]
+    },
+    "high": {
+      "params": {
+        "pin_d": 6,
+        "knuckle_wall": 3.5
+      },
+      "meshValidation": {
+        "components": 1,
+        "volume_mm3": 8104.7415,
+        "bbox": {
+          "min": [
+            -21,
+            -16,
+            -2.5
+          ],
+          "max": [
+            21,
+            12,
+            14
+          ]
+        },
+        "genus": 5
+      },
+      "rays": [
+        {
+          "feature": "knuckle_bore_x-16",
+          "description": "Knuckle bore (through knuckle at x=-16)",
+          "ray": {
+            "origin": [
+              -16,
+              5.5,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 6,
+            "center": [
+              -16,
+              5.5,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_bore_x0",
+          "description": "Knuckle bore (through knuckle at x=0)",
+          "ray": {
+            "origin": [
+              0,
+              5.5,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 6,
+            "center": [
+              0,
+              5.5,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_bore_x16",
+          "description": "Knuckle bore (through knuckle at x=16)",
+          "ray": {
+            "origin": [
+              16,
+              5.5,
+              4
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "X",
+            "diameterMm": 6,
+            "center": [
+              16,
+              5.5,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x-16",
+          "description": "Knuckle outside surface (at x=-16)",
+          "ray": {
+            "origin": [
+              -16,
+              18.6775,
+              13.9299
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 13,
+            "center": [
+              -16,
+              5.5,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x0",
+          "description": "Knuckle outside surface (at x=0)",
+          "ray": {
+            "origin": [
+              0,
+              18.6775,
+              13.9299
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 13,
+            "center": [
+              0,
+              5.5,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "knuckle_outside_x16",
+          "description": "Knuckle outside surface (at x=16)",
+          "ray": {
+            "origin": [
+              16,
+              18.6775,
+              13.9299
+            ],
+            "direction": [
+              0,
+              -0.798636,
+              -0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "X",
+            "diameterMm": 13,
+            "center": [
+              16,
+              5.5,
+              4
+            ]
+          }
+        },
+        {
+          "feature": "countersink_straight",
+          "description": "Countersink straight cylindrical wall (below the cone)",
+          "ray": {
+            "origin": [
+              -12,
+              -8,
+              2.5
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "Z",
+            "diameterMm": 4,
+            "center": [
+              -12,
+              -8,
+              2.5
+            ]
+          }
+        },
+        {
+          "feature": "countersink_cone",
+          "description": "Countersink cone (tilted wall above the straight bore)",
+          "ray": {
+            "origin": [
+              -12,
+              -8,
+              6.5
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "not-axis-aligned",
+            "message": "This surface isn't a cylinder aligned with the X, Y or Z axis."
+          }
+        },
+        {
+          "feature": "hex_boss",
+          "description": "Hex boss flat face ($fn = 6)",
+          "ray": {
+            "origin": [
+              11.6603,
+              -1.2679,
+              11
+            ],
+            "direction": [
+              -0.866025,
+              -0.5,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "too-coarse",
+            "message": "This curve has only 6 segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it."
+          }
+        },
+        {
+          "feature": "stadium_slot",
+          "description": "Stadium slot wall (left round end, tangent-continuous into the flats)",
+          "ray": {
+            "origin": [
+              -1.5836,
+              -15.2218,
+              4
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "not-circular",
+            "message": "These facets don't fit a single circle, so no diameter is shown."
+          }
+        },
+        {
+          "feature": "leaf_top_face",
+          "description": "Leaf flat top face, away from every other feature",
+          "ray": {
+            "origin": [
+              -19,
+              -2,
+              18
+            ],
+            "direction": [
+              0,
+              0,
+              -1
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        }
+      ]
+    }
+  }
+}
