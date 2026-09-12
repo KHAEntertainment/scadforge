@@ -10,7 +10,9 @@ gate, not tuned against.
 | File | What it is |
 | --- | --- |
 | `F5-detail.scad` | The S0 "F5" fixture, copied byte-for-byte from the spike worktree (see verification below) |
+| `stress-plate.scad` | Hand-authored large mesh (~105k triangles) — the fixture-derived meshes only cover 1,000–2,400 triangles |
 | `measure-inspect.mjs` | Renders every timing sample with the pinned OpenSCAD image and times `inspectSurface` |
+| `ts-loader.mjs` | Tiny Node ESM resolution hook the harness needs to import `apps/web`'s TS sources directly (see "Why `--experimental-strip-types`..." below) |
 
 ## `F5-detail.scad` provenance and hash verification
 
@@ -74,6 +76,47 @@ no overrides) as the single F5 timing sample — it already is both "F5 at
 its default" and the highest-triangle-count variant S0 recorded for it.
 `w` does not affect triangle count, so a second width-only render would add
 no new timing information.
+
+## `stress-plate.scad`
+
+Every fixture-derived mesh (clamp, hinge, F5) renders to 1,000–2,400
+triangles, so on its own the timing table only covers small meshes. This is
+a hand-authored plate with a `hole_cols × hole_rows` grid of `$fn = 48`
+through-holes plus a `boss_cols × boss_rows` grid of cylindrical bosses
+(offset by half a hole pitch so no boss centers on a hole), sized (by
+rendering and checking, not by a formula — CSG boolean seams add real
+facets beyond a naive `features × $fn` estimate) to land at **104,972
+triangles**, one solid, comfortably inside the requested 80k–120k band.
+
+## Results (this machine: darwin arm64, Apple M1 Pro ×10, Node v26.7.0, three 0.169.0)
+
+| mesh | triangles | 1st-click median | 1st-click max | budget (≤100ms) | later median | later p95 | budget (≤16ms) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| clamp/wall2 | 1,198 | ~4–13ms | ~13ms | PASS | <1ms | ~1–1.3ms | PASS |
+| clamp/wall4 | 1,118 | ~3ms | ~3.4ms | PASS | <1ms | <1ms | PASS |
+| clamp/wall6 | 1,070 | ~2–4ms | ~2.6–6.3ms | PASS | <1ms | <1ms | PASS |
+| hinge/low | 1,616 | ~3–8ms | ~4–10ms | PASS | <1ms | <1ms | PASS |
+| hinge/mid | 1,632 | ~3–10ms | ~7–22ms | PASS | <1ms | ~1.5ms | PASS |
+| hinge/high | 1,648 | ~2–12ms | ~3–25ms | PASS | <1ms | <1ms | PASS |
+| F5-detail (default) | 2,352 | ~5–17ms | ~6–39ms | PASS | <1ms | ~1–2ms | PASS |
+| **stress-plate** | **104,972** | **~350–460ms** | **~430–570ms** | **MISS (3.5–5.7×)** | <1ms | <1ms | PASS |
+
+Ranges reflect real run-to-run variance on this laptop (see the note
+below) across several independent process runs, not a single sample. Every
+small mesh passes both budgets comfortably; `stress-plate` reliably misses
+the first-click budget by 3.5–5.7×, reproducibly across 3 separate runs —
+unlike the one F5 spike noted below, this is real, load-bearing data, not
+noise.
+
+Rough weld-vs-rest split on the stress-plate miss (weld measured
+independently — see `timeWeldOnly` in `measure-inspect.mjs` — as a proxy
+for `inspectSurface`'s own internal weld, not exported for this timing
+script to call directly; "rest" is adjacency + region growth + circle fit,
+inferred as the remainder): weld alone is already ~100–115ms — at or past
+the *entire* 100ms budget by itself — with region growth/adjacency/fit
+adding another ~150–345ms on top. No optimization was attempted (out of
+scope for this ticket); this data point is what an optimization ticket
+would need to start from.
 
 ## Running
 

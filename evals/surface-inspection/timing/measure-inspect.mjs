@@ -26,6 +26,7 @@ const WEB_ROOT = join(REPO_ROOT, "apps/web");
 const HINGE_SCAD = join(REPO_ROOT, "evals/surface-inspection/fixture/hinge.scad");
 const CLAMP_SCAD = join(REPO_ROOT, "evals/scenario-a2/fixture/clamp.scad");
 const F5_SCAD = join(__dirname, "F5-detail.scad");
+const STRESS_SCAD = join(__dirname, "stress-plate.scad");
 const OPENSCAD_IMAGE = "docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7";
 
 const { BufferGeometry, DoubleSide, Mesh, MeshBasicMaterial, Raycaster, Vector3 } = await import(
@@ -158,6 +159,58 @@ function f5Rays() {
   return rays;
 }
 
+// ---------------------------------------------------------------------------
+// stress-plate rays: same rationale as F5's (a stress mesh needs timing
+// only, no expected-results file). Picked directly from stress-plate.scad's
+// own grid formulas (plate_len=260, plate_wid=170, hole_margin=12,
+// hole_cols=26, hole_rows=20, boss_cols=5, boss_rows=3, offset by half a
+// hole pitch) — 3 holes (a corner, a middle one, a far one) plus 2 bosses,
+// all at 37deg (not a multiple of the $fn=48 facet step, 7.5deg).
+// ---------------------------------------------------------------------------
+function stressPlateRays() {
+  const rad = (deg) => (deg * Math.PI) / 180;
+  const cos = Math.cos(rad(37));
+  const sin = Math.sin(rad(37));
+
+  const plateLen = 260;
+  const plateWid = 170;
+  const plateThick = 6;
+  const holeMargin = 12;
+  const holeCols = 26;
+  const holeRows = 20;
+  const holePitchX = (plateLen - 2 * holeMargin) / (holeCols - 1);
+  const holePitchY = (plateWid - 2 * holeMargin) / (holeRows - 1);
+  const bossCols = 5;
+  const bossPitchX = (plateLen - 2 * holeMargin) / (bossCols - 1);
+  const bossPitchY = (plateWid - 2 * holeMargin) / (3 - 1);
+  const bossOffsetX = holePitchX / 2;
+  const bossOffsetY = holePitchY / 2;
+
+  const holeXY = (i, j) => [-plateLen / 2 + holeMargin + i * holePitchX, -plateWid / 2 + holeMargin + j * holePitchY];
+  const bossXY = (i, j) => [-plateLen / 2 + holeMargin + bossOffsetX + i * bossPitchX, -plateWid / 2 + holeMargin + bossOffsetY + j * bossPitchY];
+
+  const rays = [];
+  const holeSpecs = [
+    { name: "corner", ij: [0, 0] },
+    { name: "mid", ij: [13, 10] },
+    { name: "far", ij: [20, 5] }
+  ];
+  for (const spec of holeSpecs) {
+    const [x, y] = holeXY(...spec.ij);
+    rays.push({ feature: `hole_${spec.name}`, origin: [x, y, plateThick / 2], direction: [cos, sin, 0] });
+  }
+  const bossSpecs = [
+    { name: "1", ij: [0, 0] },
+    { name: "2", ij: [2, 1] }
+  ];
+  for (const spec of bossSpecs) {
+    const [x, y] = bossXY(...spec.ij);
+    const standoff = 15;
+    rays.push({ feature: `boss_${spec.name}`, origin: [x + standoff * cos, y + standoff * sin, 10], direction: [-cos, -sin, 0] });
+  }
+  return rays;
+}
+
 async function loadExpectedRays(fixturePath) {
   const data = JSON.parse(await readFile(fixturePath, "utf8"));
   const bySample = {};
@@ -248,6 +301,7 @@ async function main() {
       results.push(await measureSample(`hinge/${sampleName}`, HINGE_SCAD, sample.params, sample.rays, tmpRoot));
     }
     results.push(await measureSample("F5-detail (default)", F5_SCAD, {}, f5Rays(), tmpRoot));
+    results.push(await measureSample("stress-plate", STRESS_SCAD, {}, stressPlateRays(), tmpRoot));
   } finally {
     await rm(tmpRoot, { recursive: true, force: true });
   }
