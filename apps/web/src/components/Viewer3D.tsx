@@ -153,9 +153,10 @@ interface StlMeshProps {
   onEmptyClick: () => void;
 }
 
-function StlMesh({ url, ...props }: Omit<StlMeshProps, "geometry"> & { url: string }) {
+/** Keep pending feedback in the DOM until the active request publishes a mesh. */
+export function StlModel({ url, children }: { url: string; children: (geometry: BufferGeometry) => ReactNode }) {
   const geometry = useStlGeometry(url);
-  return geometry ? <LoadedStlMesh geometry={geometry} {...props} /> : null;
+  return geometry ? children(geometry) : <ViewerPlaceholder message="Loading model…" />;
 }
 
 function LoadedStlMesh({ geometry, measure = false, measureAxis = "all", onBoundingBox, inspect = false, outcome = null, onSurfaceClick, onGeometryChange, onEmptyClick }: StlMeshProps) {
@@ -267,22 +268,24 @@ export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = 
     <div className="viewer-3d" data-testid="viewer-3d">
       <ViewerErrorBoundary>
         <Suspense fallback={<ViewerPlaceholder message="Loading model…" />}>
-          <Canvas camera={{ position: [80, 80, 80], fov: 45 }}>
-            <ambientLight intensity={0.6} />
-            <directionalLight position={[100, 150, 100]} intensity={0.8} />
-            <StlMesh
-              url={stlUrl}
-              measure={measure}
-              measureAxis={measureAxis}
-              onBoundingBox={onBoundingBox}
-              inspect={inspect}
-              outcome={outcome}
-              onSurfaceClick={handleSurfaceClick}
-              onGeometryChange={clearInspection}
-              onEmptyClick={clearInspection}
-            />
-            <OrbitControls makeDefault enableDamping />
-          </Canvas>
+          <StlModel url={stlUrl}>{(geometry) => (
+            <Canvas camera={{ position: [80, 80, 80], fov: 45 }}>
+              <ambientLight intensity={0.6} />
+              <directionalLight position={[100, 150, 100]} intensity={0.8} />
+              <LoadedStlMesh
+                geometry={geometry}
+                measure={measure}
+                measureAxis={measureAxis}
+                onBoundingBox={onBoundingBox}
+                inspect={inspect}
+                outcome={outcome}
+                onSurfaceClick={handleSurfaceClick}
+                onGeometryChange={clearInspection}
+                onEmptyClick={clearInspection}
+              />
+              <OrbitControls makeDefault enableDamping />
+            </Canvas>
+          )}</StlModel>
         </Suspense>
       </ViewerErrorBoundary>
     </div>
