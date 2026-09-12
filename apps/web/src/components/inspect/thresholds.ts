@@ -33,7 +33,13 @@ export const INSPECTION_THRESHOLDS = {
    * step to call it a regular polygon rather than an irregular shape
    * (e.g. a chamfered box corner's alternating long/short steps).
    */
-  coarseProbeStepToleranceDeg: 1
+  coarseProbeStepToleranceDeg: 1,
+  /**
+   * S2-4. A pointer whose travel between down and up is at most this
+   * many pixels (r3f's `event.delta`) counts as a click, not a drag --
+   * so orbiting the camera never selects a surface.
+   */
+  clickMaxDeltaPx: 4
 } as const;
 
 export type InspectionThresholds = typeof INSPECTION_THRESHOLDS;
