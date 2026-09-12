@@ -45,21 +45,27 @@ describe("refusals", () => {
     });
   });
 
-  it("notCircularRefusal fills {dev} with the max deviation, formatMm-style", () => {
+  it("notCircularRefusal fills {dev} with 3 decimals, not formatMm's one decimal", () => {
+    // A deviation just over the 0.01 mm limit: formatMm(0.0123) would
+    // round to "0" mm, misleadingly reading as an exact circle.
+    expect(notCircularRefusal(0.0123)).toEqual({
+      code: "not-circular",
+      message: "These facets don't fit a single circle (off by up to 0.012 mm), so no diameter is shown."
+    });
     expect(notCircularRefusal(0.5)).toEqual({
       code: "not-circular",
-      message: "These facets don't fit a single circle (off by up to 0.5 mm), so no diameter is shown."
+      message: "These facets don't fit a single circle (off by up to 0.500 mm), so no diameter is shown."
     });
   });
 
   it("every builder's message equals the scope text once its placeholder is filled", () => {
-    const cases: { built: { code: string; message: string }; template: string; value: number }[] = [
-      { built: tooCoarseRefusal(6), template: "This curve has only {n} segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it.", value: 6 },
-      { built: partialArcRefusal(150), template: "Only {deg}° of this curve is present — too little to confirm a cylindrical feature.", value: 150 },
-      { built: notCircularRefusal(0.12), template: "These facets don't fit a single circle (off by up to {dev} mm), so no diameter is shown.", value: 0.12 }
+    const cases: { built: { code: string; message: string }; template: string; value: number; formatted: string }[] = [
+      { built: tooCoarseRefusal(6), template: "This curve has only {n} segments — too few to tell a cylinder from a polygonal prism. Raise $fn for this feature to inspect it.", value: 6, formatted: formatMm(6) },
+      { built: partialArcRefusal(150), template: "Only {deg}° of this curve is present — too little to confirm a cylindrical feature.", value: 150, formatted: formatMm(150) },
+      { built: notCircularRefusal(0.12), template: "These facets don't fit a single circle (off by up to {dev} mm), so no diameter is shown.", value: 0.12, formatted: (0.12).toFixed(3) }
     ];
-    for (const { built, template, value } of cases) {
-      const expected = template.replace(/\{(n|deg|dev)\}/, formatMm(value));
+    for (const { built, template, formatted } of cases) {
+      const expected = template.replace(/\{(n|deg|dev)\}/, formatted);
       expect(built.message).toBe(expected);
     }
   });

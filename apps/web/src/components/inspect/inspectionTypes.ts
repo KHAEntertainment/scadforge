@@ -18,7 +18,7 @@ import type { Axis, Vec3 } from "../measure.js";
 export interface CylinderEvidence {
   /** Full-circle equivalent: 360° ÷ median angular step between adjacent vertices. */
   segments: number;
-  /** 360 − largest angular gap. */
+  /** 360 if the largest angular gap ≤ 1.5 × median step (closed ring), else 360 − largest gap. */
   arcDegrees: number;
   /** max | |p − c| − r | over region vertices, in mm. */
   maxDeviationMm: number;

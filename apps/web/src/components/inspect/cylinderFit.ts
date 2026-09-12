@@ -14,7 +14,7 @@
 
 import type { Axis, Vec3 } from "../measure.js";
 import { INSPECTION_THRESHOLDS } from "./thresholds.js";
-import { notCircularRefusal, partialArcRefusal, tooCoarseRefusal } from "./refusals.js";
+import { notCircularRefusal, partialArcRefusal, planarRefusal, tooCoarseRefusal } from "./refusals.js";
 import type { CylinderInspection, Refusal } from "./inspectionTypes.js";
 
 const TAU = Math.PI * 2;
@@ -96,8 +96,32 @@ interface CircleFit2D {
  * circle, the system is consistent and this recovers the circle exactly
  * (to float tolerance) — the property the "exact for points on a
  * circle" acceptance criterion depends on.
+ *
+ * The normal equations are built on points centered at their centroid
+ * (added back afterward): building them on raw coordinates is
+ * ill-conditioned for a small feature far from the origin (e.g. a
+ * Ø 4.5 hole at (150, 150)), where x²+y² dwarfs the terms that carry
+ * the actual circle shape.
+ *
+ * A singular system (collinear points — a flat region) or any
+ * non-finite fitted value yields `cx`/`cy`/`radius`/`maxDeviationMm`
+ * all `NaN`; `evaluateCylinder` treats that as a degenerate, flat
+ * region and refuses `planar`.
  */
 function fitCircle2D(points: readonly [number, number][]): CircleFit2D {
+  const n = points.length;
+  const NON_FINITE_FIT: CircleFit2D = { cx: NaN, cy: NaN, radius: NaN, maxDeviationMm: NaN };
+  if (n === 0) return NON_FINITE_FIT;
+
+  let meanX = 0;
+  let meanY = 0;
+  for (const [x, y] of points) {
+    meanX += x;
+    meanY += y;
+  }
+  meanX /= n;
+  meanY /= n;
+
   let sx = 0;
   let sy = 0;
   let sxx = 0;
@@ -106,9 +130,10 @@ function fitCircle2D(points: readonly [number, number][]): CircleFit2D {
   let sxz = 0;
   let syz = 0;
   let sz = 0;
-  const n = points.length;
 
-  for (const [x, y] of points) {
+  for (const [px, py] of points) {
+    const x = px - meanX;
+    const y = py - meanY;
     const z = -(x * x + y * y);
     sx += x;
     sy += y;
@@ -129,16 +154,27 @@ function fitCircle2D(points: readonly [number, number][]): CircleFit2D {
   // z = -(x²+y²): the right-hand side is M^T z = [sxz, syz, sz], already
   // carrying z's sign — do not re-negate here.
   const b = [sxz, syz, sz] as const;
+
+  const det = determinant3(A);
+  if (!Number.isFinite(det) || det === 0) return NON_FINITE_FIT;
+
   const [D, E, F] = solve3x3(A, b);
 
-  const cx = -D / 2;
-  const cy = -E / 2;
-  const radius = Math.sqrt(Math.max(cx * cx + cy * cy - F, 0));
+  // Center relative to the centroid, then shifted back to the original frame.
+  const cxLocal = -D / 2;
+  const cyLocal = -E / 2;
+  const radius = Math.sqrt(Math.max(cxLocal * cxLocal + cyLocal * cyLocal - F, 0));
+  const cx = cxLocal + meanX;
+  const cy = cyLocal + meanY;
 
   let maxDeviationMm = 0;
   for (const [x, y] of points) {
     const deviation = Math.abs(Math.hypot(x - cx, y - cy) - radius);
     if (deviation > maxDeviationMm) maxDeviationMm = deviation;
+  }
+
+  if (!Number.isFinite(cx) || !Number.isFinite(cy) || !Number.isFinite(radius) || !Number.isFinite(maxDeviationMm)) {
+    return NON_FINITE_FIT;
   }
 
   return { cx, cy, radius, maxDeviationMm };
@@ -160,12 +196,19 @@ export function fitCircleInPlane(axis: Axis, vertices: readonly Vec3[]): { cente
 }
 
 /**
- * Arc coverage (360° − largest angular gap between adjacent vertices,
- * measured around `center`) and the full-circle-equivalent segment
- * count (360° ÷ median angular step) — so a partial arc of a
- * 48-segment cylinder still reports 48. Near-duplicate angles (the same
- * angular position sampled at multiple axial rows) are deduplicated
- * before gaps are measured.
+ * Arc coverage and the full-circle-equivalent segment count (360° ÷
+ * median angular step) — so a partial arc of a 48-segment cylinder
+ * still reports 48. Near-duplicate angles (the same angular position
+ * sampled at multiple axial rows) are deduplicated before gaps are
+ * measured.
+ *
+ * Arc coverage: from vertices alone, a covered facet step can't be
+ * told apart from a genuinely missing one, so a fully closed ring
+ * (whose "largest gap" between adjacent vertices is otherwise just its
+ * own uniform facet step) is detected by comparing the largest gap
+ * against the median step. Largest gap ≤ 1.5 × median → closed ring,
+ * `arcDegrees = 360`. Otherwise the largest gap is a genuine missing
+ * arc: `arcDegrees = 360 − largest gap`.
  */
 export function angularCoverage(axis: Axis, vertices: readonly Vec3[], center: Vec3): { arcDegrees: number; segments: number } {
   const [ccx, ccy] = project2D(center, axis);
@@ -196,7 +239,8 @@ export function angularCoverage(axis: Axis, vertices: readonly Vec3[], center: V
 
   const largestGapDeg = Math.max(...stepsDeg);
   const medianStepDeg = median(stepsDeg);
-  const arcDegrees = 360 - largestGapDeg;
+  const isClosedRing = largestGapDeg <= 1.5 * medianStepDeg;
+  const arcDegrees = isClosedRing ? 360 : 360 - largestGapDeg;
   const segments = medianStepDeg > 0 ? Math.round(360 / medianStepDeg) : uniqueAngles.length;
 
   return { arcDegrees, segments };
@@ -223,6 +267,16 @@ export function classifySurface(axis: Axis, vertices: readonly Vec3[], normals: 
   return radialDotSum < 0 ? "hole" : "outside";
 }
 
+function isFiniteFit(fit: { center: Vec3; radius: number; maxDeviationMm: number }): boolean {
+  return (
+    Number.isFinite(fit.radius) &&
+    Number.isFinite(fit.maxDeviationMm) &&
+    Number.isFinite(fit.center.x) &&
+    Number.isFinite(fit.center.y) &&
+    Number.isFinite(fit.center.z)
+  );
+}
+
 /**
  * Takes an axis and a region's vertices and normals, and returns a
  * `CylinderInspection` or a `Refusal` using the thresholds in
@@ -231,6 +285,11 @@ export function classifySurface(axis: Axis, vertices: readonly Vec3[], normals: 
  */
 export function evaluateCylinder(axis: Axis, vertices: readonly Vec3[], normals: readonly Vec3[]): CylinderInspection | Refusal {
   const fit = fitCircleInPlane(axis, vertices);
+  if (!isFiniteFit(fit)) {
+    // A singular fit (collinear points in the plane) means a flat region.
+    return planarRefusal();
+  }
+
   const { arcDegrees, segments } = angularCoverage(axis, vertices, fit.center);
 
   if (segments < INSPECTION_THRESHOLDS.minSegments) {

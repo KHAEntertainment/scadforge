@@ -37,7 +37,17 @@ export function partialArcRefusal(deg: number): Refusal {
   return { code: "partial-arc", message: MESSAGES["partial-arc"].replace("{deg}", formatMm(deg)) };
 }
 
+/**
+ * Deviation is near the 0.01 mm limit by construction (that's exactly
+ * when this refusal fires), so `formatMm`'s one-decimal rounding would
+ * print "0 mm" for a value just over the limit. Three decimals instead:
+ * 0.0123 → "0.012".
+ */
+function formatDeviationMm(value: number): string {
+  return value.toFixed(3);
+}
+
 /** Fit deviation above the limit. `dev` is the maximum deviation in mm. */
 export function notCircularRefusal(dev: number): Refusal {
-  return { code: "not-circular", message: MESSAGES["not-circular"].replace("{dev}", formatMm(dev)) };
+  return { code: "not-circular", message: MESSAGES["not-circular"].replace("{dev}", formatDeviationMm(dev)) };
 }

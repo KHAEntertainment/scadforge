@@ -59,6 +59,25 @@ function isRefusal(value: unknown): value is Refusal {
 }
 
 describe("fitCircleInPlane", () => {
+  it("recovers a small feature's diameter and center within 1e-6 mm far from the origin (fit conditioning)", () => {
+    const axis: Axis = "z";
+    const diameter = 4.5;
+    const radius = diameter / 2;
+    const fn = 48;
+
+    for (const center of [
+      [150, 150],
+      [-300, 80]
+    ] as const) {
+      const { vertices } = fullRing(axis, [center[0], center[1]], radius, fn, [0]);
+      const fit = fitCircleInPlane(axis, vertices);
+
+      expect(Math.abs(fit.radius * 2 - diameter)).toBeLessThan(1e-6);
+      expect(Math.abs(fit.center.x - center[0])).toBeLessThan(1e-6);
+      expect(Math.abs(fit.center.y - center[1])).toBeLessThan(1e-6);
+    }
+  });
+
   it("recovers the exact modeled radius and center for $fn = 12, 48, 96, including translated centers", () => {
     const cases: { axis: Axis; center: [number, number]; radius: number; fn: number }[] = [
       { axis: "z", center: [0, 0], radius: 16, fn: 12 },
@@ -132,6 +151,17 @@ describe("fitCircleInPlane", () => {
 });
 
 describe("angularCoverage", () => {
+  it("reports a fully closed ring as exactly 360°, for $fn = 12, 48 and 96", () => {
+    const axis: Axis = "z";
+    for (const fn of [12, 48, 96]) {
+      const { vertices } = fullRing(axis, [0, 0], 20, fn, [0]);
+      const fit = fitCircleInPlane(axis, vertices);
+      const { arcDegrees, segments } = angularCoverage(axis, vertices, fit.center);
+      expect(arcDegrees).toBe(360);
+      expect(segments).toBe(fn);
+    }
+  });
+
   it("reports partial arcs of 90°, 180° and 330° from a genuinely missing facet run, and still recovers the full segment count", () => {
     const axis: Axis = "z";
     const fn = 48; // 7.5° per facet
@@ -238,6 +268,21 @@ describe("evaluateCylinder", () => {
     expect(isRefusal(outcome)).toBe(true);
     if (isRefusal(outcome)) {
       expect(outcome.code).toBe("not-circular");
+    }
+  });
+
+  it("refuses planar for degenerate (collinear) input: a flat strip has no unique circle", () => {
+    const axis: Axis = "z";
+    // A flat strip: all points share y = 5, varying only in x -- collinear
+    // in the projection plane, so the Kasa normal equations are singular.
+    const vertices: Vec3[] = [0, 10, 20, 30, 40].map((x) => ({ x, y: 5, z: 0 }));
+    const normals: Vec3[] = vertices.map(() => ({ x: 0, y: 1, z: 0 }));
+
+    const outcome = evaluateCylinder(axis, vertices, normals);
+    expect(isRefusal(outcome)).toBe(true);
+    if (isRefusal(outcome)) {
+      expect(outcome.code).toBe("planar");
+      expect(outcome.message).toBe("This is a flat surface. Surface inspection measures cylindrical walls only.");
     }
   });
 });
