@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { VIEW_NAMES, type ParamValues, type ValidationSummary, type ViewName } from "@scadforge/protocol";
 import { Viewer3D } from "./Viewer3D.js";
 import { ValidationPanel } from "./ValidationPanel.js";
@@ -7,6 +7,8 @@ import { useWasmPreview } from "../wasm/index.js";
 import { bboxSize, formatMm, AXES, type BBox } from "./measure.js";
 import type { MeasureFocus } from "./DimensionOverlay.js";
 import type { SnapshotMeshStatus } from "../hooks/useSnapshotMesh.js";
+import { InspectReadout } from "./inspect/InspectReadout.js";
+import type { InspectionOutcome } from "./inspect/inspectionTypes.js";
 
 /** The four fixed views shown as buttons (Issue #18 AC — `section` is excluded from this round's view switcher). */
 const PREVIEW_VIEW_BUTTONS: ViewName[] = VIEW_NAMES.filter(
@@ -137,6 +139,25 @@ function PreviewTabBody({
   const [measure, setMeasure] = useState(false);
   const [measureAxis, setMeasureAxis] = useState<MeasureFocus>("all");
   const [measuredBBox, setMeasuredBBox] = useState<BBox | null>(null);
+  const [inspectEnabled, setInspectEnabled] = useState(false);
+  const [inspectOutcome, setInspectOutcome] = useState<InspectionOutcome | null>(null);
+  const inspectDisabled = mode !== "orbit" || stlUrl === null;
+
+  // Nothing here relies on Viewer3D's own clearing (S2-4): a stlUrl/snapshotId
+  // change covers a project switch or a History selection, a mode change
+  // covers leaving 3D view, and turning the toggle off is explicit — all
+  // independent of when (or whether) a new mesh finishes loading.
+  useEffect(() => {
+    setInspectOutcome(null);
+  }, [stlUrl, snapshotId]);
+
+  useEffect(() => {
+    setInspectOutcome(null);
+  }, [mode]);
+
+  useEffect(() => {
+    if (!inspectEnabled) setInspectOutcome(null);
+  }, [inspectEnabled]);
 
   // `enabled: isLive` — the worker is only spawned while the Live tab is
   // actually selected, not on every project/param change.
@@ -200,6 +221,17 @@ function PreviewTabBody({
         >
           Measure
         </button>
+        <button
+          type="button"
+          className={inspectEnabled ? "active" : ""}
+          onClick={() => setInspectEnabled((value) => !value)}
+          aria-pressed={inspectEnabled}
+          data-testid="inspect-toggle"
+          disabled={inspectDisabled}
+          title={inspectDisabled ? "Inspection uses the server render, available in 3D view." : undefined}
+        >
+          Inspect
+        </button>
         <button type="button" onClick={() => onModeChange("orbit")}>Fit</button>
       </div>
 
@@ -255,6 +287,8 @@ function PreviewTabBody({
             measure={measure}
             measureAxis={measureAxis}
             onBoundingBox={setMeasuredBBox}
+            inspect={inspectEnabled && mode === "orbit"}
+            onInspect={setInspectOutcome}
           />
         </div>
         {showPng ? (
@@ -270,6 +304,8 @@ function PreviewTabBody({
           )
         ) : null}
       </div>
+
+      <InspectReadout outcome={inspectOutcome} snapshotId={snapshotId} />
 
       {/* Issue #41 symptom 3: the verdict belongs next to the thing it
           describes, not only as one coloured word in the status strip. */}

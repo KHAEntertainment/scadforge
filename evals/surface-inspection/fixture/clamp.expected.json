@@ -1,0 +1,546 @@
+{
+  "fixture": "evals/scenario-a2/fixture/clamp.scad",
+  "renderedWith": {
+    "image": "docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7",
+    "backend": "Manifold",
+    "version": "2026.01.19 (git e43242666)"
+  },
+  "toleranceMm": 0.01,
+  "notes": "Rays verified with three's STLLoader + Raycaster against the real STL for each wall sample (see evals/surface-inspection/README.md). At wall=2 the screw-hole X position is chosen inside the plate, clear of the ring-side breakthrough (scope note); diameterMm/center are exact closed-form modeled values.",
+  "samples": {
+    "wall2": {
+      "params": {
+        "wall": 2,
+        "pipe_dia": 32,
+        "width": 20,
+        "plate": 4,
+        "screw_dia": 4.5
+      },
+      "meshValidation": {
+        "components": 1,
+        "volume_mm3": 6814.2572,
+        "bbox": {
+          "min": [
+            -21,
+            -18,
+            -10
+          ],
+          "max": [
+            18,
+            18,
+            10
+          ]
+        },
+        "genus": 5
+      },
+      "rays": [
+        {
+          "feature": "pipe_bore",
+          "description": "Pipe bore",
+          "ray": {
+            "origin": [
+              0,
+              0,
+              0
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "z",
+            "diameterMm": 32,
+            "center": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "outer_ring",
+          "description": "Outer ring",
+          "ray": {
+            "origin": [
+              22.3618,
+              16.8508,
+              0
+            ],
+            "direction": [
+              -0.798636,
+              -0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "z",
+            "diameterMm": 36,
+            "center": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "screw_hole_backplate_dy-1",
+          "description": "Screw hole, backplate part (dy=-1)",
+          "ray": {
+            "origin": [
+              -20,
+              -9,
+              0
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "x",
+            "diameterMm": 4.5,
+            "center": [
+              -19,
+              -9,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "screw_hole_backplate_dy1",
+          "description": "Screw hole, backplate part (dy=1)",
+          "ray": {
+            "origin": [
+              -20,
+              9,
+              0
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "x",
+            "diameterMm": 4.5,
+            "center": [
+              -19,
+              9,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "backplate_face",
+          "description": "Backplate flat face",
+          "ray": {
+            "origin": [
+              -31,
+              16,
+              5
+            ],
+            "direction": [
+              1,
+              0,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        },
+        {
+          "feature": "ring_end_cap",
+          "description": "Ring end cap flat face",
+          "ray": {
+            "origin": [
+              5.8143,
+              15.9748,
+              20
+            ],
+            "direction": [
+              0,
+              0,
+              -1
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        }
+      ]
+    },
+    "wall4": {
+      "params": {
+        "wall": 4,
+        "pipe_dia": 32,
+        "width": 20,
+        "plate": 4,
+        "screw_dia": 4.5
+      },
+      "meshValidation": {
+        "components": 1,
+        "volume_mm3": 11895.4587,
+        "bbox": {
+          "min": [
+            -23,
+            -20,
+            -10
+          ],
+          "max": [
+            20,
+            20,
+            10
+          ]
+        },
+        "genus": 3
+      },
+      "rays": [
+        {
+          "feature": "pipe_bore",
+          "description": "Pipe bore",
+          "ray": {
+            "origin": [
+              0,
+              0,
+              0
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "z",
+            "diameterMm": 32,
+            "center": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "outer_ring",
+          "description": "Outer ring",
+          "ray": {
+            "origin": [
+              23.9591,
+              18.0545,
+              0
+            ],
+            "direction": [
+              -0.798636,
+              -0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "z",
+            "diameterMm": 40,
+            "center": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "screw_hole_backplate_dy-1",
+          "description": "Screw hole, backplate part (dy=-1)",
+          "ray": {
+            "origin": [
+              -22,
+              -10,
+              0
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "x",
+            "diameterMm": 4.5,
+            "center": [
+              -21,
+              -10,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "screw_hole_backplate_dy1",
+          "description": "Screw hole, backplate part (dy=1)",
+          "ray": {
+            "origin": [
+              -22,
+              10,
+              0
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "x",
+            "diameterMm": 4.5,
+            "center": [
+              -21,
+              10,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "backplate_face",
+          "description": "Backplate flat face",
+          "ray": {
+            "origin": [
+              -33,
+              18,
+              5
+            ],
+            "direction": [
+              1,
+              0,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        },
+        {
+          "feature": "ring_end_cap",
+          "description": "Ring end cap flat face",
+          "ray": {
+            "origin": [
+              6.1564,
+              16.9145,
+              20
+            ],
+            "direction": [
+              0,
+              0,
+              -1
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        }
+      ]
+    },
+    "wall6": {
+      "params": {
+        "wall": 6,
+        "pipe_dia": 32,
+        "width": 20,
+        "plate": 4,
+        "screw_dia": 4.5
+      },
+      "meshValidation": {
+        "components": 1,
+        "volume_mm3": 17478.9329,
+        "bbox": {
+          "min": [
+            -25,
+            -22,
+            -10
+          ],
+          "max": [
+            22,
+            22,
+            10
+          ]
+        },
+        "genus": 3
+      },
+      "rays": [
+        {
+          "feature": "pipe_bore",
+          "description": "Pipe bore",
+          "ray": {
+            "origin": [
+              0,
+              0,
+              0
+            ],
+            "direction": [
+              0.798636,
+              0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "z",
+            "diameterMm": 32,
+            "center": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "outer_ring",
+          "description": "Outer ring",
+          "ray": {
+            "origin": [
+              25.5563,
+              19.2581,
+              0
+            ],
+            "direction": [
+              -0.798636,
+              -0.601815,
+              0
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "outside",
+            "axis": "z",
+            "diameterMm": 44,
+            "center": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "screw_hole_backplate_dy-1",
+          "description": "Screw hole, backplate part (dy=-1)",
+          "ray": {
+            "origin": [
+              -24,
+              -11,
+              0
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "x",
+            "diameterMm": 4.5,
+            "center": [
+              -23,
+              -11,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "screw_hole_backplate_dy1",
+          "description": "Screw hole, backplate part (dy=1)",
+          "ray": {
+            "origin": [
+              -24,
+              11,
+              0
+            ],
+            "direction": [
+              0,
+              0.798636,
+              0.601815
+            ]
+          },
+          "expected": {
+            "status": "recognized",
+            "surface": "hole",
+            "axis": "x",
+            "diameterMm": 4.5,
+            "center": [
+              -23,
+              11,
+              0
+            ]
+          }
+        },
+        {
+          "feature": "backplate_face",
+          "description": "Backplate flat face",
+          "ray": {
+            "origin": [
+              -35,
+              20,
+              5
+            ],
+            "direction": [
+              1,
+              0,
+              0
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        },
+        {
+          "feature": "ring_end_cap",
+          "description": "Ring end cap flat face",
+          "ray": {
+            "origin": [
+              6.4984,
+              17.8542,
+              20
+            ],
+            "direction": [
+              0,
+              0,
+              -1
+            ]
+          },
+          "expected": {
+            "status": "refused",
+            "code": "planar",
+            "message": "This is a flat surface. Surface inspection measures cylindrical walls only."
+          }
+        }
+      ]
+    }
+  }
+}
