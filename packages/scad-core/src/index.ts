@@ -81,20 +81,25 @@ export {
 } from "./store/paths.js";
 export {
   createSnapshot,
+  createSnapshotLocked,
   initProject,
   listSnapshots,
+  listSnapshotsLocked,
   mergeParamsAtomic,
   readProjectManifest,
+  readProjectManifestLocked,
   readSnapshotManifest,
+  readSnapshotManifestLocked,
   recordExport,
-  revertToSnapshot
+  revertToSnapshot,
+  revertToSnapshotLocked
 } from "./store/store.js";
 export type { CreateSnapshotInput, InitProjectInput, RevertToSnapshotOptions } from "./store/store.js";
 export { PARAMS_LOCK_MAX_ATTEMPTS, withParamsLock } from "./store/params-lock.js";
 export { computeSourceRevision } from "./store/revision.js";
 export {
-  attachRendersToSnapshot,
-  attachValidationToSnapshot,
+  attachRendersToSnapshotLocked,
+  attachValidationToSnapshotLocked,
   resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   resolveSnapshotValidationPath,
@@ -123,3 +128,12 @@ export {
   sidecarDigest
 } from "./editor/canonical.js";
 export type { DigestDomain } from "./editor/canonical.js";
+
+// ── recovery boundary (Issue #73 / S3-B ticket B2) ──────────────────────────
+//
+// Kept as its own block, separate from B1's own additions below/above, so a
+// concurrent merge of both tickets' export lists stays a trivial textual
+// merge (see the S3-B ticket story's "Shared seams" note).
+export { withRecoveredProject } from "./store/recovered.js";
+export type { LockedProject, ReadResult } from "./store/recovered.js";
+export { FILE_LOCK_MAX_ATTEMPTS, LOCK_OWNER_FILE, STALE_LOCK_MIN_AGE_MS, withFileLock } from "./store/file-lock.js";

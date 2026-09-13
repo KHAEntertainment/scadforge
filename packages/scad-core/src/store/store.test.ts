@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -15,16 +15,36 @@ import {
   recordExport,
   revertToSnapshot
 } from "./store.js";
-import { snapshotDir, rootParamsPath } from "./paths.js";
+import { historyDir, projectFilePath, snapshotDir, rootParamsPath } from "./paths.js";
 import {
-  attachRendersToSnapshot,
-  attachValidationToSnapshot,
+  attachRendersToSnapshotLocked,
+  attachValidationToSnapshotLocked,
   resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   resolveSnapshotValidationPath,
   SNAPSHOT_MESH_FILE,
-  snapshotMeshPath
+  snapshotMeshPath,
+  type AttachRendersOptions,
+  type RenderAttachment
 } from "./attachments.js";
+import { withRecoveredProject } from "./recovered.js";
+import type { SnapshotId } from "@scadforge/protocol";
+import type { ValidationResult } from "../types.js";
+
+/** Test-only convenience: opens the boundary once and calls the ctx-taking attacher, mirroring how a real caller (`apps/server`'s `build`/`renderAndAttach`) does it. */
+function attachRendersToSnapshot(
+  dir: string,
+  snapshotId: SnapshotId,
+  attachments: readonly RenderAttachment[],
+  options?: AttachRendersOptions
+) {
+  return withRecoveredProject(dir, (ctx) => attachRendersToSnapshotLocked(ctx, snapshotId, attachments, options));
+}
+
+/** Test-only convenience: see {@link attachRendersToSnapshot}. */
+function attachValidationToSnapshot(dir: string, snapshotId: SnapshotId, validation: ValidationResult) {
+  return withRecoveredProject(dir, (ctx) => attachValidationToSnapshotLocked(ctx, snapshotId, validation));
+}
 
 let projectDir: string;
 
@@ -760,3 +780,72 @@ describe("project store (filesystem, temp dir)", () => {
     expect(manifest.id).toBe("0002");
   }, 20000);
 });
+
+// ── corruption vs. legacy absence (Issue #73 / S3-B ticket B2) ──────────────
+//
+// The pre-#73 code folded a genuinely corrupt file into the SAME empty/null
+// result as "this file was never written" -- silently discarding whatever
+// was actually on disk the next time something merged onto it. These prove
+// the split: legacy absence still degrades exactly as before; corruption now
+// fails loudly and leaves the bytes untouched.
+describe("corruption vs. legacy absence (Issue #73)", () => {
+  it("a corrupt root params.json fails mergeParamsAtomic with INTERNAL_ERROR and leaves the bytes on disk untouched", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n", params: { a: 1 } });
+    const corruptBytes = "{ this is not valid json";
+    await writeFile(rootParamsPath(projectDir), corruptBytes, "utf8");
+
+    await expect(mergeParamsAtomic(projectDir, { b: 2 }, async (merged) => merged)).rejects.toMatchObject({
+      error_code: "INTERNAL_ERROR"
+    });
+
+    // Refusing to merge means refusing to write -- the corrupt bytes are
+    // still exactly what they were, preserved for inspection/repair rather
+    // than silently replaced by a one-key `{b: 2}` file.
+    expect(await readFile(rootParamsPath(projectDir), "utf8")).toBe(corruptBytes);
+  });
+
+  it("a MISSING root params.json (legacy project) still merges from {} -- ordinary absence, not corruption", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    await rm(rootParamsPath(projectDir), { force: true });
+
+    const merged = await mergeParamsAtomic(projectDir, { fresh: 1 }, async (m) => m);
+    expect(merged).toEqual({ fresh: 1 });
+  });
+
+  it("a corrupt project.json fails createSnapshot BEFORE any write, and releases the history-id claim (no new snapshot directory is left behind)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const before = await readdirNames(historyDir(projectDir));
+    await writeFile(projectFilePath(projectDir), "{ not valid json at all", "utf8");
+
+    await expect(
+      createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "must not land", origin: "manual", pass: null })
+    ).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+
+    // No new snapshot directory was claimed -- the corruption is caught
+    // before claimNextSnapshotId ever calls mkdir on a new id.
+    const after = await readdirNames(historyDir(projectDir));
+    expect(after).toEqual(before);
+  });
+
+  it("a corrupt snapshot manifest.json fails readSnapshotManifest with INTERNAL_ERROR, not SNAPSHOT_NOT_FOUND", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    await writeFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "{ corrupt", "utf8");
+
+    await expect(readSnapshotManifest(projectDir, "0001")).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+  });
+
+  it("an unreadable/corrupt snapshot directory in history/ fails the WHOLE listSnapshots call, naming the offending id -- never a silent skip", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    await createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "v2", origin: "manual", pass: null });
+    // Corrupt the FIRST snapshot's manifest -- a naive implementation could
+    // silently drop just this one entry and still return a (shorter) list.
+    await writeFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "{ corrupt", "utf8");
+
+    await expect(listSnapshots(projectDir)).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+    await expect(listSnapshots(projectDir)).rejects.toThrow(/0001/);
+  });
+});
+
+async function readdirNames(dir: string): Promise<string[]> {
+  return (await readdir(dir)).sort();
+}
