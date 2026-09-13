@@ -24,6 +24,7 @@ import {
   TOOL_RESULT_IMAGE_MIME_TYPE,
   TOOL_RESULT_RULES,
   TOOL_RESULT_SCHEMAS,
+  agentEditorContextSchema,
   exportResultSchema,
   readProjectResultSchema,
   renderViewsResultSchema,
@@ -35,6 +36,7 @@ import {
   writeScadResultSchema
 } from "./contract.js";
 import type {
+  AgentEditorContextMirrorCheck,
   ManifoldStatusMirrorCheck,
   ParamSchemaMirrorCheck,
   ToolCallResult,
@@ -698,6 +700,104 @@ describe("read_project result payload uses real schemas, not unknown escape hatc
     });
     expect(parsed.success).toBe(true);
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // S3-A (Issue #68) — additive `editor` block on read_project
+  //
+  // The editor block is REFERENCEABILITY ONLY — it does NOT widen the tool
+  // surface, add a new tool, or change the seven tool names frozen above. It is
+  // what lets the agent cite features by featureId rather than by ordinal or
+  // label (D7 referenceability, wire-and-recovery §"D7 agent referenceability").
+  // Omission is reserved for legacy adapters and must never be constructed
+  // server-side as an empty confirmed document.
+  // ───────────────────────────────────────────────────────────────────────────
+
+  const editorBlock = {
+    version: 1,
+    projectId: "11111111-2222-4333-8444-555555555555",
+    editorRevision: "0".repeat(64),
+    sourceRevision: "0".repeat(64),
+    sourceFingerprint: "0".repeat(64),
+    sidecarStatus: "ready",
+    features: [
+      {
+        featureId: "11111111-2222-4333-8444-555555555555",
+        label: "wall",
+        projectId: "11111111-2222-4333-8444-555555555555",
+        createdAtRevision: "0".repeat(64),
+        sourceFingerprint: "0".repeat(64),
+        bindingVersion: 1,
+        provenance: { kind: "manual" },
+        binding: {
+          kind: "linear",
+          parameter: "wall",
+          axis: "z",
+          mapping: { scale: 1, offset: 0, anchor: "min" }
+        }
+      }
+    ],
+    eligibility: []
+  };
+
+  it("accepts a populated `editor` block as the S3-A additive surface", () => {
+    const parsed = readProjectResultSchema.safeParse({ ...fullPayload, editor: editorBlock });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts a legacy-empty editor block (zero features, sidecarStatus 'legacy-empty')", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      editor: { ...editorBlock, sidecarStatus: "legacy-empty", features: [] }
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it("accepts omission of the editor block (legacy adapter path)", () => {
+    expect(readProjectResultSchema.safeParse(fullPayload).success).toBe(true);
+  });
+
+  it("rejects a feature inside the editor block whose bindingVersion is 0", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      editor: {
+        ...editorBlock,
+        features: [{ ...editorBlock.features[0], bindingVersion: 0 }]
+      }
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects a feature whose provenance is ai-proposed but lacks confirmedBy: 'user'", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      editor: {
+        ...editorBlock,
+        features: [
+          {
+            ...editorBlock.features[0],
+            provenance: { kind: "ai-proposed", confirmedBy: "model" as never }
+          }
+        ]
+      }
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("rejects an unknown sidecarStatus inside the editor block", () => {
+    const parsed = readProjectResultSchema.safeParse({
+      ...fullPayload,
+      editor: { ...editorBlock, sidecarStatus: "weird" as never }
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it("mirrors the AgentEditorContext shape via agentEditorContextSchema", () => {
+    // The agent mirror exists so MCP/SDK providers can validate the block
+    // without re-implementing it. Wire-and-recovery §"D7 agent referenceability"
+    // requires the mirror be "exact" — that is enforced by the
+    // AgentEditorContextMirrorCheck compile-time guard below.
+    expect(agentEditorContextSchema.safeParse(editorBlock).success).toBe(true);
+  });
 });
 
 describe("image-bearing tool results (Spike 3 §3 / §7.2)", () => {
@@ -810,6 +910,14 @@ describe("scad-core zod mirror drift guard", () => {
       true,
       true
     ]);
+  });
+
+  it("keeps agentEditorContextSchema mutually assignable with @scadforge/protocol's AgentEditorContext", () => {
+    // Wire-and-recovery §"D7 agent referenceability": the runtime mirror must be
+    // exact — a field added, removed or retyped on either side flips this to
+    // `false` and fails `tsc`.
+    const editorMirrorOk: AgentEditorContextMirrorCheck = true;
+    expect(editorMirrorOk).toBe(true);
   });
 
   it("leaves no z.unknown()/z.any() escape hatch in any result schema", () => {

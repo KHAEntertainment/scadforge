@@ -139,7 +139,12 @@ export function createToolHandlers(deps: ToolHandlerDeps): ToolHandlerMap {
       summary: `${state.param_schema.parameters.length} parameters, head ${state.head_snapshot ?? "none"}`,
       duration_ms: Date.now() - startedAt
     });
-    return successResult({
+    // S3-A (Issue #68): forward the editor block only when supplied, so legacy
+    // adapters (no editor context) keep omitting the field. Wire-and-recovery
+    // §"D7 agent referenceability" forbids constructing an empty block on the
+    // handler side: omission means "not implemented", not "empty confirmed
+    // document".
+    const payload: Record<string, unknown> = {
       ok: true,
       pass: budget.pass,
       scad: state.scad,
@@ -147,7 +152,9 @@ export function createToolHandlers(deps: ToolHandlerDeps): ToolHandlerMap {
       param_schema: state.param_schema,
       validation: state.validation,
       head_snapshot: state.head_snapshot
-    });
+    };
+    if (state.editor !== undefined) payload.editor = state.editor;
+    return successResult(payload);
   };
 
   const writeScad: ToolHandler<"write_scad"> = async ({ content, message }) => {

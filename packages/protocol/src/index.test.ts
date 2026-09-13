@@ -9,6 +9,8 @@ import { describe, expect, it } from "vitest";
 import {
   API_BASE_PATH,
   API_ROUTES,
+  EDITOR_ROUTES,
+  EDITOR_SCHEMA_VERSION,
   ERROR_CODES,
   EXPORT_FORMATS,
   HTTP_STATUS_BY_ERROR_CODE,
@@ -255,6 +257,22 @@ describe("REST surface", () => {
     ];
     for (const path of paths) expect(path.startsWith("/projects/:projectId")).toBe(true);
     expect(API_ROUTES.snapshots.get).toBe("/projects/:projectId/snapshots/:snapshotId");
+  });
+
+  it("mounts the S3-A editor routes under a separate EDITOR_ROUTES constant", () => {
+    // Wire-and-recovery §"Exact additive protocol proposal": EDITOR_ROUTES is a
+    // separate exported constant; API_ROUTES is NOT silently mutated.
+    expect(EDITOR_ROUTES.get).toBe("/projects/:projectId/editor");
+    expect(EDITOR_ROUTES.verify).toBe("/projects/:projectId/editor/verify");
+    expect(EDITOR_ROUTES.commands).toBe("/projects/:projectId/editor/commands");
+    expect(EDITOR_ROUTES.operation).toBe(
+      "/projects/:projectId/editor/operations/:operationId"
+    );
+    expect(Object.keys(API_ROUTES).sort()).not.toContain("editor");
+  });
+
+  it("freezes the editor schema version at 1 (Issue #68 / S3-A)", () => {
+    expect(EDITOR_SCHEMA_VERSION).toBe(1);
   });
 });
 
