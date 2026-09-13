@@ -24,8 +24,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { z } from "zod";
-import { ERROR_CODES, VIEW_NAMES } from "@scadforge/protocol";
-import type { ScadForgeErrorCode, ToolName as ProtocolToolName } from "@scadforge/protocol";
+import { EDITOR_LABEL_MAX_CODE_POINTS, ERROR_CODES, VIEW_NAMES } from "@scadforge/protocol";
+import type {
+  AgentEditorContext,
+  EditorSidecarStatus,
+  ScadForgeErrorCode,
+  ToolName as ProtocolToolName
+} from "@scadforge/protocol";
 import { EXPORT_FORMATS, LIBRARY_NAMES } from "@scadforge/scad-core";
 import type {
   ManifoldStatus,
@@ -241,6 +246,124 @@ export const validationReportSchema = z.object({
   components: z.number().int().min(0).nullable(),
   genus: z.number().int().nullable()
 });
+
+// ── zod mirror of @scadforge/protocol's `AgentEditorContext` (S3-A, Issue #68)
+//
+// Referenceability only — the `editor` block on `read_project` is what lets the
+// agent cite features by `featureId` rather than by ordinal or label. It is NOT
+// proof of edit authority; the shared invalidation boundary continues to
+// invalidate the active editor document on every agent write. Mirrored with
+// the same field-set, sidecar-status enum, and version constraint as the REST
+// surface so a guard in section 7 proves the inferred type matches
+// `AgentEditorContext`. Runtime validation against the wire is enforced by
+// `@scadforge/protocol`'s `parseAgentEditorContext`; this schema mirrors the
+// frozen shape for the agent runtime boundary.
+
+/** UUID v4 string. Matches `@scadforge/protocol`'s editor-sidecar validator. */
+const editorUuidSchema = z.string().uuid();
+
+/** Lowercase 64-hex digest. SHA-256 family — canonical JSON encoding. */
+const editorHex64Schema = z.string().regex(/^[0-9a-f]{64}$/, "must be lowercase 64-hex");
+
+/** `EditorSidecarStatus` — typed enum (S3-C §10.2 Q3 owner decision). */
+export const editorSidecarStatusSchema: z.ZodType<EditorSidecarStatus> = z.enum([
+  "ready",
+  "legacy-empty",
+  "missing",
+  "corrupt",
+  "unsupported-version"
+]);
+
+/** Mirrors `EditorFeature` from `@scadforge/protocol`. */
+export const editorFeatureSchema = z
+  .object({
+    featureId: editorUuidSchema,
+    /**
+     * Labels are limited to {@link EDITOR_LABEL_MAX_CODE_POINTS} Unicode code
+     * points per the wire-and-recovery spec. We count code points via
+     * `[...s].length`, NOT UTF-16 units, so a 120-emoji label (240 UTF-16
+     * units) is accepted — matches `@scadforge/protocol`'s `expectLabel`.
+     */
+    label: z
+      .string()
+      .min(1)
+      .refine(
+        (s) => [...s].length <= EDITOR_LABEL_MAX_CODE_POINTS,
+        `label must be at most ${EDITOR_LABEL_MAX_CODE_POINTS} Unicode code points`
+      ),
+    projectId: editorUuidSchema,
+    createdAtRevision: editorHex64Schema,
+    sourceFingerprint: editorHex64Schema,
+    bindingVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    provenance: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("manual") }).strict(),
+      z
+        .object({
+          kind: z.enum(["ai-proposed", "parser-proposed"]),
+          confirmedBy: z.literal("user")
+        })
+        .strict()
+    ]),
+    binding: z.discriminatedUnion("kind", [
+      z
+        .object({
+          kind: z.literal("linear"),
+          parameter: z.string().min(1),
+          axis: z.enum(["x", "y", "z"]),
+          mapping: z
+            .object({
+              scale: z.union([z.literal(1), z.literal(2)]),
+              offset: z.number().finite(),
+              anchor: z.enum(["min", "max", "center"])
+            })
+            .strict()
+        })
+        .strict(),
+      z
+        .object({
+          kind: z.literal("radial"),
+          parameter: z.string().min(1),
+          center: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
+          axis: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
+          parameterMeaning: z.enum(["radius", "diameter"]),
+          presentation: z.enum(["radius", "diameter"])
+        })
+        .strict()
+    ])
+  })
+  .strict();
+
+/** Mirrors `EditorEligibility` from `@scadforge/protocol`. */
+export const editorEligibilitySchema = z
+  .object({
+    featureId: editorUuidSchema,
+    state: z.enum(["requires-proof", "unsupported"]),
+    reason: z.string().nullable()
+  })
+  .strict();
+
+/**
+ * Mirrors `AgentEditorContext` from `@scadforge/protocol`.
+ *
+ * Per wire-and-recovery §"D7 agent referenceability":
+ * "The mirrored runtime schema is exact, using the same sidecar/feature/
+ * eligibility validation and version constraints as REST; guards must prove
+ * its inferred type matches AgentEditorContext."
+ *
+ * Drift is detected by `AgentEditorContextMirrorCheck` in section 7.
+ */
+export const agentEditorContextSchema = z
+  .object({
+    version: z.literal(1),
+    projectId: editorUuidSchema,
+    editorRevision: editorHex64Schema,
+    sourceRevision: editorHex64Schema,
+    sourceFingerprint: editorHex64Schema,
+    sidecarStatus: editorSidecarStatusSchema,
+    features: z.array(editorFeatureSchema).max(256),
+    eligibility: z.array(editorEligibilitySchema).max(256)
+  })
+  .strict();
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 3. Tool input raw shapes
@@ -517,6 +640,11 @@ export const syntaxCheckSchema = z.object({
  * `param_schema` and `validation` are the real mirrored schemas, NOT
  * `z.unknown()` escape hatches — both are pinned to their scad-core
  * counterparts by the guards in section 7.
+ *
+ * The optional `editor` block (S3-A, Issue #68) carries the D7
+ * referenceability surface: features, eligibility, and current `sidecarStatus`
+ * for the project. Omitted by legacy adapters that do not implement editor
+ * context — never construed as an empty confirmed document.
  */
 export const readProjectResultSchema = toolSuccessEnvelopeSchema.extend({
   scad: z.string(),
@@ -525,7 +653,15 @@ export const readProjectResultSchema = toolSuccessEnvelopeSchema.extend({
   param_schema: paramSchemaSchema,
   /** The most recent `ValidationReport`, or null if the model has never been validated. */
   validation: validationReportSchema.nullable(),
-  head_snapshot: z.string().nullable()
+  head_snapshot: z.string().nullable(),
+  /**
+   * S3-A (Issue #68) editor referenceability block. Mirrors
+   * {@link agentEditorContextSchema} verbatim when present. Omission is
+   * allowed only for legacy adapters; modern `read_project` returns the block
+   * for every readable project (wire-and-recovery §"D7 agent
+   * referenceability").
+   */
+  editor: agentEditorContextSchema.optional()
 });
 
 /** `write_scad` result payload. Always echoes budget state. */
@@ -714,6 +850,18 @@ export type ValidationGateResultMirrorCheck = MutuallyAssignable<
 
 /** @see ManifoldStatusMirrorCheck */
 export type ParamSchemaMirrorCheck = MutuallyAssignable<z.infer<typeof paramSchemaSchema>, ParamSchema>;
+
+/**
+ * Fails compilation if `agentEditorContextSchema` drifts from
+ * `@scadforge/protocol`'s `AgentEditorContext` — wire-and-recovery §"D7 agent
+ * referenceability" mandates the mirror is "exact". A field added, removed,
+ * renamed or retyped on either side flips this to `false`, so `tsc` blocks
+ * the change.
+ */
+export type AgentEditorContextMirrorCheck = MutuallyAssignable<
+  z.infer<typeof agentEditorContextSchema>,
+  AgentEditorContext
+>;
 
 /**
  * Re-exported so `validate_mesh` handlers and MCP consumers get the frozen

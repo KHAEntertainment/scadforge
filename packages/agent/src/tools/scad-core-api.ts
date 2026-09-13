@@ -25,7 +25,11 @@ import type {
   ValidationResult,
   ViewName
 } from "@scadforge/scad-core";
-import type { SnapshotManifest, ToolArtifact } from "@scadforge/protocol";
+import type {
+  AgentEditorContext,
+  SnapshotManifest,
+  ToolArtifact
+} from "@scadforge/protocol";
 
 /** What `read_project` needs from the project store. */
 export interface ProjectState {
@@ -39,6 +43,15 @@ export interface ProjectState {
   validation: ValidationReport | null;
   /** Id of the head snapshot, or null for a project with no history. */
   head_snapshot: string | null;
+  /**
+   * S3-A (Issue #68) editor referenceability block. Mirrors
+   * `AgentEditorContext` verbatim when present. Omission is reserved for
+   * legacy adapters that do not implement the editor context; modern
+   * `readProject` implementations always populate it for a readable project,
+   * including the `legacy-empty` sidecar with an empty feature array
+   * (wire-and-recovery §"D7 agent referenceability").
+   */
+  editor?: AgentEditorContext;
 }
 
 /** Input to {@link ScadCoreApi.writeScad}. */

@@ -164,6 +164,15 @@ export interface SnapshotManifest {
   validation: ValidationSummary | null;
   /** Round-3 placeholder — always `[]` in v1. See {@link AnnotationRef}. */
   annotations: AnnotationRef[];
+  /**
+   * S3-A (Issue #68) additive descriptor for this snapshot's embedded editor
+   * sidecar. Set when the snapshot was produced or replayed by the editor
+   * surface; missing when the snapshot predates S3 or carries no editable
+   * references. Verified host-side: a present descriptor requires a matching
+   * `editor.json` whose SHA-256 matches `sha256` under canonical JSON
+   * (wire-and-recovery §"Disk declarations and one commit predicate").
+   */
+  editor?: import("./editor.js").EditorSnapshotRef;
 }
 
 /** A file written to `.scadforge/exports/`. */
@@ -220,4 +229,13 @@ export interface ProjectManifest {
   provider: ProviderConfig;
   /** Id of the newest snapshot, or null for a project with no history yet. */
   head: SnapshotId | null;
+  /**
+   * S3-A (Issue #68) marker: present and equal to `1` on modern projects
+   * that know the editor surface. Absent (or `undefined`) on legacy projects
+   * that pre-date S3 — those are treated as `legacy-empty` sidecar status on
+   * read and enabled on first S3 mutation (wire-and-recovery §"Disk
+   * declarations and one commit predicate"). Server-side writers must NOT
+   * downgrade this field once it is present.
+   */
+  editor_store_version?: 1;
 }

@@ -88,3 +88,58 @@ export type {
   BuildResponse
 } from "./api.js";
 export { API_BASE_PATH, API_ROUTES } from "./api.js";
+
+// Editor protocol (S3-A, Issue #68). Frozen once #68 merges — see `./editor.ts`
+// header. `EDITOR_ROUTES` is a separate constant from `API_ROUTES`; the
+// wire-and-recovery spec explicitly forbids silent mutation of `API_ROUTES`.
+export type {
+  Vec3,
+  Provenance,
+  Binding,
+  EditorFeature,
+  EditorSidecar,
+  EditorDocument,
+  EditorSidecarStatus,
+  EditorEligibility,
+  EditorCommand,
+  EditorIntent,
+  EditorTraversal,
+  EditorVerifyRequest,
+  EditorProofResponse,
+  EditorCommitRequest,
+  EditorReceipt,
+  EditorOperationResponse,
+  AgentEditorContext,
+  EditorSnapshotRef,
+  EditorParseResult
+} from "./editor.js";
+export {
+  EDITOR_SCHEMA_VERSION,
+  EDITOR_ROUTES,
+  EDITOR_LABEL_MAX_CODE_POINTS,
+  EDITOR_MAX_REFERENCE_ARRAY,
+  EDITOR_MAX_WIRE_BYTES,
+  EDITOR_RADIAL_AXIS_NORM_TOLERANCE,
+  EDITOR_BINDING_VERSION_MAX,
+  EditorProtocolError,
+  parseEditorSidecar,
+  safeParseEditorSidecar,
+  parseEditorDocument,
+  safeParseEditorDocument,
+  parseEditorCommand,
+  safeParseEditorCommand,
+  parseEditorVerifyRequest,
+  safeParseEditorVerifyRequest,
+  parseEditorProofResponse,
+  safeParseEditorProofResponse,
+  parseEditorCommitRequest,
+  safeParseEditorCommitRequest,
+  parseEditorReceipt,
+  safeParseEditorReceipt,
+  parseEditorOperationResponse,
+  safeParseEditorOperationResponse,
+  parseAgentEditorContext,
+  safeParseAgentEditorContext,
+  parseEditorSnapshotRef,
+  safeParseEditorSnapshotRef
+} from "./editor.js";
