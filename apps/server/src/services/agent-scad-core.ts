@@ -28,17 +28,19 @@ import type {
 } from "@scadforge/agent";
 import { lookup as libraryLookup } from "@scadforge/libs";
 import {
-  attachValidationToSnapshot,
-  createSnapshot,
+  attachValidationToSnapshotLocked,
+  createSnapshotLocked,
   exportRun,
   exportsDir,
   mergeParamsAtomic,
+  readProjectManifestLocked,
   recordExport,
   rootModelPath,
   runParamExport,
   runSyntaxCheck,
   snapshotMeshPath,
-  validateModel
+  validateModel,
+  withRecoveredProject
 } from "@scadforge/scad-core";
 import type {
   ExportRunResult,
@@ -52,7 +54,14 @@ import type {
 } from "@scadforge/scad-core";
 import type { ExportRecord } from "@scadforge/protocol";
 import { renderAndAttach } from "./scad-core-impl.js";
-import { planParamUpdate, readParams, readProject, readScad, stageSnapshotModel, type ServerRuntime } from "./runtime.js";
+import {
+  planParamUpdate,
+  readParamsLocked,
+  readProject,
+  readScadLocked,
+  stageSnapshotModel,
+  type ServerRuntime
+} from "./runtime.js";
 import { exportFileUrl, renderFileUrl, snapshotMeshUrl, snapshotUrl } from "./urls.js";
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */
@@ -111,8 +120,23 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
 
   return {
     async readProject(): Promise<ProjectState> {
-      const project = await readProject(dir);
-      const [scad, params, param_schema] = await Promise.all([readScad(dir), readParams(dir), paramSchema()]);
+      // ONE boundary entry for project + scad + params together (Issue #73:
+      // D7's "same recovered coherent read" requirement) -- the old code ran
+      // these as three INDEPENDENT operations (an unlocked `readProject`
+      // plus two more via `Promise.all`), so a concurrent writer landing
+      // between them could hand the agent a head that disagrees with the
+      // scad/params it's paired with. `paramSchema()` stays OUTSIDE the
+      // lock -- it is a slow OpenSCAD subprocess call, and (like
+      // `scad-core-impl.ts`'s `paramsResponse`) already tolerates being a
+      // live, best-effort derived view rather than a value pinned to the
+      // exact coherent instant above.
+      const { project, scad, params } = await withRecoveredProject(dir, async (ctx) => {
+        const project = await readProjectManifestLocked(ctx);
+        const scad = await readScadLocked(ctx);
+        const params = await readParamsLocked(ctx);
+        return { project, scad, params };
+      });
+      const param_schema = await paramSchema();
       return { scad, params, param_schema, validation: lastValidation, head_snapshot: project.head };
     },
 
@@ -125,11 +149,12 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // Params are carried forward UNCHANGED (`accepted: {}`), but still go
       // through `mergeParamsAtomic` (Issue #44): reading "current params" and
       // writing them back into this snapshot must hold the SAME cross-process
-      // params lock every other params writer uses, or this content-only edit
-      // could still race a concurrent `set_params`/REST params update and
-      // silently regress its just-committed change.
-      const snapshot = await mergeParamsAtomic(dir, {}, (params) =>
-        createSnapshot(dir, {
+      // params lock (the recovery boundary) every other params writer uses,
+      // or this content-only edit could still race a concurrent
+      // `set_params`/REST params update and silently regress its
+      // just-committed change.
+      const snapshot = await mergeParamsAtomic(dir, {}, (params, ctx) =>
+        createSnapshotLocked(ctx, {
           content: request.content,
           params,
           message: request.message,
@@ -158,10 +183,13 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // and creates the snapshot WHILE HOLDING the cross-process params lock,
       // so this can never race a concurrent REST params update (or another
       // `set_params`/`write_scad` call) merging a DISJOINT key onto the same
-      // file.
-      const snapshot = await mergeParamsAtomic(dir, plan.accepted, async (merged) =>
-        createSnapshot(dir, {
-          content: await readScad(dir),
+      // file. Reads the current source through the `ctx` this callback
+      // already holds (`readScadLocked`) -- the exported `readScad` would
+      // re-enter the boundary and throw immediately (Issue #73's
+      // non-reentrancy guard).
+      const snapshot = await mergeParamsAtomic(dir, plan.accepted, async (merged, ctx) =>
+        createSnapshotLocked(ctx, {
+          content: await readScadLocked(ctx),
           params: merged,
           message: `Set ${Object.keys(params).length - unknown_params.length} parameter(s)`,
           origin: "manual",
@@ -236,9 +264,16 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // inspection of what a given revision actually measured would all be
       // permanently null.
       if (targetId && !isPreview) {
-        // A validation run whose bookkeeping fails must not fail the tool —
-        // the model still needs to see the report it just paid for.
-        await attachValidationToSnapshot(dir, targetId, result).catch(() => {});
+        // Issue #73: this bookkeeping failure used to be swallowed
+        // (`.catch(() => {})`) so a validation that genuinely succeeded but
+        // failed to PERSIST would report success anyway — the History
+        // badge, `ExportResponse.validation` and any later inspection of
+        // this revision would then silently disagree with what the agent
+        // was just told. `ValidationResult`'s frozen shape has no secondary
+        // field to carry a bookkeeping error alongside a geometry verdict,
+        // so the only honest way to report it is to fail the whole tool
+        // call.
+        await withRecoveredProject(dir, (ctx) => attachValidationToSnapshotLocked(ctx, targetId, result));
       }
       return result;
     },

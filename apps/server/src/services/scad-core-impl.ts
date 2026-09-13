@@ -51,18 +51,19 @@ import type {
 import {
   DEFAULT_VIEWS,
   analyzeSourceParams,
-  attachRendersToSnapshot,
-  attachValidationToSnapshot,
+  attachRendersToSnapshotLocked,
+  attachValidationToSnapshotLocked,
   computeSourceRevision,
-  createSnapshot,
+  createSnapshotLocked,
   exportRunWithValidation,
   exportsDir,
   initProject,
   listSnapshots,
   mergeParamsAtomic,
   normalizeLineEndings,
-  readProjectManifest,
+  readProjectManifestLocked,
   readSnapshotManifest,
+  readSnapshotManifestLocked,
   recordExport,
   renderViews as runRenderViews,
   resolveSnapshotMeshPath,
@@ -75,9 +76,9 @@ import {
   snapshotMeshPath,
   snapshotRenderPath,
   validateModel,
-  withParamsLock
+  withRecoveredProject
 } from "@scadforge/scad-core";
-import type { ParamSchema, ParamValues, RenderAttachment, RenderedView } from "@scadforge/scad-core";
+import type { LockedProject, ParamSchema, ParamValues, RenderAttachment, RenderedView } from "@scadforge/scad-core";
 import { RouteError } from "./errors.js";
 import { allocateProjectId, listProjectIds } from "./project-paths.js";
 import type { RenderFile, ScadCoreApi } from "./scad-core-api.js";
@@ -85,10 +86,11 @@ import {
   asRouteResult,
   planParamUpdate,
   readParams,
+  readParamsLocked,
   readProject,
-  readScad,
+  readScadLocked,
   stageSnapshotModel,
-  writeRootParams,
+  writeRootParamsLocked,
   type ServerRuntime
 } from "./runtime.js";
 import { exportFileUrl, renderFileUrl } from "./urls.js";
@@ -185,9 +187,19 @@ export async function renderAndAttach(
           height: view.imgsize[1]
         }));
       if (attachments.length > 0) {
-        await attachRendersToSnapshot(dir, head, attachments, {
-          buildRenderUrl: (snapshotId, view) => renderFileUrl(projectId, snapshotId, view)
-        });
+        // A SECOND, sequential (never nested) boundary entry -- the pin
+        // above (via `readProject`) already opened and closed its own; the
+        // (slow) render ran entirely outside any lock (Issue #73: "pin
+        // immutable input... release lock for engine work... recheck before
+        // mutable attachment"). Attaching to `head`, the id pinned before
+        // rendering, is valid regardless of whether the project's head has
+        // since moved on -- this render describes THAT snapshot's own
+        // content, not "whatever is current now".
+        await withRecoveredProject(dir, (ctx) =>
+          attachRendersToSnapshotLocked(ctx, head, attachments, {
+            buildRenderUrl: (snapshotId, view) => renderFileUrl(projectId, snapshotId, view)
+          })
+        );
         // Re-point each successful view at its durable home in the snapshot so
         // callers (the agent's `readImageBase64`) can still read it after the
         // temp directory below is removed.
@@ -215,18 +227,21 @@ interface SourceState {
 }
 
 /**
- * Reads the project's coherent head + `model.scad` + `params.json` state UNDER
- * the cross-process params lock, so the returned revision never mixes a head
+ * Reads the project's coherent head + `model.scad` + `params.json` state
+ * under the recovery boundary, so the returned revision never mixes a head
  * from one write with a source/params from another. Every writer of those
  * three files serializes on the same lock, so reading inside it is what makes
- * the (head, source, params) triple coherent.
+ * the (head, source, params) triple coherent. A missing project surfaces
+ * `PROJECT_NOT_FOUND` from the boundary itself (Issue #73:
+ * `withRecoveredProject` translates the lock's own missing-`.scadforge/`
+ * case), so the separate unlocked pre-check the old code needed before it
+ * dared enter the lock is gone.
  */
 async function coherentSourceState(dir: string): Promise<SourceState> {
-  await readProject(dir); // PROJECT_NOT_FOUND before we try to create the params lock dir
-  return withParamsLock(dir, async () => {
-    const project = await readProjectManifest(dir);
-    const scad = await readScad(dir);
-    const params = await readParams(dir);
+  return withRecoveredProject(dir, async (ctx) => {
+    const project = await readProjectManifestLocked(ctx);
+    const scad = await readScadLocked(ctx);
+    const params = await readParamsLocked(ctx);
     return { project, head: project.head, scad, params, revision: computeSourceRevision(project.head, scad, params) };
   });
 }
@@ -301,29 +316,57 @@ export function assertCompleteBuildRender(
 
 /** Builds the real `ScadCoreApi`. */
 export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
+  /**
+   * Reads the head snapshot's manifest. Issue #73 AC7: a `head` that IS set
+   * always names a snapshot that was committed (a project's `head` only ever
+   * advances after that snapshot's `manifest.json` is written -- see
+   * `store.ts`'s `writeSnapshotFiles`), so a read failure here is never
+   * ordinary "no head yet" and must never be reported as one; it fails the
+   * whole request instead (corrupt bytes -> `INTERNAL_ERROR`; a genuinely
+   * missing directory despite a set head -> `SNAPSHOT_NOT_FOUND`, itself
+   * exactly this kind of integrity violation).
+   */
+  async function headSnapshotLocked(ctx: LockedProject, head: string | null): Promise<SnapshotManifest | null> {
+    if (!head) return null;
+    return readSnapshotManifestLocked(ctx, head);
+  }
+
+  /** Standalone (own boundary entry) sibling of {@link headSnapshotLocked}, for a caller not already composing it with other locked reads under one `ctx`. */
   async function headSnapshot(dir: string, head: string | null): Promise<SnapshotManifest | null> {
     if (!head) return null;
-    try {
-      return await readSnapshotManifest(dir, head);
-    } catch {
-      return null;
-    }
+    return asRouteResult(
+      () => withRecoveredProject(dir, (ctx) => headSnapshotLocked(ctx, head)),
+      `failed to read head snapshot '${head}'`
+    );
   }
 
   async function projectResponse(projectId: string): Promise<ProjectResponse> {
     const dir = runtime.dirFor(projectId);
-    const project = await readProject(dir);
-    const [scad, params, head] = await Promise.all([
-      readScad(dir),
-      readParams(dir),
-      headSnapshot(dir, project.head)
-    ]);
-    return { project, scad, params, head };
+    // ONE boundary entry for project + scad + params + head together (Issue
+    // #73 AC9): the old code read these as FOUR separate operations (an
+    // unlocked `readProject` pre-check, then three more independently-timed
+    // reads), so a concurrent writer landing between them could hand back a
+    // head that no longer agrees with the scad/params it's paired with.
+    return asRouteResult(() => withRecoveredProject(dir, async (ctx) => {
+      const project = await readProjectManifestLocked(ctx);
+      const [scad, params, head] = await Promise.all([
+        readScadLocked(ctx),
+        readParamsLocked(ctx),
+        headSnapshotLocked(ctx, project.head)
+      ]);
+      return { project, scad, params, head };
+    }), "failed to read project");
   }
 
   async function paramsResponse(projectId: string): Promise<ParamsResponse> {
     const dir = runtime.dirFor(projectId);
-    await readProject(dir);
+    // The schema is a LIVE, derived view of the current `model.scad` via an
+    // OpenSCAD subprocess call -- deliberately kept outside any lock (never
+    // slow work under the lock). `values` still goes through its own
+    // boundary entry (`readParams`); the two are not required to describe
+    // the exact same instant here (unlike `projectResponse`/
+    // `coherentSourceState`, this response carries no revision a caller
+    // could then act on as if it were pinned).
     const [schema, values] = await Promise.all([
       asRouteResult(
         () => runParamExport(rootModelPath(dir), { libraryPaths: runtime.libraryPaths }),
@@ -337,6 +380,8 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
   async function sourceResponse(projectId: string): Promise<SourceResponse> {
     const dir = runtime.dirFor(projectId);
     const state = await asRouteResult(() => coherentSourceState(dir), "failed to read source");
+    // A second, sequential (not nested) boundary entry -- coherentSourceState's
+    // own entry has already closed by the time this runs.
     const head = state.head ? await headSnapshot(dir, state.head) : null;
     return { project: state.project, scad: state.scad, params: state.params, head, revision: state.revision };
   }
@@ -491,15 +536,19 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       // update) merging a DISJOINT key onto the same file.
       await asRouteResult(
         () =>
-          mergeParamsAtomic(dir, plan.accepted, async (merged) => {
+          mergeParamsAtomic(dir, plan.accepted, async (merged, ctx) => {
             if (request.snapshot !== false) {
               // The snapshot carries the CURRENT source unchanged — a
               // parameter write is not a model edit, and passing anything
-              // else here would silently truncate `model.scad`.
-              const content = await readScad(dir);
-              await createSnapshot(dir, { content, params: merged, message, origin: "manual", pass: null });
+              // else here would silently truncate `model.scad`. Reads
+              // `ctx.projectDir`'s content THROUGH the ctx this callback
+              // already holds (`readScadLocked`), never the exported
+              // `readScad` -- that would re-enter the boundary and throw
+              // immediately (Issue #73's non-reentrancy guard).
+              const content = await readScadLocked(ctx);
+              await createSnapshotLocked(ctx, { content, params: merged, message, origin: "manual", pass: null });
             } else {
-              await writeRootParams(dir, merged);
+              await writeRootParamsLocked(ctx, merged);
             }
           }),
         "failed to persist the parameter update"
@@ -581,19 +630,21 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
         );
       }
 
-      // Commit under the params lock, re-checking the revision one last time so
-      // a concurrent write between the compile and the commit can never be
-      // force-overwritten.
+      // Commit under a SECOND, sequential boundary entry, re-checking the
+      // revision one last time so a concurrent write between the compile and
+      // the commit can never be force-overwritten (Tech Lead correction:
+      // "never hold the lock across the compile" -- two sequential entries,
+      // never one held across the engine work, same pattern as `build`).
       await asRouteResult(
         () =>
-          withParamsLock(dir, async () => {
-            const current = await readProjectManifest(dir);
-            const currentScad = await readScad(dir);
-            const currentParams = await readParams(dir);
+          withRecoveredProject(dir, async (ctx) => {
+            const current = await readProjectManifestLocked(ctx);
+            const currentScad = await readScadLocked(ctx);
+            const currentParams = await readParamsLocked(ctx);
             if (computeSourceRevision(current.head, currentScad, currentParams) !== request.base_revision) {
               throw new RouteError("CONFLICT", "Source changed while saving; refresh and retry.");
             }
-            await createSnapshot(dir, {
+            await createSnapshotLocked(ctx, {
               content: scad,
               params: analysis.retained_params,
               message: "Edited source",
@@ -679,11 +730,19 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
         if (attachments.length === 0) {
           throw new RouteError("RENDER_FAILED", renderResult.message ?? "Build produced no renders.");
         }
+        // Each attach step is its OWN, sequential (never nested) boundary
+        // entry, with the (slow) engine work between them running entirely
+        // outside any lock -- Issue #73: "release lock for engine work;
+        // recheck before mutable attachment". `pinned` was fixed before any
+        // of this ran, so attaching to it stays correct however far the
+        // project's head has since moved.
         await asRouteResult(
           () =>
-            attachRendersToSnapshot(dir, pinned, attachments, {
-              buildRenderUrl: (snapshotId, view) => renderFileUrl(projectId, snapshotId, view)
-            }),
+            withRecoveredProject(dir, (ctx) =>
+              attachRendersToSnapshotLocked(ctx, pinned, attachments, {
+                buildRenderUrl: (snapshotId, view) => renderFileUrl(projectId, snapshotId, view)
+              })
+            ),
           "failed to attach renders"
         );
 
@@ -696,7 +755,10 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
             }),
           "build validation failed"
         );
-        await asRouteResult(() => attachValidationToSnapshot(dir, pinned, validation), "failed to attach validation");
+        await asRouteResult(
+          () => withRecoveredProject(dir, (ctx) => attachValidationToSnapshotLocked(ctx, pinned, validation)),
+          "failed to attach validation"
+        );
       } finally {
         await staged.cleanup();
         await rm(outDir, { recursive: true, force: true }).catch(() => {});
