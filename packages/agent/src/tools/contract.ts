@@ -24,7 +24,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { z } from "zod";
-import { ERROR_CODES, VIEW_NAMES } from "@scadforge/protocol";
+import { EDITOR_LABEL_MAX_CODE_POINTS, ERROR_CODES, VIEW_NAMES } from "@scadforge/protocol";
 import type {
   AgentEditorContext,
   EditorSidecarStatus,
@@ -275,48 +275,72 @@ export const editorSidecarStatusSchema: z.ZodType<EditorSidecarStatus> = z.enum(
 ]);
 
 /** Mirrors `EditorFeature` from `@scadforge/protocol`. */
-export const editorFeatureSchema = z.object({
-  featureId: editorUuidSchema,
-  label: z.string().min(1).max(120),
-  projectId: editorUuidSchema,
-  createdAtRevision: editorHex64Schema,
-  sourceFingerprint: editorHex64Schema,
-  bindingVersion: z.number().int().min(1),
-  provenance: z.discriminatedUnion("kind", [
-    z.object({ kind: z.literal("manual") }),
-    z.object({
-      kind: z.enum(["ai-proposed", "parser-proposed"]),
-      confirmedBy: z.literal("user")
-    })
-  ]),
-  binding: z.discriminatedUnion("kind", [
-    z.object({
-      kind: z.literal("linear"),
-      parameter: z.string().min(1),
-      axis: z.enum(["x", "y", "z"]),
-      mapping: z.object({
-        scale: z.union([z.literal(1), z.literal(2)]),
-        offset: z.number().finite(),
-        anchor: z.enum(["min", "max", "center"])
-      })
-    }),
-    z.object({
-      kind: z.literal("radial"),
-      parameter: z.string().min(1),
-      center: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
-      axis: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
-      parameterMeaning: z.enum(["radius", "diameter"]),
-      presentation: z.enum(["radius", "diameter"])
-    })
-  ])
-});
+export const editorFeatureSchema = z
+  .object({
+    featureId: editorUuidSchema,
+    /**
+     * Labels are limited to {@link EDITOR_LABEL_MAX_CODE_POINTS} Unicode code
+     * points per the wire-and-recovery spec. We count code points via
+     * `[...s].length`, NOT UTF-16 units, so a 120-emoji label (240 UTF-16
+     * units) is accepted — matches `@scadforge/protocol`'s `expectLabel`.
+     */
+    label: z
+      .string()
+      .min(1)
+      .refine(
+        (s) => [...s].length <= EDITOR_LABEL_MAX_CODE_POINTS,
+        `label must be at most ${EDITOR_LABEL_MAX_CODE_POINTS} Unicode code points`
+      ),
+    projectId: editorUuidSchema,
+    createdAtRevision: editorHex64Schema,
+    sourceFingerprint: editorHex64Schema,
+    bindingVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
+    provenance: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("manual") }).strict(),
+      z
+        .object({
+          kind: z.enum(["ai-proposed", "parser-proposed"]),
+          confirmedBy: z.literal("user")
+        })
+        .strict()
+    ]),
+    binding: z.discriminatedUnion("kind", [
+      z
+        .object({
+          kind: z.literal("linear"),
+          parameter: z.string().min(1),
+          axis: z.enum(["x", "y", "z"]),
+          mapping: z
+            .object({
+              scale: z.union([z.literal(1), z.literal(2)]),
+              offset: z.number().finite(),
+              anchor: z.enum(["min", "max", "center"])
+            })
+            .strict()
+        })
+        .strict(),
+      z
+        .object({
+          kind: z.literal("radial"),
+          parameter: z.string().min(1),
+          center: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
+          axis: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]),
+          parameterMeaning: z.enum(["radius", "diameter"]),
+          presentation: z.enum(["radius", "diameter"])
+        })
+        .strict()
+    ])
+  })
+  .strict();
 
 /** Mirrors `EditorEligibility` from `@scadforge/protocol`. */
-export const editorEligibilitySchema = z.object({
-  featureId: editorUuidSchema,
-  state: z.enum(["requires-proof", "unsupported"]),
-  reason: z.string().nullable()
-});
+export const editorEligibilitySchema = z
+  .object({
+    featureId: editorUuidSchema,
+    state: z.enum(["requires-proof", "unsupported"]),
+    reason: z.string().nullable()
+  })
+  .strict();
 
 /**
  * Mirrors `AgentEditorContext` from `@scadforge/protocol`.
@@ -328,16 +352,18 @@ export const editorEligibilitySchema = z.object({
  *
  * Drift is detected by `AgentEditorContextMirrorCheck` in section 7.
  */
-export const agentEditorContextSchema = z.object({
-  version: z.literal(1),
-  projectId: editorUuidSchema,
-  editorRevision: editorHex64Schema,
-  sourceRevision: editorHex64Schema,
-  sourceFingerprint: editorHex64Schema,
-  sidecarStatus: editorSidecarStatusSchema,
-  features: z.array(editorFeatureSchema).max(256),
-  eligibility: z.array(editorEligibilitySchema).max(256)
-});
+export const agentEditorContextSchema = z
+  .object({
+    version: z.literal(1),
+    projectId: editorUuidSchema,
+    editorRevision: editorHex64Schema,
+    sourceRevision: editorHex64Schema,
+    sourceFingerprint: editorHex64Schema,
+    sidecarStatus: editorSidecarStatusSchema,
+    features: z.array(editorFeatureSchema).max(256),
+    eligibility: z.array(editorEligibilitySchema).max(256)
+  })
+  .strict();
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 3. Tool input raw shapes

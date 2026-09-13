@@ -25,6 +25,8 @@ import {
   TOOL_RESULT_RULES,
   TOOL_RESULT_SCHEMAS,
   agentEditorContextSchema,
+  editorEligibilitySchema,
+  editorFeatureSchema,
   exportResultSchema,
   readProjectResultSchema,
   renderViewsResultSchema,
@@ -45,6 +47,38 @@ import type {
   ValidationGateResultMirrorCheck,
   ValidationReportMirrorCheck
 } from "./contract.js";
+
+/**
+ * Shared editor-block fixture for the S3-A editor mirror tests. Module-level
+ * so the strictness-parity describe block (below) and the read_project block
+ * can both reference it without duplication.
+ */
+const editorBlock = {
+  version: 1,
+  projectId: "11111111-2222-4333-8444-555555555555",
+  editorRevision: "0".repeat(64),
+  sourceRevision: "0".repeat(64),
+  sourceFingerprint: "0".repeat(64),
+  sidecarStatus: "ready",
+  features: [
+    {
+      featureId: "11111111-2222-4333-8444-555555555555",
+      label: "wall",
+      projectId: "11111111-2222-4333-8444-555555555555",
+      createdAtRevision: "0".repeat(64),
+      sourceFingerprint: "0".repeat(64),
+      bindingVersion: 1,
+      provenance: { kind: "manual" },
+      binding: {
+        kind: "linear",
+        parameter: "wall",
+        axis: "z",
+        mapping: { scale: 1, offset: 0, anchor: "min" }
+      }
+    }
+  ],
+  eligibility: []
+};
 
 /** True only when A and B are mutually assignable. */
 type MutuallyAssignable<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -712,33 +746,6 @@ describe("read_project result payload uses real schemas, not unknown escape hatc
   // server-side as an empty confirmed document.
   // ───────────────────────────────────────────────────────────────────────────
 
-  const editorBlock = {
-    version: 1,
-    projectId: "11111111-2222-4333-8444-555555555555",
-    editorRevision: "0".repeat(64),
-    sourceRevision: "0".repeat(64),
-    sourceFingerprint: "0".repeat(64),
-    sidecarStatus: "ready",
-    features: [
-      {
-        featureId: "11111111-2222-4333-8444-555555555555",
-        label: "wall",
-        projectId: "11111111-2222-4333-8444-555555555555",
-        createdAtRevision: "0".repeat(64),
-        sourceFingerprint: "0".repeat(64),
-        bindingVersion: 1,
-        provenance: { kind: "manual" },
-        binding: {
-          kind: "linear",
-          parameter: "wall",
-          axis: "z",
-          mapping: { scale: 1, offset: 0, anchor: "min" }
-        }
-      }
-    ],
-    eligibility: []
-  };
-
   it("accepts a populated `editor` block as the S3-A additive surface", () => {
     const parsed = readProjectResultSchema.safeParse({ ...fullPayload, editor: editorBlock });
     expect(parsed.success).toBe(true);
@@ -797,6 +804,118 @@ describe("read_project result payload uses real schemas, not unknown escape hatc
     // requires the mirror be "exact" — that is enforced by the
     // AgentEditorContextMirrorCheck compile-time guard below.
     expect(agentEditorContextSchema.safeParse(editorBlock).success).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S3-A (Issue #68) — zod mirror strictness parity with @scadforge/protocol
+//
+// These assertions close out the Nemotron independent-review NITs 1, 3 and 4
+// (mirror strictness). NITs 2 (radial axis normalization) and 5 (duplicate
+// featureId) are deferred to server-side authoritative parsing in S3-B — zod
+// cannot express the duplicate-featureId check natively and the protocol
+// parser already enforces both at the wire boundary.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("zod mirror strictness parity (S3-A NIT 1 / NIT 3 / NIT 4)", () => {
+  it("NIT 1: counts Unicode code points for the label cap, not UTF-16 units", () => {
+    // 120 emoji is 120 code points but 240 UTF-16 units. .max(120) would have
+    // rejected this; the refine on Unicode code points now accepts.
+    const ok = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      label: "🌀".repeat(120)
+    });
+    expect(ok.success).toBe(true);
+
+    const tooLong = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      label: "🌀".repeat(121)
+    });
+    expect(tooLong.success).toBe(false);
+  });
+
+  it("NIT 3: rejects unknown top-level fields on editorFeatureSchema", () => {
+    const result = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      extra_field: "should be rejected"
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("NIT 3: rejects unknown top-level fields on editorEligibilitySchema", () => {
+    const result = editorEligibilitySchema.safeParse({
+      featureId: "11111111-2222-4333-8444-555555555555",
+      state: "requires-proof",
+      reason: null,
+      extra: true
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("NIT 3: rejects unknown top-level fields on agentEditorContextSchema", () => {
+    const result = agentEditorContextSchema.safeParse({
+      ...editorBlock,
+      extras: "should be rejected"
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("NIT 3: rejects unknown fields inside linear binding mapping", () => {
+    const result = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      binding: {
+        kind: "linear",
+        parameter: "wall",
+        axis: "z",
+        mapping: {
+          scale: 1,
+          offset: 0,
+          anchor: "min",
+          unexpected: true
+        }
+      }
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("NIT 3: rejects unknown fields inside the provenance object", () => {
+    const result = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      provenance: { kind: "manual", leaked: true }
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("NIT 3: rejects unknown fields inside the ai-proposed provenance", () => {
+    const result = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      provenance: { kind: "ai-proposed", confirmedBy: "user", extra: true }
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("NIT 4: rejects bindingVersion above Number.MAX_SAFE_INTEGER", () => {
+    const result = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      bindingVersion: Number.MAX_SAFE_INTEGER + 1
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("NIT 4: accepts bindingVersion at Number.MAX_SAFE_INTEGER", () => {
+    const result = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      bindingVersion: Number.MAX_SAFE_INTEGER
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("NIT 4: rejects non-integer bindingVersion", () => {
+    const result = editorFeatureSchema.safeParse({
+      ...editorBlock.features[0],
+      bindingVersion: 1.5
+    });
+    expect(result.success).toBe(false);
   });
 });
 
