@@ -1,13 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_VIEWS, createSnapshotLocked, initProject, mergeParamsAtomic } from "@scadforge/scad-core";
+import {
+  DEFAULT_VIEWS,
+  createSnapshotLocked,
+  editorRevision,
+  initProject,
+  mergeParamsAtomic,
+  withRecoveredProject,
+  writeSidecarLocked
+} from "@scadforge/scad-core";
 import type { RenderResult, RenderedView, SyntaxCheckResult } from "@scadforge/scad-core";
+import type { EditorFeature, EditorSidecar } from "@scadforge/protocol";
 import { RouteError } from "./errors.js";
-import { assertCompleteBuildRender, compileProposedSource, createScadCoreApi } from "./scad-core-impl.js";
+import { assertCompleteBuildRender, coherentSourceState, compileProposedSource, createScadCoreApi } from "./scad-core-impl.js";
 import { createServerRuntime, type ServerRuntime } from "./runtime.js";
 import { PROJECTS_DIR_ENV_VAR } from "./project-paths.js";
 
@@ -119,5 +129,64 @@ describe("projectResponse coherence under a concurrent slow writer (Issue #73 AC
         expect(response.params.tag).toBe("new");
       }
     }
+  });
+});
+
+// ── coherentSourceState carries the editor sidecar (Issue #87 / S3-B ticket B3, AC9) ──
+//
+// No wire response changes -- this only proves the INTERNAL coherent-read
+// result carries the sidecar fields B5/B6/B7 will consume.
+describe("coherentSourceState internal sidecar fields (Issue #87)", () => {
+  let root: string;
+  const providerConfig = { provider: "claude-agent-sdk", model: null, max_passes: 2 };
+
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "scadforge-coherent-source-state-"));
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  function feature(overrides: Partial<EditorFeature> = {}): EditorFeature {
+    return {
+      featureId: randomUUID(),
+      label: "Width",
+      projectId: randomUUID(),
+      createdAtRevision: "a".repeat(64),
+      sourceFingerprint: "b".repeat(64),
+      bindingVersion: 1,
+      provenance: { kind: "manual" },
+      binding: { kind: "linear", parameter: "width", axis: "x", mapping: { scale: 1, offset: 0, anchor: "min" } },
+      ...overrides
+    };
+  }
+
+  it("a brand-new project (S3-modern from its first snapshot) reads ready with an empty feature list and a non-null editor revision", async () => {
+    const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
+    const dir = runtime.dirFor("p");
+    await initProject(dir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    const state = await coherentSourceState(dir);
+
+    expect(state.sidecarStatus).toBe("ready");
+    expect(state.sidecarFeatures).toEqual([]);
+    expect(state.sidecarDigest).not.toBeNull();
+    expect(state.editorRevision).toBe(editorRevision(state.revision, state.sidecarDigest!));
+  });
+
+  it("a sidecar write changes editorRevision without changing revision (source untouched)", async () => {
+    const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
+    const dir = runtime.dirFor("p");
+    await initProject(dir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    const before = await coherentSourceState(dir);
+    const sidecar: EditorSidecar = { version: 1, features: [feature()] };
+    await withRecoveredProject(dir, (ctx) => writeSidecarLocked(ctx, sidecar));
+    const after = await coherentSourceState(dir);
+
+    expect(after.revision).toBe(before.revision);
+    expect(after.editorRevision).not.toBe(before.editorRevision);
+    expect(after.sidecarFeatures.map((f) => f.featureId)).toEqual([sidecar.features[0].featureId]);
   });
 });

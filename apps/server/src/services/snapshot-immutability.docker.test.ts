@@ -23,10 +23,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PROJECT_LAYOUT } from "@scadforge/protocol";
 import type { SnapshotManifest } from "@scadforge/protocol";
 import {
+  EMPTY_SIDECAR,
   initProject,
   parseStl,
   readSnapshotManifest,
   resolveSnapshotValidationPath,
+  sidecarDigest,
   snapshotDir
 } from "@scadforge/scad-core";
 import { createAgentScadCore } from "./agent-scad-core.js";
@@ -409,4 +411,38 @@ describe.skipIf(!dockerAvailable())("@docker Issue #45: snapshots are immutable 
     const meshFile = await rest.getSnapshotMeshFile("bracket", "0001");
     expect(meshFile).toBeNull();
   }, 60_000);
+
+  // ── Editor sidecar capture, S3-B B3 (Issue #87) ───────────────────────────
+  //
+  // `history/<id>/editor.json` is written ONCE, at snapshot creation, exactly
+  // like `manifest.json`/`model.scad`/`params.json` -- every test above
+  // already proves this incidentally (`checksumSnapshotDir` walks the WHOLE
+  // `history/<id>/` directory, `editor.json` included), but this test names
+  // it explicitly and additionally proves the COPY-FORWARD correctness of a
+  // real revert (the reverted snapshot's own captured copy, not a rewrite of
+  // the source's).
+
+  it("history/<id>/editor.json is written once at snapshot creation and stays byte-identical through validate/render/export/revert", async () => {
+    const { runtime, dir } = await seedProject();
+    const agentCore = createAgentScadCore({ runtime, projectId: "bracket" });
+    const rest = createScadCoreApi(runtime);
+
+    const snap1 = await readSnapshotManifest(dir, "0001");
+    expect(snap1.editor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(EMPTY_SIDECAR) });
+    const editorJsonPath = (id: string) => join(snapshotDir(dir, id), "editor.json");
+    const before = await readFile(editorJsonPath("0001"));
+
+    await agentCore.validateMesh({});
+    await agentCore.renderViews({ views: ["iso"] });
+    await rest.runExport("bracket", { format: "stl" });
+    expect(await readFile(editorJsonPath("0001"))).toEqual(before);
+
+    const reverted = await rest.revertSnapshot("bracket", "0001", {});
+    // 0001 -- the REVERT SOURCE -- is untouched by its own revert.
+    expect(await readFile(editorJsonPath("0001"))).toEqual(before);
+    // The REVERTED snapshot captured its OWN copy-forward from 0001's own
+    // captured editor.json -- byte-identical, never a re-derivation.
+    expect(await readFile(editorJsonPath(reverted.snapshot.id))).toEqual(before);
+    expect(reverted.snapshot.editor).toEqual(snap1.editor);
+  }, 120_000);
 });

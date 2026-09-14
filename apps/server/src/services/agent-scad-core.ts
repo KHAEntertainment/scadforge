@@ -14,7 +14,7 @@ import { readFile } from "node:fs/promises";
 import { basename, relative } from "node:path";
 import { rename, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { SnapshotManifest, ToolArtifact, ViewName } from "@scadforge/protocol";
+import type { EditorFeature, EditorSidecarStatus, ProjectManifest, SnapshotManifest, ToolArtifact, ViewName } from "@scadforge/protocol";
 import type {
   AgentExportRequest,
   AgentRenderRequest,
@@ -29,11 +29,14 @@ import type {
 import { lookup as libraryLookup } from "@scadforge/libs";
 import {
   attachValidationToSnapshotLocked,
+  computeSourceRevision,
   createSnapshotLocked,
+  editorRevision,
   exportRun,
   exportsDir,
   mergeParamsAtomic,
   readProjectManifestLocked,
+  readSidecarLocked,
   recordExport,
   rootModelPath,
   runParamExport,
@@ -93,6 +96,53 @@ export interface AgentScadCoreOptions {
 }
 
 /**
+ * The agent's coherent project + source + params (+, since Issue #87, editor
+ * sidecar) read result. INTERNAL-ONLY extension mirroring `scad-core-impl.ts`'s
+ * `SourceState` — the seam B5/B6/B7 read from, no change to the wire
+ * `ProjectState` (`readProject()` below still returns exactly that, unchanged).
+ * `sidecarDigest`/`editorRevision` are `null` whenever the sidecar status is
+ * `missing`/`corrupt`/`unsupported-version` (Tech Lead correction C1) —
+ * `sidecarFeatures` is `[]` in that case.
+ */
+export interface CoherentProjectState {
+  project: ProjectManifest;
+  scad: string;
+  params: ParamValues;
+  sidecarStatus: EditorSidecarStatus;
+  sidecarFeatures: EditorFeature[];
+  sidecarDigest: string | null;
+  editorRevision: string | null;
+}
+
+/**
+ * ONE boundary entry for project + scad + params + editor sidecar together
+ * (Issue #73: D7's "same recovered coherent read" requirement) — a
+ * concurrent writer landing between independently-timed reads could hand
+ * back a head that disagrees with the scad/params/sidecar it's paired with.
+ * Exported (was inlined in `readProject()` below) so this coherent-read
+ * result is directly unit-testable and independently reusable by a future
+ * ticket, without touching the wire `ProjectState` shape.
+ */
+export async function coherentProjectState(dir: string): Promise<CoherentProjectState> {
+  return withRecoveredProject(dir, async (ctx) => {
+    const project = await readProjectManifestLocked(ctx);
+    const scad = await readScadLocked(ctx);
+    const params = await readParamsLocked(ctx);
+    const sidecarRead = await readSidecarLocked(ctx);
+    const sourceRevision = computeSourceRevision(project.head, scad, params);
+    return {
+      project,
+      scad,
+      params,
+      sidecarStatus: sidecarRead.status,
+      sidecarFeatures: sidecarRead.sidecar?.features ?? [],
+      sidecarDigest: sidecarRead.digest,
+      editorRevision: sidecarRead.digest !== null ? editorRevision(sourceRevision, sidecarRead.digest) : null
+    };
+  });
+}
+
+/**
  * Binds `packages/agent`'s CAD seam to one project.
  *
  * Every method rejects with a `ScadForgeError` (the `ScadCoreFailure` shape
@@ -120,24 +170,25 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
 
   return {
     async readProject(): Promise<ProjectState> {
-      // ONE boundary entry for project + scad + params together (Issue #73:
-      // D7's "same recovered coherent read" requirement) -- the old code ran
-      // these as three INDEPENDENT operations (an unlocked `readProject`
-      // plus two more via `Promise.all`), so a concurrent writer landing
-      // between them could hand the agent a head that disagrees with the
-      // scad/params it's paired with. `paramSchema()` stays OUTSIDE the
-      // lock -- it is a slow OpenSCAD subprocess call, and (like
-      // `scad-core-impl.ts`'s `paramsResponse`) already tolerates being a
-      // live, best-effort derived view rather than a value pinned to the
-      // exact coherent instant above.
-      const { project, scad, params } = await withRecoveredProject(dir, async (ctx) => {
-        const project = await readProjectManifestLocked(ctx);
-        const scad = await readScadLocked(ctx);
-        const params = await readParamsLocked(ctx);
-        return { project, scad, params };
-      });
+      // `coherentProjectState` (above) is the ONE boundary entry for project
+      // + scad + params + editor sidecar together -- the old code ran
+      // project/scad/params as three INDEPENDENT operations (an unlocked
+      // `readProject` plus two more via `Promise.all`), so a concurrent
+      // writer landing between them could hand the agent a head that
+      // disagrees with the scad/params it's paired with. `paramSchema()`
+      // stays OUTSIDE the lock -- it is a slow OpenSCAD subprocess call, and
+      // (like `scad-core-impl.ts`'s `paramsResponse`) already tolerates
+      // being a live, best-effort derived view rather than a value pinned to
+      // the exact coherent instant above.
+      const coherent = await coherentProjectState(dir);
       const param_schema = await paramSchema();
-      return { scad, params, param_schema, validation: lastValidation, head_snapshot: project.head };
+      return {
+        scad: coherent.scad,
+        params: coherent.params,
+        param_schema,
+        validation: lastValidation,
+        head_snapshot: coherent.project.head
+      };
     },
 
     async writeScad(request: WriteScadRequest): Promise<WriteScadOutcome> {
