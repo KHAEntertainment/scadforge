@@ -41,12 +41,24 @@ export function App() {
   const projectId = selectedId;
   const chat = useChat(client, projectId);
   const snapshots = useSnapshots(client, projectId);
+  // Issue #79: `chat.state.headSnapshot` only resets to the new project's
+  // state inside `useChat`'s own effect — one render behind a `projectId`
+  // change, same as any other effect-driven reset. A plain ref comparison
+  // (not `useState`, so this never itself triggers a render) is true for
+  // exactly the first render after `projectId` changes, and lets that one
+  // render ignore `chat.state.headSnapshot` entirely rather than briefly
+  // treating the PREVIOUS project's head as this project's working head —
+  // `snapshots.snapshots` is already correct at this point (see
+  // `useSnapshots`'s own render-time reset), so `listedHead` alone is safe.
+  const previousProjectIdForHeadRef = useRef(projectId);
+  const switchingProjects = previousProjectIdForHeadRef.current !== projectId;
+  previousProjectIdForHeadRef.current = projectId;
   const workingHead = useMemo<SnapshotManifest | null>(() => {
     const listedHead = snapshots.snapshots[0] ?? null;
-    const chatHead = chat.state.headSnapshot;
+    const chatHead = switchingProjects ? null : chat.state.headSnapshot;
     if (!chatHead) return listedHead;
     return snapshots.snapshots.some((snapshot) => snapshot.id === chatHead.id) ? listedHead : chatHead;
-  }, [snapshots.snapshots, chat.state.headSnapshot]);
+  }, [snapshots.snapshots, chat.state.headSnapshot, switchingProjects]);
   const workingHeadId = workingHead?.id ?? null;
   const liveSource = useLiveModelSource(client, projectId, workingHeadId);
   const sourceEditor = useSourceEditor(client, projectId, snapshots.refresh);
@@ -105,6 +117,25 @@ export function App() {
   const pngUrls = useMemo<Partial<Record<ViewName, string | null>>>(() => Object.fromEntries((currentSnapshot?.renders ?? []).map((render) => [render.view, client.resolveUrl(render.url)])), [currentSnapshot, client]);
   const validation = currentSnapshot?.validation ?? null;
   const historical = selectedSnapshotId !== null && selectedSnapshotId !== workingHeadId;
+  // Issue #78: every inline Build CTA (Preview's empty state, the status
+  // panel's "Not validated" state) mirrors the header Build button's own
+  // disabled conditions, plus one case the header doesn't have — Build
+  // always targets the head, so an inline CTA shown while viewing a
+  // DIFFERENT (historical) snapshot would silently fix the wrong thing.
+  const buildDisabledReason = !projectId
+    ? "Select a project first."
+    : buildState === "building"
+      ? "Building…"
+      : chat.isStreaming
+        ? "Finish the active chat turn before building."
+        : sourceEditor.saving
+          ? "Saving your source edits…"
+          : sourceEditor.dirty
+            ? "Save or discard your source edits before building."
+            : historical
+              ? "Build validates the current head; select the head to build"
+              : null;
+  const buildDisabled = buildDisabledReason !== null;
   const liveSourceReady = (liveSource.projectId === undefined || liveSource.projectId === projectId)
     && (liveSource.headSnapshotId === undefined || liveSource.headSnapshotId === workingHeadId)
     && liveSource.scad !== null;
@@ -201,11 +232,11 @@ export function App() {
       {headerNotice || exportState ? <div className="studio-notice" role="status">{headerNotice ?? exportState}<button type="button" aria-label="Dismiss notice" onClick={() => { setHeaderNotice(null); setExportState(null); }}>Dismiss</button></div> : null}
       <main className="app-body">
         <Workspace
-          preview={<PreviewTab stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} />}
+          preview={<PreviewTab key={`preview-${projectId ?? "no-project"}`} stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} />}
           chat={<ChatPanel state={chat.state} isStreaming={chat.isStreaming} streamError={chat.streamError} onSend={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           params={<ParamsTab controller={paramsController} onAskAgent={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           code={<CodeTab client={client} projectId={projectId} editor={sourceEditor} historicalSnapshotId={selectedSnapshotId} isHistorical={historical} />}
-          history={<HistoryTab client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onSelectSnapshot={(id) => setSelectedSnapshotId(id)} />}
+          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onSelectSnapshot={(id) => setSelectedSnapshotId(id)} />}
         />
       </main>
       {projectError ? <p className="app-error" role="alert">{projectError}</p> : null}

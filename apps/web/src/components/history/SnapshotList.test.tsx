@@ -103,6 +103,35 @@ describe("SnapshotList (history)", () => {
     expect(rows[1]).toHaveAttribute("aria-pressed", "false");
   });
 
+  it("shows the enriched manifest's validation status (ok / warnings / failed), never falling back to 'Not validated' when validation is set (Issue #78 AC4)", () => {
+    // Mirrors `readSnapshotManifest`'s merge (packages/scad-core/src/store/derived.ts):
+    // a row's `validation` field IS the source of truth this component reads,
+    // regardless of how long ago the snapshot itself was created.
+    const snapshots = [
+      makeSnapshot({
+        id: "0004",
+        validation: { badge: "green", manifold: true, components: 1, volume_mm3: 500, warning_count: 0 }
+      }),
+      makeSnapshot({
+        id: "0003",
+        validation: { badge: "amber", manifold: true, components: 2, volume_mm3: 500, warning_count: 1 }
+      }),
+      makeSnapshot({
+        id: "0002",
+        validation: { badge: "red", manifold: false, components: null, volume_mm3: null, warning_count: 0 }
+      }),
+      makeSnapshot({ id: "0001", validation: null })
+    ];
+    render(<SnapshotList client={makeClient()} snapshots={snapshots} loading={false} error={null} selectedId={null} onSelect={vi.fn()} />);
+
+    const badges = screen.getAllByTestId("snapshot-badge");
+    expect(badges[0]).toHaveTextContent("Valid");
+    expect(badges[1]).toHaveTextContent("Warnings");
+    expect(badges[2]).toHaveTextContent("Invalid");
+    // A row with no validation attached is the only one that keeps "Not validated".
+    expect(badges[3]).toHaveTextContent("Not validated");
+  });
+
   it("calls onSelect with the clicked snapshot's id", async () => {
     const onSelect = vi.fn();
     const snapshots = [makeSnapshot({ id: "0001" }), makeSnapshot({ id: "0002", parent: "0001" })];

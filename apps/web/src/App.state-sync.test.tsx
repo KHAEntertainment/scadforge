@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SnapshotManifest } from "@scadforge/protocol";
@@ -39,7 +39,9 @@ const harness = vi.hoisted(() => ({
   },
   liveHead: null as string | null,
   controllerHead: null as string | null,
-  controllerOnSaved: null as (() => void) | null
+  controllerOnSaved: null as (() => void) | null,
+  previewMountCount: 0,
+  historyMountCount: 0
 }));
 
 vi.mock("./hooks/useProject.js", () => ({
@@ -106,27 +108,43 @@ vi.mock("./components/PreviewTab.js", () => ({
     validation?: { volume_mm3: number | null } | null;
     liveParams: Record<string, unknown>;
     meshStatus: string;
-  }) => (
-    <output
-      data-testid="preview-state"
-      data-snapshot={props.snapshotId ?? "none"}
-      data-validation={props.validation?.volume_mm3 ?? "none"}
-      data-params={JSON.stringify(props.liveParams)}
-      data-mesh-status={props.meshStatus}
-    />
-  )
+  }) => {
+    // Mount-count tracking (Issue #79): `App.tsx` keys this element by
+    // `projectId` so a project switch remounts it, clearing its internal
+    // measure/measureAxis/inspectOutcome state. A plain ordinary re-render
+    // (e.g. selecting a different snapshot within the SAME project) must
+    // NOT remount it — that would be its own regression (losing the user's
+    // Grid/Measure toggles on every History click).
+    useEffect(() => {
+      harness.previewMountCount += 1;
+    }, []);
+    return (
+      <output
+        data-testid="preview-state"
+        data-snapshot={props.snapshotId ?? "none"}
+        data-validation={props.validation?.volume_mm3 ?? "none"}
+        data-params={JSON.stringify(props.liveParams)}
+        data-mesh-status={props.meshStatus}
+      />
+    );
+  }
 }));
 vi.mock("./components/HistoryTab.js", () => ({
-  HistoryTab: (props: { onSelectSnapshot?: (id: string) => void; onExported: () => void }) => (
-    <div>
-      <button type="button" onClick={() => props.onSelectSnapshot?.("0001")}>
-        Select 0001
-      </button>
-      <button type="button" onClick={props.onExported}>
-        Refresh history
-      </button>
-    </div>
-  )
+  HistoryTab: (props: { onSelectSnapshot?: (id: string) => void; onExported: () => void }) => {
+    useEffect(() => {
+      harness.historyMountCount += 1;
+    }, []);
+    return (
+      <div>
+        <button type="button" onClick={() => props.onSelectSnapshot?.("0001")}>
+          Select 0001
+        </button>
+        <button type="button" onClick={props.onExported}>
+          Refresh history
+        </button>
+      </div>
+    );
+  }
 }));
 
 function snapshot(id: string, overrides: Partial<SnapshotManifest> = {}): SnapshotManifest {
@@ -153,6 +171,7 @@ function snapshot(id: string, overrides: Partial<SnapshotManifest> = {}): Snapsh
 }
 
 beforeEach(() => {
+  harness.project = { project: { id: "p1" }, loading: false, error: null };
   harness.chat.state = { headSnapshot: null, items: [], activeTurnId: null };
   harness.chat.isStreaming = false;
   harness.snapshots = [];
@@ -164,6 +183,8 @@ beforeEach(() => {
   harness.liveHead = null;
   harness.controllerHead = null;
   harness.controllerOnSaved = null;
+  harness.previewMountCount = 0;
+  harness.historyMountCount = 0;
 });
 
 describe("App working-head synchronization", () => {
@@ -284,5 +305,87 @@ describe("App working-head synchronization", () => {
 
     act(() => harness.controllerOnSaved?.());
     expect(harness.refresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("App project-switch reset (Issue #79)", () => {
+  it("never resolves the previous project's chat head as the new project's working head, even before the new snapshot list arrives", () => {
+    harness.snapshots = [snapshot("0002")];
+    harness.chat.state = { headSnapshot: snapshot("0002", { origin: "agent" }), items: [], activeTurnId: null };
+    const view = render(<App />);
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-snapshot", "0002");
+
+    // Switch projects. `useSnapshots` is mocked here, so this simulates what
+    // its OWN render-time reset (tested separately in useSnapshots.test.tsx)
+    // guarantees in the real app: the new project's snapshot array starts
+    // empty. `chat.state.headSnapshot` is deliberately left as project p1's
+    // stale value — `useChat`'s real reset effect hasn't run in this harness
+    // (it's mocked), which is exactly the race `App.tsx`'s own
+    // `switchingProjects` guard has to cover on its own.
+    harness.project = { project: { id: "p2" }, loading: false, error: null };
+    harness.snapshots = [];
+    view.rerender(<App />);
+
+    // Must not fall back to project p1's stale chat head — the whole point
+    // of the fix. Before this fix, this asserted "0002".
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-snapshot", "none");
+
+    // `useChat`'s own real reset effect (`hooks/useChat.ts`, keyed on
+    // `projectId`) dispatches synchronously within the same effect-flush that
+    // follows the render above — by the time anything else happens for p2,
+    // its chat head is p2's own (here: none yet). Simulating that is what
+    // makes the next step a realistic continuation rather than an
+    // indefinitely-stale chat head this fix was never meant to cover.
+    harness.chat.state = { headSnapshot: null, items: [], activeTurnId: null };
+
+    // Once p2's own snapshots arrive, preview reflects them, not p1's.
+    harness.snapshots = [snapshot("0005")];
+    view.rerender(<App />);
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-snapshot", "0005");
+  });
+
+  it("clears an explicit historical selection on project switch even when the new project reuses the same snapshot id (the common case — every project's history starts at 0001)", () => {
+    harness.snapshots = [snapshot("0002"), snapshot("0001")];
+    const view = render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Select 0001" }));
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-snapshot", "0001");
+
+    // p2's OWN history also happens to have an "0001" — a same-id coincidence
+    // that a `workingHeadId`-only comparison would miss (previous "0001" ===
+    // new "0001", so nothing looked like it changed).
+    harness.project = { project: { id: "p2" }, loading: false, error: null };
+    harness.snapshots = [];
+    view.rerender(<App />);
+    harness.snapshots = [snapshot("0001", { message: "p2's own first snapshot" })];
+    view.rerender(<App />);
+
+    // The selection must have been cleared by the switch, so preview follows
+    // p2's head (which happens to also be "0001") rather than a leftover,
+    // never-cleared selection from p1.
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-snapshot", "0001");
+    expect(screen.getByTestId("preview-state")).toHaveAttribute("data-validation", "none");
+  });
+
+  it("remounts the Preview and History subtrees on project switch, but not on an ordinary same-project snapshot selection", () => {
+    harness.snapshots = [snapshot("0002"), snapshot("0001")];
+    const view = render(<App />);
+    expect(harness.previewMountCount).toBe(1);
+    expect(harness.historyMountCount).toBe(1);
+
+    // Selecting a snapshot within the SAME project must not remount either
+    // subtree — that would lose the user's Grid/Measure/Inspect toggles on
+    // every History click, a regression this fix must not introduce.
+    fireEvent.click(screen.getByRole("button", { name: "Select 0001" }));
+    expect(harness.previewMountCount).toBe(1);
+    expect(harness.historyMountCount).toBe(1);
+
+    // A genuine project switch DOES remount both — this is what clears
+    // PreviewTab's internal measure/measureAxis/inspectOutcome state (Issue
+    // #79 AC) without App having to track and clear each field itself.
+    harness.project = { project: { id: "p2" }, loading: false, error: null };
+    harness.snapshots = [];
+    view.rerender(<App />);
+    expect(harness.previewMountCount).toBe(2);
+    expect(harness.historyMountCount).toBe(2);
   });
 });
