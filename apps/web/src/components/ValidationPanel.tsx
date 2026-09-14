@@ -57,6 +57,14 @@ export function validationFindings(validation: ValidationSummary): string[] {
 export interface ValidationPanelProps {
   /** The selected snapshot's validation summary; null when nothing has validated it. */
   validation: ValidationSummary | null;
+  /** Same handler as the header's Build button (Issue #78) — omitted, the CTA is not rendered. */
+  onBuild?: () => void;
+  /** True while a build is in flight; swaps the CTA's label/detail to "Validating…" (Issue #78 AC). */
+  building?: boolean;
+  /** Disables the inline Build action; mirrors the header button's own conditions. */
+  buildDisabled?: boolean;
+  /** Why the action is disabled right now, shown as the button's tooltip. Null/undefined when enabled. */
+  buildDisabledReason?: string | null;
 }
 
 /**
@@ -67,14 +75,30 @@ export interface ValidationPanelProps {
  * no findings attached — an amber "Warnings" that never said what the warning
  * was. This panel sits under the preview and spells the verdict out.
  */
-export function ValidationPanel({ validation }: ValidationPanelProps) {
+export function ValidationPanel({ validation, onBuild, building = false, buildDisabled = false, buildDisabledReason = null }: ValidationPanelProps) {
   if (!validation) {
     return (
       <div className="validation-panel validation-panel--unknown" data-testid="validation-panel">
         <span className="validation-badge validation-badge--unknown" data-testid="validation-panel-badge">
           Not validated
         </span>
-        <span className="validation-panel-detail">This snapshot has not been checked yet.</span>
+        <span className="validation-panel-detail">
+          {building
+            ? "Validating…"
+            : "This snapshot has not been checked yet. Build validates the model and creates the mesh."}
+        </span>
+        {onBuild ? (
+          <button
+            type="button"
+            className="button button--secondary validation-build-button"
+            data-testid="validation-build-button"
+            onClick={onBuild}
+            disabled={buildDisabled}
+            title={buildDisabledReason ?? undefined}
+          >
+            {building ? "Validating…" : "Build"}
+          </button>
+        ) : null}
       </div>
     );
   }

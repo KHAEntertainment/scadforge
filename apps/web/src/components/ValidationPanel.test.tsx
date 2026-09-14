@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import type { ValidationSummary } from "@scadforge/protocol";
 import { ValidationPanel, validationFindings } from "./ValidationPanel.js";
 
@@ -38,6 +38,48 @@ describe("ValidationPanel (Issue #41 symptom 3)", () => {
     render(<ValidationPanel validation={null} />);
     expect(screen.getByTestId("validation-panel-badge")).toHaveTextContent("Not validated");
     expect(screen.getByTestId("validation-panel")).toHaveTextContent("has not been checked");
+  });
+
+  it("counterexample: no onBuild handler — the 'Not validated' state renders no Build action", () => {
+    render(<ValidationPanel validation={null} />);
+    expect(screen.queryByTestId("validation-build-button")).not.toBeInTheDocument();
+  });
+});
+
+describe("ValidationPanel — Build CTA (Issue #78 AC2)", () => {
+  it("gains the same one-line instruction and an inline Build action when 'Not validated'", () => {
+    const onBuild = vi.fn();
+    render(<ValidationPanel validation={null} onBuild={onBuild} buildDisabled={false} buildDisabledReason={null} />);
+
+    expect(screen.getByTestId("validation-panel")).toHaveTextContent(/build validates the model and creates the mesh/i);
+    const button = screen.getByTestId("validation-build-button");
+    expect(button).toBeEnabled();
+    expect(button).toHaveTextContent("Build");
+    fireEvent.click(button);
+    expect(onBuild).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows 'Validating…' in place of the instruction and on the button while building", () => {
+    render(<ValidationPanel validation={null} onBuild={vi.fn()} building buildDisabled buildDisabledReason="Building…" />);
+
+    expect(screen.getByTestId("validation-panel")).toHaveTextContent("Validating…");
+    expect(screen.getByTestId("validation-build-button")).toHaveTextContent("Validating…");
+    expect(screen.getByTestId("validation-build-button")).toBeDisabled();
+  });
+
+  it("disables the Build action with a tooltip naming the reason", () => {
+    render(
+      <ValidationPanel
+        validation={null}
+        onBuild={vi.fn()}
+        buildDisabled
+        buildDisabledReason="Finish the active chat turn before building."
+      />
+    );
+
+    const button = screen.getByTestId("validation-build-button");
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", "Finish the active chat turn before building.");
   });
 });
 

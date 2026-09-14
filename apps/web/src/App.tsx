@@ -105,6 +105,25 @@ export function App() {
   const pngUrls = useMemo<Partial<Record<ViewName, string | null>>>(() => Object.fromEntries((currentSnapshot?.renders ?? []).map((render) => [render.view, client.resolveUrl(render.url)])), [currentSnapshot, client]);
   const validation = currentSnapshot?.validation ?? null;
   const historical = selectedSnapshotId !== null && selectedSnapshotId !== workingHeadId;
+  // Issue #78: every inline Build CTA (Preview's empty state, the status
+  // panel's "Not validated" state) mirrors the header Build button's own
+  // disabled conditions, plus one case the header doesn't have — Build
+  // always targets the head, so an inline CTA shown while viewing a
+  // DIFFERENT (historical) snapshot would silently fix the wrong thing.
+  const buildDisabledReason = !projectId
+    ? "Select a project first."
+    : buildState === "building"
+      ? "Building…"
+      : chat.isStreaming
+        ? "Finish the active chat turn before building."
+        : sourceEditor.saving
+          ? "Saving your source edits…"
+          : sourceEditor.dirty
+            ? "Save or discard your source edits before building."
+            : historical
+              ? "Build validates the current head; select the head to build"
+              : null;
+  const buildDisabled = buildDisabledReason !== null;
   const liveSourceReady = (liveSource.projectId === undefined || liveSource.projectId === projectId)
     && (liveSource.headSnapshotId === undefined || liveSource.headSnapshotId === workingHeadId)
     && liveSource.scad !== null;
@@ -201,7 +220,7 @@ export function App() {
       {headerNotice || exportState ? <div className="studio-notice" role="status">{headerNotice ?? exportState}<button type="button" aria-label="Dismiss notice" onClick={() => { setHeaderNotice(null); setExportState(null); }}>Dismiss</button></div> : null}
       <main className="app-body">
         <Workspace
-          preview={<PreviewTab stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} />}
+          preview={<PreviewTab stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} />}
           chat={<ChatPanel state={chat.state} isStreaming={chat.isStreaming} streamError={chat.streamError} onSend={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           params={<ParamsTab controller={paramsController} onAskAgent={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           code={<CodeTab client={client} projectId={projectId} editor={sourceEditor} historicalSnapshotId={selectedSnapshotId} isHistorical={historical} />}
