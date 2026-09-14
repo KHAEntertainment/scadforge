@@ -77,6 +77,17 @@
 - **Model cost**: `SCADFORGE_MODEL` unset → SDK defaults to Opus; a single-pass Scenario A turn cost **$0.97** vs Spike 3's $0.08–0.14 on a cheaper model. Set the default explicitly before the M3 eval harness runs 10–20 prompts per change.
 - **Contract friction logged (no frozen edits)**: (1) `ChatTurnRequest.images` has no path into the agent — text-only in M1, needed for v2 photo input; (2) `ToolResultEvent` is summary-only so SSE consumers can't read a `ValidationReport` from the stream (harness reads the persisted manifest); (3) `writeScadResultSchema` can't express a failed syntax check (superset workaround parses); (4) no error code distinguishes green-validation early-stop from genuine `PASS_BUDGET_EXHAUSTED`.
 
+## External Review Policy (owner decision 2026-09-13)
+- **Mode**: `off`. CodeRabbit on the current free plan posts a walkthrough comment but never submits a formal review, so a review-completion gate keyed on it can never clear (observed on PRs #71, #74, #80, #81).
+- **Substitute**: every PR gets an internal read-only QA lane plus an independent read-only review lane with distinct agent identities before the Tech Lead rates it. Neither lane may hold implementation ownership. CodeRabbit's walkthrough is read as advisory context only.
+- **Trusted / required / ignored reviewers**: none.
+- Revisit if the CodeRabbit plan changes or a reviewer that submits formal reviews is adopted.
+
+## Execution Routing Policy (owner decision 2026-09-13)
+- **Independent review**: `openrouter` harness, model `nvidia/nemotron-3-ultra-550b-a55b:free`, reasoning `high`. Approved by the owner per use; the free tier does not draw on the OpenRouter budget. Fallbacks in order when it is unavailable: MiniMax M3 via `opencode`, then GLM 5.3 via `openrouter` (budget-checked).
+- **Implementation**: `claude` / latest Sonnet / high (unchanged from the global guide).
+- **QA**: DeepSeek V4 Pro via `qwen` when it has balance; otherwise Kimi K3 via `kimi`; otherwise `claude` / Sonnet. Recorded because on 2026-09-13 the first two routes failed (402 insufficient balance; zero output).
+
 ## Current Status
 - **Last updated**: 2026-09-08
 - **M0 core deliverables and M1 complete.** M0 still has license-gate debt #10. Scenario A was rerun unchanged on 2026-09-08: 6/6 assertions passed with one explicit Sonnet turn; evidence is under `evals/scenario-a/evidence/`. The baseline workspace suite passed 790 tests, including Docker suites.
