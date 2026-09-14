@@ -91,6 +91,11 @@ import { readDerivedEnrichmentLocked, writeDerivedValidationLocked } from "./der
 import { withFileLock } from "./file-lock.js";
 import { type LockedProject, type ReadResult, withRecoveredProject } from "./recovered.js";
 import {
+  captureSidecarForSnapshotLocked,
+  readSnapshotSidecarLocked,
+  writeSidecarBytesLocked
+} from "../editor/sidecar.js";
+import {
   attachRendersToSnapshotLocked,
   resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
@@ -473,6 +478,18 @@ async function writeSnapshotFiles(
     });
   }
 
+  // editor.json (S3-B B3, Issue #87): every new snapshot -- including
+  // ordinary source/params snapshots, not just editor commands -- captures
+  // the CURRENT root editor sidecar verbatim. Refuses (never silently drops
+  // or fabricates) when the current root sidecar is missing/corrupt/
+  // unsupported-version; a legacy project's sidecar-naive first snapshot
+  // establishes the root sidecar and reports `legacyMarkerFlip`, which is
+  // applied to the SAME in-memory `project` object below so the marker flip
+  // and the head/updated bump publish in ONE `project.json` write (sidecar
+  // bytes are written before this point, satisfying "sidecar then manifest").
+  const sidecarCapture = await captureSidecarForSnapshotLocked(ctx);
+  await writeFile(join(dir, "editor.json"), sidecarCapture.bytes, "utf8");
+
   const manifest: SnapshotManifest = {
     id,
     parent,
@@ -490,7 +507,8 @@ async function writeSnapshotFiles(
     params: input.params,
     renders,
     validation: validationSummary,
-    annotations: []
+    annotations: [],
+    editor: sidecarCapture.descriptor
   };
   await writeFile(join(dir, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(manifest, null, 2), "utf8");
 
@@ -498,10 +516,12 @@ async function writeSnapshotFiles(
   await writeFile(rootModelPath(ctx.projectDir), content, "utf8");
   await writeFile(rootParamsPath(ctx.projectDir), JSON.stringify(paramsFile, null, 2), "utf8");
 
-  // Update project.json head.
+  // Update project.json head (and, if this snapshot flipped a legacy
+  // project's editor marker above, editor_store_version too -- ONE write).
   if (project) {
     project.head = id;
     project.updated = manifest.timestamp;
+    if (sidecarCapture.legacyMarkerFlip) project.editor_store_version = 1;
     await writeProjectManifest(ctx.projectDir, project);
   }
 
@@ -664,6 +684,21 @@ export async function revertToSnapshotLocked(
       const paramsRaw = await readFile(join(snapshotDir(ctx.projectDir, targetId), target.files.params_json), "utf8");
       const paramsFile = JSON.parse(paramsRaw) as ParamsFile;
       const params = (paramsFile.parameterSets[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
+
+      // editor.json (S3-B B3, Issue #87): the target's EXACT canonical
+      // sidecar bytes are copied forward as the new ROOT sidecar -- never
+      // merged with whatever the current root sidecar has (mirrors how
+      // model.scad/params.json are wholesale-replaced, never merged, on
+      // revert). A pre-S3 target yields the canonical empty sidecar. Refuses
+      // when either the target's OWN captured sidecar, or the CURRENT root
+      // sidecar this overwrites, is corrupt -- never silently drop/repair
+      // either side. This must happen BEFORE `createSnapshotLocked` below:
+      // that call's own `writeSnapshotFiles` captures whatever the root
+      // sidecar reads as AT THAT POINT into the new revert snapshot, so
+      // overwriting the root here is what makes the capture correct.
+      const targetSidecar = await readSnapshotSidecarLocked(ctx, targetId);
+      if (targetSidecar.status === "corrupt") throw targetSidecar.error;
+      await writeSidecarBytesLocked(ctx, targetSidecar.sidecar);
 
       // Resolve read locations before creating the new snapshot. Each
       // resolver checks the post-creation `derived/` tree first and then
