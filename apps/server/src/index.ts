@@ -8,7 +8,7 @@
 import { mkdir } from "node:fs/promises";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
-import { createRealAgentProvider } from "./services/agent-impl.js";
+import { AGENT_STDERR_ENV_VAR, createRealAgentProvider } from "./services/agent-impl.js";
 import { createScadCoreApi } from "./services/scad-core-impl.js";
 import { createServerRuntime } from "./services/runtime.js";
 
@@ -27,4 +27,7 @@ serve({ fetch: app.fetch, port }, (info) => {
   console.log(`  projects root: ${runtime.root}`);
   console.log(`  provider:      ${runtime.provider.provider} (model: ${runtime.provider.model ?? "sdk default"})`);
   console.log(`  max passes:    ${runtime.provider.max_passes}`);
+  console.log(
+    `  agent stderr:  ${process.env[AGENT_STDERR_ENV_VAR] === "0" ? "disabled" : `forwarded (${AGENT_STDERR_ENV_VAR}=0 to disable)`}`
+  );
 });

@@ -34,6 +34,103 @@ export interface RealAgentProviderOptions {
 }
 
 /**
+ * Set to `"0"` to disable CLI stderr forwarding (Issue #75 AC). Default is
+ * enabled — the bundled CLI's stderr is otherwise the only place MCP
+ * connection and API diagnostics for a turn are visible at all.
+ */
+export const AGENT_STDERR_ENV_VAR = "SCADFORGE_AGENT_STDERR";
+
+/** Never let an unterminated stderr chunk grow the carry buffer forever. */
+const STDERR_CARRY_LIMIT = 4096;
+
+/** What {@link createAgentStderrForwarder} returns; `null` when disabled. */
+export interface AgentStderrForwarder {
+  /** Passed straight through as `ClaudeAgentSdkProviderOptions.onStderr`. */
+  onStderr: (data: string) => void;
+  /**
+   * Call with the running turn's id at the start of `runTurn`, and with
+   * `null` once it ends, so lines are stamped with the turn that actually
+   * produced them. A line that arrives outside any active turn (subprocess
+   * startup/teardown) is stamped `[agent]`.
+   */
+  setCurrentTurnId: (turnId: string | null) => void;
+}
+
+/**
+ * Builds the CLI stderr forwarder wired into the default `ClaudeAgentSdkProvider`
+ * (Issue #75): the subprocess's stderr — where MCP-connection and API
+ * diagnostics land — was previously discarded entirely (no `onStderr` was
+ * ever passed), so nothing about a live turn was observable from the server.
+ *
+ * One `process.stderr.write` per stderr *event* (one subprocess data chunk),
+ * never one per line: chunk boundaries do not line up with newlines, and a
+ * chatty subprocess must not turn into a synchronous-write storm. Lines
+ * within one chunk are still each stamped individually. An unterminated tail
+ * is carried to the next chunk but capped at {@link STDERR_CARRY_LIMIT} —
+ * past that it is flushed as-is instead of grown forever, so a pathological
+ * stream can never buffer without bound here.
+ */
+export function createAgentStderrForwarder(
+  env: NodeJS.ProcessEnv = process.env
+): AgentStderrForwarder | null {
+  if (env[AGENT_STDERR_ENV_VAR] === "0") return null;
+
+  let currentTurnId: string | null = null;
+  let carry = "";
+
+  const onStderr = (data: string): void => {
+    carry += data;
+    const lines: string[] = [];
+    let newlineAt: number;
+    while ((newlineAt = carry.indexOf("\n")) !== -1) {
+      lines.push(carry.slice(0, newlineAt));
+      carry = carry.slice(newlineAt + 1);
+    }
+    if (carry.length > STDERR_CARRY_LIMIT) {
+      lines.push(carry);
+      carry = "";
+    }
+    const nonEmpty = lines.map((line) => line.trimEnd()).filter((line) => line.length > 0);
+    if (nonEmpty.length === 0) return;
+    const prefix = currentTurnId ? `[turn ${currentTurnId}]` : "[agent]";
+    process.stderr.write(nonEmpty.map((line) => `${prefix} ${line}`).join("\n") + "\n");
+  };
+
+  return {
+    onStderr,
+    setCurrentTurnId: (turnId) => {
+      currentTurnId = turnId;
+    }
+  };
+}
+
+/** Builds the default provider + forwarder pair exactly as production does. */
+function buildDefaultProvider(
+  runtime: ServerRuntime,
+  env: NodeJS.ProcessEnv
+): { provider: ClaudeAgentSdkProvider; forwarder: AgentStderrForwarder | null } {
+  const forwarder = createAgentStderrForwarder(env);
+  const provider = new ClaudeAgentSdkProvider({
+    model: runtime.provider.model ?? undefined,
+    onStderr: forwarder?.onStderr
+  });
+  return { provider, forwarder };
+}
+
+/**
+ * Exposed for the wiring test (Issue #75 AC): builds exactly the model
+ * provider `createRealAgentProvider` uses when the caller supplies no
+ * override, so `onStderr` wiring can be asserted without spawning the
+ * bundled CLI.
+ */
+export function buildDefaultModelProvider(
+  runtime: ServerRuntime,
+  env: NodeJS.ProcessEnv = process.env
+): ModelProvider {
+  return buildDefaultProvider(runtime, env).provider;
+}
+
+/**
  * True when the project's `model.scad` holds real content rather than the
  * placeholder a fresh project starts with. Drives `hasExistingModel`, which
  * decides whether the turn prompt tells the model to read before it rewrites
@@ -50,53 +147,65 @@ function hasRealModel(scad: string): boolean {
 export function createRealAgentProvider(options: RealAgentProviderOptions): AgentProvider {
   const { runtime } = options;
   const libraries = createLibraryIndex();
-  const modelProvider =
-    options.modelProvider ?? new ClaudeAgentSdkProvider({ model: runtime.provider.model ?? undefined });
+  // An injected `modelProvider` (tests, the eval harness) owns its own stderr
+  // wiring, if any; only the default construction gets the forwarder below.
+  const defaultBuild = options.modelProvider ? null : buildDefaultProvider(runtime, process.env);
+  const modelProvider = options.modelProvider ?? defaultBuild!.provider;
+  const forwarder = defaultBuild?.forwarder ?? null;
+
+  async function runOneTurn(input: AgentTurnInput, onEvent: AgentEventSink): Promise<void> {
+    const dir = runtime.dirFor(input.projectId);
+    const scadCore = createAgentScadCore({ runtime, projectId: input.projectId });
+
+    // A chat turn may carry parameter overrides. They are persisted BEFORE
+    // the turn (`ChatTurnRequest.params`: "Parameter overrides to apply
+    // before the turn runs"), so the agent's `read_project` sees the values
+    // the user is actually asking about.
+    if (input.params && Object.keys(input.params).length > 0) {
+      await scadCore.setParams(input.params, 0);
+    }
+
+    const scad = await readScad(dir);
+    await readProject(dir); // PROJECT_NOT_FOUND surfaces before the model is called
+    await readParams(dir);
+
+    // The host already emitted `turn_started` (see the header).
+    const forward: AgentEventSink = (event: SseEvent) => {
+      if (event.type === "turn_started") return;
+      onEvent(event);
+    };
+
+    const message =
+      input.images.length > 0
+        ? // `packages/agent`'s turn prompt is text-only in M1 (annotated-view
+          // image input is the Round-3 annotate overlay, SDP §9). Rather than
+          // dropping the attachments silently, tell the model they exist.
+          `${input.message}\n\n(The user attached ${input.images.length} annotated view(s); image input is not wired in this milestone.)`
+        : input.message;
+
+    await runAgentTurn({
+      projectId: input.projectId,
+      message,
+      provider: modelProvider,
+      scadCore,
+      libraries,
+      onEvent: forward,
+      turnId: input.turnId,
+      maxPasses: input.maxPasses,
+      hasExistingModel: hasRealModel(scad),
+      librariesAvailable: true,
+      model: runtime.provider.model
+    });
+  }
 
   return {
     async runTurn(input: AgentTurnInput, onEvent: AgentEventSink): Promise<void> {
-      const dir = runtime.dirFor(input.projectId);
-      const scadCore = createAgentScadCore({ runtime, projectId: input.projectId });
-
-      // A chat turn may carry parameter overrides. They are persisted BEFORE
-      // the turn (`ChatTurnRequest.params`: "Parameter overrides to apply
-      // before the turn runs"), so the agent's `read_project` sees the values
-      // the user is actually asking about.
-      if (input.params && Object.keys(input.params).length > 0) {
-        await scadCore.setParams(input.params, 0);
+      forwarder?.setCurrentTurnId(input.turnId);
+      try {
+        await runOneTurn(input, onEvent);
+      } finally {
+        forwarder?.setCurrentTurnId(null);
       }
-
-      const scad = await readScad(dir);
-      await readProject(dir); // PROJECT_NOT_FOUND surfaces before the model is called
-      await readParams(dir);
-
-      // The host already emitted `turn_started` (see the header).
-      const forward: AgentEventSink = (event: SseEvent) => {
-        if (event.type === "turn_started") return;
-        onEvent(event);
-      };
-
-      const message =
-        input.images.length > 0
-          ? // `packages/agent`'s turn prompt is text-only in M1 (annotated-view
-            // image input is the Round-3 annotate overlay, SDP §9). Rather than
-            // dropping the attachments silently, tell the model they exist.
-            `${input.message}\n\n(The user attached ${input.images.length} annotated view(s); image input is not wired in this milestone.)`
-          : input.message;
-
-      await runAgentTurn({
-        projectId: input.projectId,
-        message,
-        provider: modelProvider,
-        scadCore,
-        libraries,
-        onEvent: forward,
-        turnId: input.turnId,
-        maxPasses: input.maxPasses,
-        hasExistingModel: hasRealModel(scad),
-        librariesAvailable: true,
-        model: runtime.provider.model
-      });
     }
   };
 }
