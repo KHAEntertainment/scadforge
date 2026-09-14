@@ -26,6 +26,8 @@ import type {
   BuildRequest,
   BuildResponse,
   CreateProjectRequest,
+  EditorFeature,
+  EditorSidecarStatus,
   ExportRecord,
   ExportRequest,
   ExportResponse,
@@ -55,6 +57,7 @@ import {
   attachValidationToSnapshotLocked,
   computeSourceRevision,
   createSnapshotLocked,
+  editorRevision,
   exportRunWithValidation,
   exportsDir,
   initProject,
@@ -62,6 +65,7 @@ import {
   mergeParamsAtomic,
   normalizeLineEndings,
   readProjectManifestLocked,
+  readSidecarLocked,
   readSnapshotManifest,
   readSnapshotManifestLocked,
   recordExport,
@@ -217,32 +221,64 @@ export async function renderAndAttach(
 
 // ── source revision + proposed-source compilation (Issue #54) ──────────────
 
-/** The coherent head+source+params state of a project, plus its opaque revision. */
-interface SourceState {
+/**
+ * The coherent head+source+params state of a project, plus its opaque
+ * revision. Also carries the S3-B B3 (Issue #87) editor sidecar's status,
+ * features, digest and the resulting editor revision — an INTERNAL-ONLY
+ * extension: this is the seam B5/B6/B7 read from, but no wire response
+ * (`SourceResponse` etc.) exposes these fields yet. `sidecarDigest` and
+ * `editorRevision` are `null` whenever the sidecar status is `missing`,
+ * `corrupt` or `unsupported-version` (Tech Lead correction C1) — a caller
+ * must never compute an editor revision from a sidecar that does not
+ * actually, trustworthily exist on disk. `sidecarFeatures` is `[]` in that
+ * case (never a fabricated non-empty list).
+ */
+export interface SourceState {
   project: ProjectManifest;
   head: SnapshotId | null;
   scad: string;
   params: ParamValues;
   revision: string;
+  sidecarStatus: EditorSidecarStatus;
+  sidecarFeatures: EditorFeature[];
+  sidecarDigest: string | null;
+  editorRevision: string | null;
 }
 
 /**
- * Reads the project's coherent head + `model.scad` + `params.json` state
- * under the recovery boundary, so the returned revision never mixes a head
- * from one write with a source/params from another. Every writer of those
- * three files serializes on the same lock, so reading inside it is what makes
- * the (head, source, params) triple coherent. A missing project surfaces
- * `PROJECT_NOT_FOUND` from the boundary itself (Issue #73:
- * `withRecoveredProject` translates the lock's own missing-`.scadforge/`
- * case), so the separate unlocked pre-check the old code needed before it
- * dared enter the lock is gone.
+ * Reads the project's coherent head + `model.scad` + `params.json` (+, since
+ * Issue #87, editor sidecar) state under the recovery boundary, so the
+ * returned revision never mixes a head from one write with a source/params
+ * from another. Every writer of those files serializes on the same lock, so
+ * reading inside it is what makes the (head, source, params, sidecar) tuple
+ * coherent. A missing project surfaces `PROJECT_NOT_FOUND` from the boundary
+ * itself (Issue #73: `withRecoveredProject` translates the lock's own
+ * missing-`.scadforge/` case), so the separate unlocked pre-check the old
+ * code needed before it dared enter the lock is gone.
+ *
+ * Exported (was private) so this internal coherent-read result is directly
+ * unit-testable — no wire-shape change; every existing wire-facing caller
+ * (`sourceResponse`/`preflightSource`/`updateSource`) still destructures only
+ * the fields it already used.
  */
-async function coherentSourceState(dir: string): Promise<SourceState> {
+export async function coherentSourceState(dir: string): Promise<SourceState> {
   return withRecoveredProject(dir, async (ctx) => {
     const project = await readProjectManifestLocked(ctx);
     const scad = await readScadLocked(ctx);
     const params = await readParamsLocked(ctx);
-    return { project, head: project.head, scad, params, revision: computeSourceRevision(project.head, scad, params) };
+    const sidecarRead = await readSidecarLocked(ctx);
+    const revision = computeSourceRevision(project.head, scad, params);
+    return {
+      project,
+      head: project.head,
+      scad,
+      params,
+      revision,
+      sidecarStatus: sidecarRead.status,
+      sidecarFeatures: sidecarRead.sidecar?.features ?? [],
+      sidecarDigest: sidecarRead.digest,
+      editorRevision: sidecarRead.digest !== null ? editorRevision(revision, sidecarRead.digest) : null
+    };
   });
 }
 
