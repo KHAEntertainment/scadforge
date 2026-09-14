@@ -143,7 +143,9 @@ export function createToolHandlers(deps: ToolHandlerDeps): ToolHandlerMap {
     // adapters (no editor context) keep omitting the field. Wire-and-recovery
     // §"D7 agent referenceability" forbids constructing an empty block on the
     // handler side: omission means "not implemented", not "empty confirmed
-    // document".
+    // document". This path is now exercised in production (Issue #92, S3-B
+    // ticket B7): `apps/server`'s adapter always supplies `state.editor`, so
+    // it is forwarded on every real `read_project` call.
     const payload: Record<string, unknown> = {
       ok: true,
       pass: budget.pass,
