@@ -137,3 +137,19 @@ export type { DigestDomain } from "./editor/canonical.js";
 export { withRecoveredProject } from "./store/recovered.js";
 export type { LockedProject, ReadResult } from "./store/recovered.js";
 export { FILE_LOCK_MAX_ATTEMPTS, LOCK_OWNER_FILE, STALE_LOCK_MIN_AGE_MS, withFileLock } from "./store/file-lock.js";
+
+// ── sidecar storage (Issue #87 / S3-B ticket B3) ────────────────────────────
+//
+// Kept as its own block for the same merge-friendliness reason as B1/B2
+// above. `writeSidecarBytesLocked`, `captureSidecarForSnapshotLocked` and the
+// sidecar path helpers stay package-internal (store.ts imports them via a
+// relative path) -- nothing outside this package needs them yet.
+export {
+  EMPTY_SIDECAR,
+  quarantine,
+  readSidecarLocked,
+  readSnapshotSidecarLocked,
+  serializeCanonicalSidecar,
+  writeSidecarLocked
+} from "./editor/sidecar.js";
+export type { SidecarReadResult } from "./editor/sidecar.js";
