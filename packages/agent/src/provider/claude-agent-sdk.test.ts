@@ -92,7 +92,11 @@ describe("buildQuery — the mandatory options are the provider's job, never the
     expect(built.options.allowDangerouslySkipPermissions).toBe(true);
   });
 
-  it("exposes MANDATORY_SDK_OPTIONS as the single source of those five", () => {
+  it("always sets strictMcpConfig: true (Issue #75: omitting it loads the operator's entire ~/.claude.json MCP server list)", () => {
+    expect(built.options.strictMcpConfig).toBe(true);
+  });
+
+  it("exposes MANDATORY_SDK_OPTIONS as the single source of those six", () => {
     for (const [key, value] of Object.entries(MANDATORY_SDK_OPTIONS)) {
       expect(built.options[key]).toEqual(value);
     }
@@ -118,6 +122,15 @@ describe("buildQuery — the mandatory options are the provider's job, never the
   it("does not leak the SDK's maxTurns into the pass budget", () => {
     // Spike 3 §6 amendment 3: maxTurns counts API round trips, not build passes.
     expect(built.options.maxTurns).toBe(40);
+  });
+
+  it("omits stderr when no onStderr was configured, and forwards it verbatim when it was (Issue #75)", () => {
+    expect(built.options.stderr).toBeUndefined();
+
+    const onStderr = (_data: string) => {};
+    const withStderr = new ClaudeAgentSdkProvider({ binding: sdk.binding, onStderr });
+    const builtWithStderr = withStderr.buildQuery(sdk.binding, turnInput(), toolSet());
+    expect(builtWithStderr.options.stderr).toBe(onStderr);
   });
 });
 

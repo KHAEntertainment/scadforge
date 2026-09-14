@@ -20,6 +20,15 @@
 //                                   `message_start` placeholder
 //   permissionMode / allowDangerouslySkipPermissions
 //                                   in-process handlers, no interactive host
+//   strictMcpConfig: true           without it, the bundled CLI loads the
+//                                   OPERATOR's entire ~/.claude.json MCP
+//                                   server list on top of the `scadforge`
+//                                   server built below -- `settingSources: []`
+//                                   does NOT cover this. Issue #75: measured
+//                                   at 12 attempted `claude.ai …` connectors,
+//                                   ~280 held connections and 157K
+//                                   cache-creation tokens (~$1.57) for their
+//                                   tool schemas on a single trivial turn
 //
 // The SDK is reached through a small injectable {@link ClaudeAgentSdkBinding}
 // so the unit tests exercise the whole message loop with zero live API calls.
@@ -68,7 +77,8 @@ export const MANDATORY_SDK_OPTIONS = {
   tools: [] as string[],
   includePartialMessages: true,
   permissionMode: "bypassPermissions",
-  allowDangerouslySkipPermissions: true
+  allowDangerouslySkipPermissions: true,
+  strictMcpConfig: true
 } as const;
 
 /** Default cap on SDK round trips. NOT the pass budget — that lives in the tools. */
