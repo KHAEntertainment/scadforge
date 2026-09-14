@@ -3,6 +3,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
 
+import { reticle } from '@reticlehq/vite-plugin';
 // Issue #36: the app calls `createApiClient()` with no baseUrl and relies on
 // same-origin `/api/*` requests being forwarded to `apps/server` by this dev
 // proxy. Without it, `/api/*` hits Vite itself, which serves `index.html`
@@ -15,7 +16,7 @@ const apiProxyTarget =
   process.env.SCADFORGE_API_URL ?? process.env.VITE_API_PROXY_TARGET ?? "http://localhost:3001";
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [reticle({ sourceMapping: false }),react(), tailwindcss()],
   server: {
     proxy: {
       "/api": {

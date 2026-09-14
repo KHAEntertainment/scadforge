@@ -24,6 +24,8 @@
     "three": "^0.169.0"
   },
   "devDependencies": {
+    "@reticlehq/react": "2.14.0",
+    "@reticlehq/vite-plugin": "2.14.0",
     "@tailwindcss/vite": "^4.3.3",
     "@testing-library/jest-dom": "^6.6.2",
     "@testing-library/react": "^16.0.1",
