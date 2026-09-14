@@ -7,6 +7,10 @@ export interface ChatPanelProps {
   streamError: string | null;
   onSend: (text: string) => void;
   disabled?: boolean;
+  /** Re-checks whether a disconnected turn finished server-side (Issue #77 AC). */
+  onCheckConnection: () => void;
+  /** Clears an unresolved `connection_lost` item, re-enabling `onSend` (Issue #77 AC). */
+  onDismissConnection: () => void;
 }
 
 /** `m:ss`, per Issue #76 AC — minutes unpadded, seconds zero-padded. */
@@ -22,7 +26,23 @@ function phaseLabel(item: Extract<ChatItem, { kind: "turn_running" }>): string {
   return item.lastToolName ? `Working — ${item.lastToolName}` : "Working";
 }
 
-function ChatItemRow({ item, now }: { item: ChatItem; now: number }) {
+function connectionLostLabel(item: Extract<ChatItem, { kind: "connection_lost" }>): string {
+  return item.status === "still_running"
+    ? "Still running or no changes yet."
+    : "Connection to the studio server was lost while the turn was running.";
+}
+
+function ChatItemRow({
+  item,
+  now,
+  onCheckConnection,
+  onDismissConnection
+}: {
+  item: ChatItem;
+  now: number;
+  onCheckConnection: () => void;
+  onDismissConnection: () => void;
+}) {
   switch (item.kind) {
     case "user_text":
       return (
@@ -64,6 +84,30 @@ function ChatItemRow({ item, now }: { item: ChatItem; now: number }) {
         </div>
       );
 
+    case "connection_lost":
+      return (
+        <div className="chat-item chat-item--error chat-item--connection-lost" role="alert" data-testid="connection-lost">
+          <p>
+            {connectionLostLabel(item)} <span className="connection-lost-turn">(turn {item.turnId})</span>
+          </p>
+          <div className="connection-lost-actions">
+            <button type="button" onClick={onCheckConnection} disabled={item.status === "checking"}>
+              {item.status === "checking" ? "Checking…" : "Check result"}
+            </button>
+            <button type="button" className="button--ghost" onClick={onDismissConnection}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      );
+
+    case "reconciled_status":
+      return (
+        <p className="chat-item chat-item--turn-status" data-testid="reconciled-status">
+          {`Turn finished while disconnected — head is now #${item.headId}.`}
+        </p>
+      );
+
     case "error":
       return (
         <p className="chat-item chat-item--error" role="alert">
@@ -76,9 +120,18 @@ function ChatItemRow({ item, now }: { item: ChatItem; now: number }) {
   }
 }
 
-export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }: ChatPanelProps) {
+export function ChatPanel({
+  state,
+  isStreaming,
+  streamError,
+  onSend,
+  disabled,
+  onCheckConnection,
+  onDismissConnection
+}: ChatPanelProps) {
   const [draft, setDraft] = useState("");
   const hasRunningTurn = state.items.some((item) => item.kind === "turn_running");
+  const hasUnresolvedConnectionLoss = state.items.some((item) => item.kind === "connection_lost");
 
   // 1×/sec elapsed-time tick for the running-turn item (Issue #76 AC): a
   // self-rearming `setTimeout` rather than `setInterval`, matching this
@@ -96,7 +149,7 @@ export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }:
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (draft.trim().length === 0) return;
+    if (draft.trim().length === 0 || hasUnresolvedConnectionLoss) return;
     onSend(draft);
     setDraft("");
   }
@@ -108,13 +161,23 @@ export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }:
     }
   }
 
+  const sendDisabled = disabled || isStreaming || hasUnresolvedConnectionLoss;
+
   return (
     <section className="chat-panel" aria-label="Chat conversation">
       <div className="chat-transcript" data-testid="chat-transcript">
         {state.items.length === 0 ? (
           <p className="chat-empty">Ask ScadForge to build or change your model.</p>
         ) : (
-          state.items.map((item, index) => <ChatItemRow key={index} item={item} now={now} />)
+          state.items.map((item, index) => (
+            <ChatItemRow
+              key={index}
+              item={item}
+              now={now}
+              onCheckConnection={onCheckConnection}
+              onDismissConnection={onDismissConnection}
+            />
+          ))
         )}
         {streamError ? (
           <p className="chat-item chat-item--error" role="alert" data-testid="chat-stream-error">
@@ -132,7 +195,7 @@ export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }:
           aria-label="Message"
           rows={3}
         />
-        <button type="submit" disabled={disabled || isStreaming || draft.trim().length === 0}>
+        <button type="submit" disabled={sendDisabled || draft.trim().length === 0}>
           {isStreaming ? "Working…" : "Send ⌘↵"}
         </button>
       </form>

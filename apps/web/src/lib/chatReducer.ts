@@ -48,7 +48,20 @@ export type ChatItem =
       startedAt: string;
       phase: "waiting" | "working";
       lastToolName: string | null;
-    };
+    }
+  /**
+   * The SSE stream for `turnId` ended (or the fetch itself failed) without a
+   * `turn_done`/`error` closing it (Issue #77). Replaces the `turn_running`
+   * item in place. The server may still be finishing the turn — CLAUDE.md
+   * "server render is authoritative" / `routes/chat.ts` continues a turn past
+   * client disconnect — so this is a reconciliation prompt, not a failure.
+   */
+  | { kind: "connection_lost"; turnId: string; status: "lost" | "checking" | "still_running" }
+  /**
+   * `checkConnectionResult` found the project head advanced past the turn's
+   * `startedHeadId` baseline while disconnected. Replaces `connection_lost`.
+   */
+  | { kind: "reconciled_status"; turnId: string; headId: string };
 
 export interface ChatState {
   items: ChatItem[];
@@ -100,6 +113,10 @@ function updateLast<T extends ChatItem>(
 function isTurnRunning(turnId: string): (item: ChatItem) => item is Extract<ChatItem, { kind: "turn_running" }> {
   return (item): item is Extract<ChatItem, { kind: "turn_running" }> =>
     item.kind === "turn_running" && item.turnId === turnId;
+}
+
+function isConnectionLost(item: ChatItem): item is Extract<ChatItem, { kind: "connection_lost" }> {
+  return item.kind === "connection_lost";
 }
 
 /**
@@ -250,7 +267,21 @@ export type ChatLocalAction =
   /** Replace the whole transcript, e.g. rehydrating after a page refresh. */
   | { type: "local_restore"; items: ChatItem[] }
   /** Drop the transcript, e.g. when the selected project changes. */
-  | { type: "local_reset" };
+  | { type: "local_reset" }
+  /**
+   * Issue #77: the SSE stream for `turnId` ended or failed without a
+   * `turn_done`/`error` closing it. Dispatched by `useChat`, never derived
+   * from a wire event — the frozen `SseEvent` union has no such signal.
+   */
+  | { type: "local_connection_lost"; turnId: string }
+  /** A `checkConnectionResult()` re-fetch is in flight. */
+  | { type: "local_connection_check_started" }
+  /** The re-fetched head has not advanced past the turn's baseline; retryable. */
+  | { type: "local_connection_still_running" }
+  /** The re-fetched head advanced past the turn's baseline while disconnected. */
+  | { type: "local_connection_advanced"; turnId: string; snapshot: SnapshotManifest }
+  /** The user dismissed a `connection_lost` item; re-enables sending. */
+  | { type: "local_connection_dismissed" };
 
 /** Everything `useChat`'s reducer accepts: wire events plus local actions. */
 export type ChatAction = SseEvent | ChatLocalAction;
@@ -284,6 +315,35 @@ export function reduceChatAction(state: ChatState, action: ChatAction): ChatStat
 
     case "local_reset": {
       return initialChatState;
+    }
+
+    case "local_connection_lost": {
+      const item: ChatItem = { kind: "connection_lost", turnId: action.turnId, status: "lost" };
+      const replaced = replaceLast(state.items, isTurnRunning(action.turnId), () => item);
+      return { ...state, items: replaced ?? [...state.items, item], activeTurnId: null };
+    }
+
+    case "local_connection_check_started": {
+      const updated = updateLast(state.items, isConnectionLost, (item) => ({ ...item, status: "checking" }));
+      return updated ? { ...state, items: updated } : state;
+    }
+
+    case "local_connection_still_running": {
+      const updated = updateLast(state.items, isConnectionLost, (item) => ({ ...item, status: "still_running" }));
+      return updated ? { ...state, items: updated } : state;
+    }
+
+    case "local_connection_advanced": {
+      const item: ChatItem = { kind: "reconciled_status", turnId: action.turnId, headId: action.snapshot.id };
+      const replaced = replaceLast(state.items, isConnectionLost, () => item);
+      // Feeds the existing App.tsx `headSnapshot` → `snapshots.refresh()` wiring
+      // so the preview picks up what finished while the client was gone,
+      // without this hook knowing anything about the preview.
+      return { ...state, items: replaced ?? [...state.items, item], headSnapshot: action.snapshot };
+    }
+
+    case "local_connection_dismissed": {
+      return { ...state, items: state.items.filter((item) => item.kind !== "connection_lost") };
     }
 
     default: {

@@ -310,3 +310,69 @@ describe("reduceChatAction — local user echo", () => {
     expect(reduceChatAction(restored, { type: "local_reset" })).toEqual(initialChatState);
   });
 });
+
+// ── stream-drop reconciliation (Issue #77) ───────────────────────────────────
+//
+// The server keeps running a turn after the client disconnects (routes/chat.ts
+// swallows write failures); these local actions are how `useChat` surfaces
+// that gap and later reconciles it, without any new wire event.
+
+describe("reduceChatAction — connection lost / reconciliation", () => {
+  function stateAfterTurnStarted(): ReturnType<typeof reduceChatEvent> {
+    return reduceChatEvent(initialChatState, turnStarted());
+  }
+
+  it("replaces the running placeholder with a connection_lost item and clears activeTurnId", () => {
+    const state = reduceChatAction(stateAfterTurnStarted(), { type: "local_connection_lost", turnId: TURN_ID });
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({ kind: "connection_lost", turnId: TURN_ID, status: "lost" });
+    expect(state.activeTurnId).toBeNull();
+  });
+
+  it("counterexample: with no matching running item, the connection_lost item is still appended (never dropped)", () => {
+    const state = reduceChatAction(initialChatState, { type: "local_connection_lost", turnId: "turn-orphan" });
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({ kind: "connection_lost", turnId: "turn-orphan" });
+  });
+
+  it("a check-in-flight marks the item checking, and a still-running result flips it back with no new item", () => {
+    let state = reduceChatAction(stateAfterTurnStarted(), { type: "local_connection_lost", turnId: TURN_ID });
+    state = reduceChatAction(state, { type: "local_connection_check_started" });
+    expect(state.items[0]).toMatchObject({ kind: "connection_lost", status: "checking" });
+
+    state = reduceChatAction(state, { type: "local_connection_still_running" });
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({ kind: "connection_lost", status: "still_running" });
+  });
+
+  it("an advanced head replaces connection_lost with a reconciled_status item and updates headSnapshot (AC)", () => {
+    const manifest: SnapshotManifest = {
+      id: "0004",
+      parent: "0003",
+      timestamp: "2026-09-13T00:00:00.000Z",
+      message: "Finished while disconnected",
+      origin: "agent",
+      pass: 1,
+      files: { model_scad: "model.scad", params_json: "params.json", message_md: "message.md", validation_json: null, diff_patch: null },
+      params: {},
+      renders: [],
+      validation: null,
+      annotations: []
+    };
+    let state = reduceChatAction(stateAfterTurnStarted(), { type: "local_connection_lost", turnId: TURN_ID });
+    state = reduceChatAction(state, { type: "local_connection_advanced", turnId: TURN_ID, snapshot: manifest });
+
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({ kind: "reconciled_status", turnId: TURN_ID, headId: "0004" });
+    expect(state.headSnapshot).toEqual(manifest);
+  });
+
+  it("dismissing removes the connection_lost item and nothing else", () => {
+    let state = reduceChatAction(initialChatState, { type: "local_user_message", localId: "local-1", text: "hi" });
+    state = reduceChatAction(state, turnStarted());
+    state = reduceChatAction(state, { type: "local_connection_lost", turnId: TURN_ID });
+    state = reduceChatAction(state, { type: "local_connection_dismissed" });
+
+    expect(state.items).toEqual([{ kind: "user_text", localId: "local-1", text: "hi" }]);
+  });
+});

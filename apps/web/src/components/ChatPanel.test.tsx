@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatState } from "../lib/chatReducer.js";
 import { initialChatState } from "../lib/chatReducer.js";
@@ -9,7 +9,9 @@ function baseProps(overrides: Partial<ChatState> = {}) {
     state: { ...initialChatState, ...overrides },
     isStreaming: false,
     streamError: null,
-    onSend: vi.fn()
+    onSend: vi.fn(),
+    onCheckConnection: vi.fn(),
+    onDismissConnection: vi.fn()
   };
 }
 
@@ -114,5 +116,54 @@ describe("ChatPanel — running-turn placeholder", () => {
     // this still-pending case is exactly what "clears on unmount" already
     // covers deliberately, so keep it out of automatic teardown here too.
     unmount();
+  });
+});
+
+// ── stream-drop reconciliation (Issue #77) ───────────────────────────────────
+
+describe("ChatPanel — connection lost", () => {
+  it("shows the turn id, wires Check result / Dismiss, and blocks Send while unresolved (AC)", () => {
+    const props = baseProps({ items: [{ kind: "connection_lost", turnId: "turn-9", status: "lost" }] });
+    render(<ChatPanel {...props} />);
+
+    const row = screen.getByTestId("connection-lost");
+    expect(row).toHaveTextContent("Connection to the studio server was lost while the turn was running.");
+    expect(row).toHaveTextContent("turn-9");
+
+    fireEvent.click(screen.getByRole("button", { name: "Check result" }));
+    expect(props.onCheckConnection).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(props.onDismissConnection).toHaveBeenCalledTimes(1);
+
+    // Unresolved connection loss blocks sending, independent of `disabled`/`isStreaming`
+    // and independent of the empty-draft rule — non-empty draft still can't submit.
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "try again" } });
+    expect(screen.getByRole("button", { name: /Send/ })).toBeDisabled();
+    fireEvent.submit(screen.getByLabelText("Message").closest("form")!);
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it("shows a checking state and disables the Check result button while a check is in flight", () => {
+    const props = baseProps({ items: [{ kind: "connection_lost", turnId: "turn-9", status: "checking" }] });
+    render(<ChatPanel {...props} />);
+    expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
+  });
+
+  it("shows the still-running message and keeps the check retryable", () => {
+    const props = baseProps({ items: [{ kind: "connection_lost", turnId: "turn-9", status: "still_running" }] });
+    render(<ChatPanel {...props} />);
+    expect(screen.getByTestId("connection-lost")).toHaveTextContent("Still running or no changes yet.");
+    expect(screen.getByRole("button", { name: "Check result" })).toBeEnabled();
+  });
+
+  it("renders the reconciled head once resolved, and re-enables Send", () => {
+    const props = baseProps({ items: [{ kind: "reconciled_status", turnId: "turn-9", headId: "0004" }] });
+    render(<ChatPanel {...props} />);
+    expect(screen.getByTestId("reconciled-status")).toHaveTextContent("Turn finished while disconnected — head is now #0004.");
+    // A non-empty draft is what would otherwise disable Send, so this isolates
+    // the "unresolved connection loss" block from the separate empty-draft rule.
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "continue" } });
+    expect(screen.getByRole("button", { name: /Send/ })).toBeEnabled();
   });
 });
