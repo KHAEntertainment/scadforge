@@ -280,8 +280,12 @@ export type ChatLocalAction =
   | { type: "local_connection_still_running" }
   /** The re-fetched head advanced past the turn's baseline while disconnected. */
   | { type: "local_connection_advanced"; turnId: string; snapshot: SnapshotManifest }
-  /** The user dismissed a `connection_lost` item; re-enables sending. */
-  | { type: "local_connection_dismissed" };
+  /**
+   * The user dismissed the `connection_lost` item for `turnId`; re-enables
+   * sending. Scoped to one turn (not "clear every connection_lost item") so
+   * dismissing one lost turn's item can never clear a different turn's.
+   */
+  | { type: "local_connection_dismissed"; turnId: string };
 
 /** Everything `useChat`'s reducer accepts: wire events plus local actions. */
 export type ChatAction = SseEvent | ChatLocalAction;
@@ -343,7 +347,10 @@ export function reduceChatAction(state: ChatState, action: ChatAction): ChatStat
     }
 
     case "local_connection_dismissed": {
-      return { ...state, items: state.items.filter((item) => item.kind !== "connection_lost") };
+      return {
+        ...state,
+        items: state.items.filter((item) => !(item.kind === "connection_lost" && item.turnId === action.turnId))
+      };
     }
 
     default: {

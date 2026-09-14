@@ -217,6 +217,96 @@ describe("useChat — stream-drop reconciliation (Issue #77)", () => {
     expect(result.current.state.items.find((i) => i.kind === "connection_lost")).toMatchObject({ status: "still_running" });
   });
 
+  it("counterexample: a rejected baseline fetch is never treated as 'no prior head' — a still-failing retry stays still_running, never falsely advanced (AC)", async () => {
+    const getProject = vi
+      .fn()
+      // The baseline fetch at turn_started fails outright.
+      .mockRejectedValueOnce(new Error("network error"))
+      // checkConnectionResult's retry of the baseline ALSO fails.
+      .mockRejectedValueOnce(new Error("still unreachable"));
+    const client = makeClient({
+      openChatStream: vi.fn().mockResolvedValue({ ok: true, body: streamThatEndsAfterTurnStarted() }),
+      getProject
+    });
+    const { result } = renderHook(() => useChat(client, PROJECT_ID));
+
+    await act(async () => {
+      await result.current.sendMessage("Make a box");
+    });
+    expect(result.current.state.items.some((i) => i.kind === "connection_lost")).toBe(true);
+
+    await act(async () => {
+      await result.current.checkConnectionResult();
+    });
+
+    // An unknown baseline (both fetches failed) must never be compared
+    // against a real head as if it meant "no snapshot existed" — that would
+    // paint every retry as a false "advanced".
+    expect(result.current.state.items.some((i) => i.kind === "reconciled_status")).toBe(false);
+    expect(result.current.state.items.find((i) => i.kind === "connection_lost")).toMatchObject({ status: "still_running" });
+    expect(getProject).toHaveBeenCalledTimes(2); // the original attempt + the retry, no "current head" fetch without a baseline
+  });
+
+  it("a slow baseline fetch from a project the user has switched away from never corrupts the new project's baseline (AC)", async () => {
+    let resolveOldBaseline!: (value: ProjectResponse) => void;
+    let openChatStreamCalls = 0;
+    const openChatStream = vi.fn().mockImplementation((_projectId: string, _turn: unknown, signal?: AbortSignal) => {
+      openChatStreamCalls += 1;
+      if (openChatStreamCalls === 1) {
+        return Promise.resolve({ ok: true, body: neverEndingStreamAbortAware(signal) });
+      }
+      return Promise.resolve({ ok: true, body: streamThatEndsAfterTurnStarted() });
+    });
+    const getProject = vi
+      .fn()
+      // Project A's baseline fetch at turn_started — deliberately slow.
+      .mockImplementationOnce(() => new Promise<ProjectResponse>((resolve) => { resolveOldBaseline = resolve; }))
+      // Project B's baseline fetch at its own turn_started.
+      .mockResolvedValueOnce(projectResponse(manifest("b-0001")))
+      // Project B's checkConnectionResult "current head" fetch — unchanged.
+      .mockResolvedValueOnce(projectResponse(manifest("b-0001")));
+    const client = makeClient({ openChatStream, getProject });
+
+    const { result, rerender } = renderHook(({ projectId }) => useChat(client, projectId), {
+      initialProps: { projectId: "project-a" }
+    });
+
+    let sendPromiseA!: Promise<void>;
+    act(() => {
+      sendPromiseA = result.current.sendMessage("build A");
+    });
+    await waitFor(() => expect(result.current.state.items.some((i) => i.kind === "turn_running")).toBe(true));
+
+    // Switch away from A while its baseline fetch is still pending.
+    rerender({ projectId: "project-b" });
+    await act(async () => {
+      await sendPromiseA;
+    });
+
+    // A's slow baseline resolves LATE, after the switch to B.
+    resolveOldBaseline(projectResponse(manifest("a-9999")));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      await result.current.sendMessage("build B");
+    });
+    expect(result.current.state.items.some((i) => i.kind === "connection_lost")).toBe(true);
+
+    await act(async () => {
+      await result.current.checkConnectionResult();
+    });
+
+    // B's own baseline ("b-0001") is what must be compared — not A's
+    // late-arriving "a-9999" — and B's head is unchanged, so the only
+    // correct result is "still running", never a false "advanced" from a
+    // cross-project-contaminated baseline.
+    expect(result.current.state.items.some((i) => i.kind === "reconciled_status")).toBe(false);
+    expect(result.current.state.items.find((i) => i.kind === "connection_lost")).toMatchObject({ status: "still_running" });
+  });
+
   it("does not re-check faster than the 5s floor (AC)", async () => {
     const getProject = vi.fn().mockResolvedValue(projectResponse(manifest("0001")));
     const client = makeClient({

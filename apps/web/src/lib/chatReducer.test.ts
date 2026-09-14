@@ -371,8 +371,17 @@ describe("reduceChatAction — connection lost / reconciliation", () => {
     let state = reduceChatAction(initialChatState, { type: "local_user_message", localId: "local-1", text: "hi" });
     state = reduceChatAction(state, turnStarted());
     state = reduceChatAction(state, { type: "local_connection_lost", turnId: TURN_ID });
-    state = reduceChatAction(state, { type: "local_connection_dismissed" });
+    state = reduceChatAction(state, { type: "local_connection_dismissed", turnId: TURN_ID });
 
     expect(state.items).toEqual([{ kind: "user_text", localId: "local-1", text: "hi" }]);
+  });
+
+  it("dismissing one turn's connection_lost item never clears a different turn's (AC)", () => {
+    const item = (turnId: string): ChatItem => ({ kind: "connection_lost", turnId, status: "lost" });
+    const state = reduceChatAction(
+      { ...initialChatState, items: [item("turn-a"), item("turn-b")] },
+      { type: "local_connection_dismissed", turnId: "turn-a" }
+    );
+    expect(state.items).toEqual([item("turn-b")]);
   });
 });

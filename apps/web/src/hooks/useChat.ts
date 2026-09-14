@@ -29,6 +29,22 @@ function isConnectionLostItem(item: ChatItem): item is Extract<ChatItem, { kind:
   return item.kind === "connection_lost";
 }
 
+/**
+ * The turn's head baseline, or the fact that it could not be determined.
+ * `ok: false` must never be treated as "no snapshot existed" — it means
+ * "unknown", and `checkConnectionResult` must not compare against it as if
+ * it were a real id (a null-as-baseline bug would make ANY current head look
+ * "advanced", painting a false reconciled result).
+ */
+type BaselineResult = { ok: true; id: string | null } | { ok: false };
+
+function fetchBaseline(client: ApiClient, projectId: string): Promise<BaselineResult> {
+  return client.getProject(projectId).then(
+    (res): BaselineResult => ({ ok: true, id: res.head?.id ?? null }),
+    (): BaselineResult => ({ ok: false })
+  );
+}
+
 export interface UseChatResult {
   state: ChatState;
   /** True while a turn's SSE stream is open. */
@@ -127,8 +143,10 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
    * `GET /projects/:id` rather than read from `state.headSnapshot` (Issue #77):
    * that field is empty right after a restore/refresh even though the server
    * has real history, which would make ANY existing head look "advanced".
+   * `null` (not a pending/resolved promise) means no turn has started yet —
+   * `checkConnectionResult` treats that the same as an unresolved baseline.
    */
-  const startedHeadPromiseRef = useRef<Promise<string | null> | null>(null);
+  const startedHeadPromiseRef = useRef<Promise<BaselineResult> | null>(null);
   /** Issue #77 AC: never re-check more often than {@link CHECK_MIN_INTERVAL_MS}. */
   const lastCheckAtRef = useRef(0);
   /** The `connection_lost` turnId already auto-checked once via focus/visibilitychange. */
@@ -160,6 +178,11 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
         projectGenerationRef.current += 1;
         abortRef.current?.abort();
         abortRef.current = null;
+        // Belt-and-suspenders alongside the generation guards in sendMessage/
+        // checkConnectionResult: a baseline fetch or reconciliation still in
+        // flight for the project being left must never write into what the
+        // next project's turn will read as its own baseline.
+        startedHeadPromiseRef.current = null;
       }
     };
   }, [projectId]);
@@ -207,10 +230,7 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
             turnId = event.turn_id;
             // Fire-and-forget: the baseline only needs to be ready by the time
             // a reconciliation check runs, never before the next SSE frame.
-            startedHeadPromiseRef.current = client
-              .getProject(projectId)
-              .then((res) => res.head?.id ?? null)
-              .catch(() => null);
+            startedHeadPromiseRef.current = fetchBaseline(client, projectId);
           } else if (event.type === "turn_done" || event.type === "error") {
             turnClosed = true;
           }
@@ -240,6 +260,11 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
 
   const checkConnectionResult = useCallback(async () => {
     if (!projectId) return;
+    // Captured now, checked after every await below: a stale check for a
+    // project the user has since switched away from must never dispatch into
+    // the fresh project's state (it would corrupt a just-reset transcript
+    // with another project's head/turn id).
+    const generation = projectGenerationRef.current;
     const lostItem = stateRef.current.items.find(isConnectionLostItem);
     if (!lostItem) return;
     const now = Date.now();
@@ -248,17 +273,33 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
 
     dispatch({ type: "local_connection_check_started" });
     try {
-      const [baselineHeadId, projectRes] = await Promise.all([
-        startedHeadPromiseRef.current ?? Promise.resolve(null),
-        client.getProject(projectId)
-      ]);
+      let baseline = await (startedHeadPromiseRef.current ?? Promise.resolve<BaselineResult>({ ok: false }));
+      if (generation !== projectGenerationRef.current) return;
+      if (!baseline.ok) {
+        // The turn_started baseline fetch never resolved successfully —
+        // retry it now. An unknown baseline must never be treated as "no
+        // prior head": that would make ANY current head look "advanced" and
+        // paint a false reconciled result.
+        baseline = await fetchBaseline(client, projectId);
+        if (generation !== projectGenerationRef.current) return;
+        if (baseline.ok) startedHeadPromiseRef.current = Promise.resolve(baseline);
+      }
+      if (!baseline.ok) {
+        // Still can't establish a baseline (server unreachable) — stay
+        // retryable rather than guess.
+        dispatch({ type: "local_connection_still_running" });
+        return;
+      }
+      const projectRes = await client.getProject(projectId);
+      if (generation !== projectGenerationRef.current) return;
       const newHead = projectRes.head;
-      if (newHead && newHead.id !== baselineHeadId) {
+      if (newHead && newHead.id !== baseline.id) {
         dispatch({ type: "local_connection_advanced", turnId: lostItem.turnId, snapshot: newHead });
       } else {
         dispatch({ type: "local_connection_still_running" });
       }
     } catch {
+      if (generation !== projectGenerationRef.current) return;
       // The server is still unreachable — stay in the retryable state rather
       // than claiming a (possibly wrong) resolution.
       dispatch({ type: "local_connection_still_running" });
@@ -266,7 +307,11 @@ export function useChat(client: ApiClient, projectId: string | null): UseChatRes
   }, [client, projectId]);
 
   const dismissConnectionLost = useCallback(() => {
-    dispatch({ type: "local_connection_dismissed" });
+    // Scoped to the specific item's turnId (chatReducer AC): dismissing one
+    // lost turn's item must never clear a different turn's.
+    const lostItem = stateRef.current.items.find(isConnectionLostItem);
+    if (!lostItem) return;
+    dispatch({ type: "local_connection_dismissed", turnId: lostItem.turnId });
   }, []);
 
   // Issue #77 AC: reconcile automatically, once per lost turn, the moment the
