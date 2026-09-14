@@ -92,8 +92,14 @@ export interface ClaudeAgentSdkProviderOptions {
   model?: string | null;
   /** SDK round-trip cap. See {@link DEFAULT_MAX_TURNS}. */
   maxTurns?: number;
-  /** Receives the CLI's stderr; off by default. */
-  onStderr?: (data: string) => void;
+  /**
+   * Receives the CLI's stderr; off by default. Called with the RUNNING
+   * turn's id alongside each chunk (Issue #75 QA fix 2): the provider
+   * instance is shared across turns (`agent-impl.ts` constructs one for the
+   * server's lifetime), so per-turn labelling cannot live in shared state on
+   * this class -- `buildQuery` closes over `input.turnId` per call instead.
+   */
+  onStderr?: (data: string, turnId: string) => void;
 }
 
 /** The prompt + options actually handed to `query()`. */
@@ -173,7 +179,7 @@ export class ClaudeAgentSdkProvider implements ModelProvider {
   private readonly injectedBinding?: ClaudeAgentSdkBinding;
   private readonly model: string | null;
   private readonly maxTurns: number;
-  private readonly onStderr?: (data: string) => void;
+  private readonly onStderr?: (data: string, turnId: string) => void;
 
   constructor(options: ClaudeAgentSdkProviderOptions = {}) {
     this.injectedBinding = options.binding;
@@ -231,7 +237,14 @@ export class ClaudeAgentSdkProvider implements ModelProvider {
     };
     const model = input.model ?? this.model;
     if (model) options.model = model;
-    if (this.onStderr) options.stderr = this.onStderr;
+    // Bind THIS turn's id here, per `query()` call -- `this.onStderr` is one
+    // function shared across every turn this (long-lived) provider instance
+    // ever runs, so the turn id cannot be read off `this` at call time.
+    if (this.onStderr) {
+      const onStderr = this.onStderr;
+      const turnId = input.turnId;
+      options.stderr = (data: string) => onStderr(data, turnId);
+    }
 
     return { prompt: input.prompt, options };
   }

@@ -124,13 +124,33 @@ describe("buildQuery — the mandatory options are the provider's job, never the
     expect(built.options.maxTurns).toBe(40);
   });
 
-  it("omits stderr when no onStderr was configured, and forwards it verbatim when it was (Issue #75)", () => {
+  it("omits stderr when no onStderr was configured (Issue #75)", () => {
     expect(built.options.stderr).toBeUndefined();
+  });
 
-    const onStderr = (_data: string) => {};
+  it("binds THIS turn's id to every stderr chunk, not shared mutable state (Issue #75 QA fix 2)", () => {
+    // The provider instance is shared across every turn it ever runs
+    // (`agent-impl.ts` constructs one for the server's lifetime), so the SDK's
+    // one-arg `stderr` callback must be wrapped per `query()` call with the
+    // id of the turn that call actually belongs to -- never read off `this`.
+    const calls: Array<[string, string]> = [];
+    const onStderr = (data: string, turnId: string) => {
+      calls.push([data, turnId]);
+    };
     const withStderr = new ClaudeAgentSdkProvider({ binding: sdk.binding, onStderr });
-    const builtWithStderr = withStderr.buildQuery(sdk.binding, turnInput(), toolSet());
-    expect(builtWithStderr.options.stderr).toBe(onStderr);
+
+    const builtA = withStderr.buildQuery(sdk.binding, turnInput({ turnId: "turn-A" }), toolSet());
+    const builtB = withStderr.buildQuery(sdk.binding, turnInput({ turnId: "turn-B" }), toolSet());
+
+    (builtA.options.stderr as (d: string) => void)("from A\n");
+    (builtB.options.stderr as (d: string) => void)("from B\n");
+    (builtA.options.stderr as (d: string) => void)("from A again\n");
+
+    expect(calls).toEqual([
+      ["from A\n", "turn-A"],
+      ["from B\n", "turn-B"],
+      ["from A again\n", "turn-A"]
+    ]);
   });
 });
 
