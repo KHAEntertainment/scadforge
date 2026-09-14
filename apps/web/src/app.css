@@ -87,6 +87,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .chat-item--turn-status { color: var(--muted); font-style: italic; }
 .tool-status { padding: 2px 6px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
 .tool-status--running { background: #d0e2ff; color: #002d9c; }.tool-status--ok { background: #defbe6; color: var(--success); }.tool-status--failed { background: #fff1f1; color: var(--danger); }
+.chat-item--turn-status--running { display: flex; align-items: center; gap: 10px; font-style: normal; }
+.turn-running-elapsed { font-variant-numeric: tabular-nums; opacity: .75; }
+.chat-item--connection-lost { display: flex; flex-direction: column; gap: 8px; }
+.connection-lost-turn { color: var(--muted); font-size: 11px; }
+.connection-lost-actions { display: flex; gap: 8px; }
+.connection-lost-actions button { min-height: 28px; padding: 0 10px; border: 0; background: var(--blue); color: #fff; font-size: 12px; }
+.connection-lost-actions button:disabled { opacity: .6; }
+.connection-lost-actions button.button--ghost { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
 .chat-composer { display: flex; gap: 8px; padding: 12px 16px 16px; border-top: 1px solid var(--border); background: #fff; }
 .chat-composer textarea { flex: 1; min-height: 72px; resize: vertical; padding: 10px; border: 1px solid #8d8d8d; background: #fff; }
 .chat-composer button { align-self: flex-end; min-height: 40px; padding: 0 14px; border: 0; background: var(--blue); color: #fff; }

@@ -32,7 +32,36 @@ export type ChatItem =
       inputSummary: string | null;
     }
   | { kind: "turn_status"; turnId: string; status: TurnStatus; summary: string | null; usage: TurnUsage | null }
-  | { kind: "error"; turnId: string | null; errorCode: string; message: string };
+  | { kind: "error"; turnId: string | null; errorCode: string; message: string }
+  /**
+   * Live placeholder for a turn in flight (Issue #76). Pushed the instant
+   * `turn_started` is reduced — before any tool or text event exists to render
+   * — and replaced IN PLACE (never left alongside a second item) once the turn
+   * closes via `turn_done` or `error`. `phase`/`lastToolName` let the UI show
+   * "Waiting for the model" vs. "Working — <tool>" without polling; the
+   * elapsed-time ticking itself is presentation-only and lives in `ChatPanel`.
+   */
+  | {
+      kind: "turn_running";
+      turnId: string;
+      /** Echoes `TurnStartedEvent.started_at` — the elapsed-timer epoch. */
+      startedAt: string;
+      phase: "waiting" | "working";
+      lastToolName: string | null;
+    }
+  /**
+   * The SSE stream for `turnId` ended (or the fetch itself failed) without a
+   * `turn_done`/`error` closing it (Issue #77). Replaces the `turn_running`
+   * item in place. The server may still be finishing the turn — CLAUDE.md
+   * "server render is authoritative" / `routes/chat.ts` continues a turn past
+   * client disconnect — so this is a reconciliation prompt, not a failure.
+   */
+  | { kind: "connection_lost"; turnId: string; status: "lost" | "checking" | "still_running" }
+  /**
+   * `checkConnectionResult` found the project head advanced past the turn's
+   * `startedHeadId` baseline while disconnected. Replaces `connection_lost`.
+   */
+  | { kind: "reconciled_status"; turnId: string; headId: string };
 
 export interface ChatState {
   items: ChatItem[];
@@ -55,30 +84,75 @@ export const initialChatState: ChatState = {
   latestMeshUrl: null
 };
 
-function updateLast<T extends ChatItem>(
+/** Finds the last item matching `predicate` and maps it to a (possibly differently-kinded) replacement. */
+function replaceLast<T extends ChatItem>(
   items: ChatItem[],
   predicate: (item: ChatItem) => item is T,
-  update: (item: T) => T
+  replacement: (item: T) => ChatItem
 ): ChatItem[] | null {
   for (let i = items.length - 1; i >= 0; i -= 1) {
     const item = items[i];
     if (predicate(item)) {
       const next = items.slice();
-      next[i] = update(item);
+      next[i] = replacement(item);
       return next;
     }
   }
   return null;
 }
 
+/** `replaceLast` specialised to an in-kind update (the replacement stays the same `ChatItem` variant). */
+function updateLast<T extends ChatItem>(
+  items: ChatItem[],
+  predicate: (item: ChatItem) => item is T,
+  update: (item: T) => T
+): ChatItem[] | null {
+  return replaceLast(items, predicate, update);
+}
+
+function isTurnRunning(turnId: string): (item: ChatItem) => item is Extract<ChatItem, { kind: "turn_running" }> {
+  return (item): item is Extract<ChatItem, { kind: "turn_running" }> =>
+    item.kind === "turn_running" && item.turnId === turnId;
+}
+
+function isConnectionLost(item: ChatItem): item is Extract<ChatItem, { kind: "connection_lost" }> {
+  return item.kind === "connection_lost";
+}
+
+/**
+ * Marks the in-flight turn's running item "working" once real activity starts
+ * (Issue #76 AC: "Waiting for the model" until the first `assistant_text`,
+ * `tool_call`, or `tool_result"; then "Working" with the last tool name).
+ * `toolName` is null for `assistant_text`, which flips the phase but has no
+ * tool to attribute.
+ */
+function markTurnWorking(items: ChatItem[], turnId: string, toolName: string | null): ChatItem[] | null {
+  return updateLast(items, isTurnRunning(turnId), (item) => ({
+    ...item,
+    phase: "working",
+    lastToolName: toolName ?? item.lastToolName
+  }));
+}
+
 /** Applies one SSE event to chat state. Never throws on well-typed input. */
 export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
   switch (event.type) {
     case "turn_started": {
-      return { ...state, activeTurnId: event.turn_id };
+      // Issue #76: render feedback the instant the turn opens, not after
+      // whatever comes first (a model turn measured at ~6 minutes had nothing
+      // on screen until then).
+      const item: ChatItem = {
+        kind: "turn_running",
+        turnId: event.turn_id,
+        startedAt: event.started_at,
+        phase: "waiting",
+        lastToolName: null
+      };
+      return { ...state, activeTurnId: event.turn_id, items: [...state.items, item] };
     }
 
     case "tool_call": {
+      const withRunning = markTurnWorking(state.items, event.turn_id, event.name) ?? state.items;
       const item: ChatItem = {
         kind: "tool_activity",
         turnId: event.turn_id,
@@ -89,12 +163,13 @@ export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
         summary: null,
         inputSummary: event.input_summary
       };
-      return { ...state, items: [...state.items, item] };
+      return { ...state, items: [...withRunning, item] };
     }
 
     case "tool_result": {
+      const withRunning = markTurnWorking(state.items, event.turn_id, event.name) ?? state.items;
       const updated = updateLast(
-        state.items,
+        withRunning,
         (item): item is Extract<ChatItem, { kind: "tool_activity" }> =>
           item.kind === "tool_activity" && item.toolCallId === event.tool_call_id,
         (item) => ({
@@ -106,17 +181,18 @@ export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
       const meshArtifact = event.artifacts.find((artifact) => artifact.kind === "mesh");
       return {
         ...state,
-        items: updated ?? state.items,
+        items: updated ?? withRunning,
         latestMeshUrl: meshArtifact ? meshArtifact.url : state.latestMeshUrl
       };
     }
 
     case "assistant_text": {
+      const withRunning = markTurnWorking(state.items, event.turn_id, null) ?? state.items;
       // Coalesce consecutive assistant_text chunks in the same turn into one
       // growing item so prose renders progressively rather than as separate
       // bubbles per SSE frame.
       const updated = updateLast(
-        state.items,
+        withRunning,
         (item): item is Extract<ChatItem, { kind: "assistant_text" }> =>
           item.kind === "assistant_text" && item.turnId === event.turn_id,
         (item) => ({ ...item, text: item.text + event.text })
@@ -124,7 +200,7 @@ export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
       if (updated) return { ...state, items: updated };
       return {
         ...state,
-        items: [...state.items, { kind: "assistant_text", turnId: event.turn_id, text: event.text }]
+        items: [...withRunning, { kind: "assistant_text", turnId: event.turn_id, text: event.text }]
       };
     }
 
@@ -136,6 +212,9 @@ export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
     }
 
     case "turn_done": {
+      // Replaces the turn's `turn_running` item in place (Issue #76 AC): the
+      // elapsed-timer placeholder never lingers alongside its own terminal
+      // status.
       const item: ChatItem = {
         kind: "turn_status",
         turnId: event.turn_id,
@@ -143,7 +222,8 @@ export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
         summary: event.summary,
         usage: event.usage
       };
-      return { ...state, items: [...state.items, item], activeTurnId: null };
+      const replaced = replaceLast(state.items, isTurnRunning(event.turn_id), () => item);
+      return { ...state, items: replaced ?? [...state.items, item], activeTurnId: null };
     }
 
     case "error": {
@@ -153,7 +233,10 @@ export function reduceChatEvent(state: ChatState, event: SseEvent): ChatState {
         errorCode: event.error_code,
         message: event.message
       };
-      return { ...state, items: [...state.items, item], activeTurnId: null };
+      // A turn_id-less error (e.g. before any turn opened) has no running
+      // item to convert; append as before.
+      const replaced = event.turn_id ? replaceLast(state.items, isTurnRunning(event.turn_id), () => item) : null;
+      return { ...state, items: replaced ?? [...state.items, item], activeTurnId: null };
     }
 
     default: {
@@ -184,7 +267,25 @@ export type ChatLocalAction =
   /** Replace the whole transcript, e.g. rehydrating after a page refresh. */
   | { type: "local_restore"; items: ChatItem[] }
   /** Drop the transcript, e.g. when the selected project changes. */
-  | { type: "local_reset" };
+  | { type: "local_reset" }
+  /**
+   * Issue #77: the SSE stream for `turnId` ended or failed without a
+   * `turn_done`/`error` closing it. Dispatched by `useChat`, never derived
+   * from a wire event — the frozen `SseEvent` union has no such signal.
+   */
+  | { type: "local_connection_lost"; turnId: string }
+  /** A `checkConnectionResult()` re-fetch is in flight. */
+  | { type: "local_connection_check_started" }
+  /** The re-fetched head has not advanced past the turn's baseline; retryable. */
+  | { type: "local_connection_still_running" }
+  /** The re-fetched head advanced past the turn's baseline while disconnected. */
+  | { type: "local_connection_advanced"; turnId: string; snapshot: SnapshotManifest }
+  /**
+   * The user dismissed the `connection_lost` item for `turnId`; re-enables
+   * sending. Scoped to one turn (not "clear every connection_lost item") so
+   * dismissing one lost turn's item can never clear a different turn's.
+   */
+  | { type: "local_connection_dismissed"; turnId: string };
 
 /** Everything `useChat`'s reducer accepts: wire events plus local actions. */
 export type ChatAction = SseEvent | ChatLocalAction;
@@ -218,6 +319,38 @@ export function reduceChatAction(state: ChatState, action: ChatAction): ChatStat
 
     case "local_reset": {
       return initialChatState;
+    }
+
+    case "local_connection_lost": {
+      const item: ChatItem = { kind: "connection_lost", turnId: action.turnId, status: "lost" };
+      const replaced = replaceLast(state.items, isTurnRunning(action.turnId), () => item);
+      return { ...state, items: replaced ?? [...state.items, item], activeTurnId: null };
+    }
+
+    case "local_connection_check_started": {
+      const updated = updateLast(state.items, isConnectionLost, (item) => ({ ...item, status: "checking" }));
+      return updated ? { ...state, items: updated } : state;
+    }
+
+    case "local_connection_still_running": {
+      const updated = updateLast(state.items, isConnectionLost, (item) => ({ ...item, status: "still_running" }));
+      return updated ? { ...state, items: updated } : state;
+    }
+
+    case "local_connection_advanced": {
+      const item: ChatItem = { kind: "reconciled_status", turnId: action.turnId, headId: action.snapshot.id };
+      const replaced = replaceLast(state.items, isConnectionLost, () => item);
+      // Feeds the existing App.tsx `headSnapshot` → `snapshots.refresh()` wiring
+      // so the preview picks up what finished while the client was gone,
+      // without this hook knowing anything about the preview.
+      return { ...state, items: replaced ?? [...state.items, item], headSnapshot: action.snapshot };
+    }
+
+    case "local_connection_dismissed": {
+      return {
+        ...state,
+        items: state.items.filter((item) => !(item.kind === "connection_lost" && item.turnId === action.turnId))
+      };
     }
 
     default: {
