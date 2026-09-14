@@ -14,7 +14,16 @@ import { readFile } from "node:fs/promises";
 import { basename, relative } from "node:path";
 import { rename, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { EditorFeature, EditorSidecarStatus, ProjectManifest, SnapshotManifest, ToolArtifact, ViewName } from "@scadforge/protocol";
+import { parseAgentEditorContext } from "@scadforge/protocol";
+import type {
+  AgentEditorContext,
+  EditorFeature,
+  EditorSidecarStatus,
+  ProjectManifest,
+  SnapshotManifest,
+  ToolArtifact,
+  ViewName
+} from "@scadforge/protocol";
 import type {
   AgentExportRequest,
   AgentRenderRequest,
@@ -42,6 +51,7 @@ import {
   runParamExport,
   runSyntaxCheck,
   snapshotMeshPath,
+  sourceFingerprint,
   validateModel,
   withRecoveredProject
 } from "@scadforge/scad-core";
@@ -56,6 +66,7 @@ import type {
   ValidationResult
 } from "@scadforge/scad-core";
 import type { ExportRecord } from "@scadforge/protocol";
+import { editorEligibility } from "./editor-eligibility-standin.js";
 import { renderAndAttach } from "./scad-core-impl.js";
 import {
   planParamUpdate,
@@ -103,6 +114,13 @@ export interface AgentScadCoreOptions {
  * `sidecarDigest`/`editorRevision` are `null` whenever the sidecar status is
  * `missing`/`corrupt`/`unsupported-version` (Tech Lead correction C1) —
  * `sidecarFeatures` is `[]` in that case.
+ *
+ * `sourceRevision`/`sourceFingerprint` (Issue #92, S3-B ticket B7) are
+ * exposed here so `readProject()` below can build `AgentEditorContext`
+ * without a second, separately-timed computation outside this coherent
+ * read — `sourceFingerprint` in particular is the ONE shared digest B5's
+ * proof records and B6's editor document also consume (see
+ * `@scadforge/scad-core`'s `sourceFingerprint` doc comment).
  */
 export interface CoherentProjectState {
   project: ProjectManifest;
@@ -112,6 +130,8 @@ export interface CoherentProjectState {
   sidecarFeatures: EditorFeature[];
   sidecarDigest: string | null;
   editorRevision: string | null;
+  sourceRevision: string;
+  sourceFingerprint: string;
 }
 
 /**
@@ -137,7 +157,12 @@ export async function coherentProjectState(dir: string): Promise<CoherentProject
       sidecarStatus: sidecarRead.status,
       sidecarFeatures: sidecarRead.sidecar?.features ?? [],
       sidecarDigest: sidecarRead.digest,
-      editorRevision: sidecarRead.digest !== null ? editorRevision(sourceRevision, sidecarRead.digest) : null
+      editorRevision: sidecarRead.digest !== null ? editorRevision(sourceRevision, sidecarRead.digest) : null,
+      sourceRevision,
+      // Computed inside the same locked read as `scad`, alongside
+      // `sourceRevision` above -- no extra I/O, since `sourceFingerprint` is
+      // a pure hash of `scad` alone.
+      sourceFingerprint: sourceFingerprint(scad)
     };
   });
 }
@@ -182,12 +207,49 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // the exact coherent instant above.
       const coherent = await coherentProjectState(dir);
       const param_schema = await paramSchema();
+
+      // D7 agent referenceability (Issue #92, S3-B ticket B7): `eligibility`
+      // is PURE (no I/O -- see the eligibility seam doc) and is computed
+      // against the coherent read's OWN `sidecarFeatures`, so it only
+      // inherits `param_schema`'s existing best-effort/live-view tolerance
+      // above -- never a second, independently-timed sidecar read.
+      const eligibility = editorEligibility(coherent.sidecarFeatures, param_schema);
+
+      // Tech-Lead-approved fallback (2026-09-14, Q1): `AgentEditorContext.
+      // editorRevision` is a required hex64 field, but `coherent.editorRevision`
+      // is `null` whenever the sidecar is untrustworthy (`missing`/`corrupt`/
+      // `unsupported-version` -- see `CoherentProjectState`'s doc comment).
+      // B3's `readSidecarLocked` deliberately never fabricates a digest for a
+      // sidecar that does not trustworthily exist, so there is no real
+      // sidecar digest to fold in for those three statuses. Falling back to
+      // `sourceRevision` verbatim reports the agent's actual, current source
+      // identity without inventing anything: it can never collide with a
+      // genuine (domain-prefixed) editor revision, and it still changes
+      // whenever the source changes even though no sidecar is available.
+      const agentEditorRevision = coherent.editorRevision ?? coherent.sourceRevision;
+
+      // `parseAgentEditorContext` (AC2): the production adapter must never
+      // emit a block the frozen mirror schema would reject -- validating
+      // here, not just trusting the object literal below, is what makes that
+      // an enforced invariant rather than an assumption.
+      const editor: AgentEditorContext = parseAgentEditorContext({
+        version: 1,
+        projectId: coherent.project.id,
+        editorRevision: agentEditorRevision,
+        sourceRevision: coherent.sourceRevision,
+        sourceFingerprint: coherent.sourceFingerprint,
+        sidecarStatus: coherent.sidecarStatus,
+        features: coherent.sidecarFeatures,
+        eligibility
+      });
+
       return {
         scad: coherent.scad,
         params: coherent.params,
         param_schema,
         validation: lastValidation,
-        head_snapshot: coherent.project.head
+        head_snapshot: coherent.project.head,
+        editor
       };
     },
 
