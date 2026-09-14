@@ -15,6 +15,21 @@ export function useSnapshots(client: ApiClient, projectId: string | null): UseSn
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [trackedProjectId, setTrackedProjectId] = useState(projectId);
+
+  // Issue #79: reset synchronously, DURING RENDER, the instant `projectId`
+  // changes (React's supported "adjust state when a prop changes" pattern),
+  // instead of waiting for the fetch effect below to run. A project switch
+  // must never let the FIRST render with the new `projectId` still carry the
+  // previous project's snapshots — `App.tsx`'s derived `workingHead` reads
+  // this array on every render, and a stale array there is exactly what let
+  // the old project's snapshot id (and mesh request) leak into the new
+  // project for a render or more.
+  if (projectId !== trackedProjectId) {
+    setTrackedProjectId(projectId);
+    setSnapshots([]);
+    setError(null);
+  }
 
   useEffect(() => {
     if (!projectId) return;
