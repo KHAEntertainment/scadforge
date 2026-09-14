@@ -105,3 +105,21 @@ export {
   snapshotViewsDir
 } from "./store/attachments.js";
 export type { AttachRendersOptions, RenderAttachment } from "./store/attachments.js";
+
+// editor/
+//
+// Canonical identity for the S3 studio editor (Issue #72, S3-B B1): canonical
+// JSON, domain-prefixed SHA-256 digests, the sidecar digest, editor revision,
+// and command/request digests. This is the shared seam later S3-B tickets
+// (B3 sidecar storage, B4 staged transactions, B5 proof service) hash
+// against — see the S3-B ticket story's "Shared seams" block.
+export {
+  canonicalJson,
+  canonicalSidecar,
+  commandDigest,
+  digest,
+  editorRevision,
+  requestDigest,
+  sidecarDigest
+} from "./editor/canonical.js";
+export type { DigestDomain } from "./editor/canonical.js";

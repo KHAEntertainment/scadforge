@@ -1,0 +1,75 @@
+{
+  "_comment": "Golden fixtures for canonical.ts (Issue #72, S3-B B1). Checked in so a canonical-serializer or digest change is a visible diff (canonical.test.ts re-derives every value below and fails on drift). Every sidecar/commitRequest 'input'/'body' also round-trips through the frozen parseEditorSidecar/parseEditorCommitRequest parsers (packages/protocol/src/editor.ts) unchanged.",
+  "sidecars": [
+    {
+      "name": "empty-sidecar",
+      "input": { "version": 1, "features": [] },
+      "canonicalText": "{\"features\":[],\"version\":1}",
+      "digest": "41615572b9ba480d9459109b437a0a01ea929edbaef12b3a2c50cac60ec87882"
+    },
+    {
+      "name": "two-features-unordered",
+      "input": {
+        "version": 1,
+        "features": [
+          {
+            "featureId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "label": "Width",
+            "projectId": "11111111-1111-4111-8111-111111111111",
+            "createdAtRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sourceFingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "bindingVersion": 1,
+            "provenance": { "kind": "manual" },
+            "binding": {
+              "kind": "linear",
+              "parameter": "width",
+              "axis": "x",
+              "mapping": { "scale": 1, "offset": 0, "anchor": "center" }
+            }
+          },
+          {
+            "featureId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "label": "Bore Ø",
+            "projectId": "11111111-1111-4111-8111-111111111111",
+            "createdAtRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sourceFingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "bindingVersion": 1,
+            "provenance": { "kind": "ai-proposed", "confirmedBy": "user" },
+            "binding": {
+              "kind": "radial",
+              "parameter": "bore_d",
+              "center": [0, 0, 0],
+              "axis": [0, 0, 1],
+              "parameterMeaning": "diameter",
+              "presentation": "diameter"
+            }
+          }
+        ]
+      },
+      "canonicalText": "{\"features\":[{\"binding\":{\"axis\":[0,0,1],\"center\":[0,0,0],\"kind\":\"radial\",\"parameter\":\"bore_d\",\"parameterMeaning\":\"diameter\",\"presentation\":\"diameter\"},\"bindingVersion\":1,\"createdAtRevision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"featureId\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"label\":\"Bore Ø\",\"projectId\":\"11111111-1111-4111-8111-111111111111\",\"provenance\":{\"confirmedBy\":\"user\",\"kind\":\"ai-proposed\"},\"sourceFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},{\"binding\":{\"axis\":\"x\",\"kind\":\"linear\",\"mapping\":{\"anchor\":\"center\",\"offset\":0,\"scale\":1},\"parameter\":\"width\"},\"bindingVersion\":1,\"createdAtRevision\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"featureId\":\"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\",\"label\":\"Width\",\"projectId\":\"11111111-1111-4111-8111-111111111111\",\"provenance\":{\"kind\":\"manual\"},\"sourceFingerprint\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}],\"version\":1}",
+      "digest": "5fd17209aee2a1fb135ae608c2795fb079f29616dee06cb867135ec4adca87e8"
+    }
+  ],
+  "commitRequests": [
+    {
+      "name": "set-value-edit",
+      "projectId": "11111111-1111-4111-8111-111111111111",
+      "body": {
+        "version": 1,
+        "baseEditorRevision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "command": {
+          "kind": "set-value",
+          "featureId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          "bindingVersion": 1,
+          "value": 42.5
+        },
+        "intent": "edit",
+        "traversal": null,
+        "operationId": "22222222-2222-4222-8222-222222222222",
+        "proofId": "33333333-3333-4333-8333-333333333333"
+      },
+      "commandDigest": "af614c9fe9e4a89c01f5e80f4a453994bbcffdcbaff53fb3e39540364c7cd741",
+      "requestDigest": "9a3364cd5558a4b5af377eb32fd98f7c7a1275675e05ba4cf450b8989f53e940"
+    }
+  ]
+}
