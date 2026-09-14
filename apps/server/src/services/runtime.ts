@@ -21,9 +21,10 @@ import {
   rootParamsPath,
   runParamExport,
   snapshotDir,
-  validateParamValues
+  validateParamValues,
+  withRecoveredProject
 } from "@scadforge/scad-core";
-import type { ParamRejection, ParamSchema, ParamValues, ParamsFile } from "@scadforge/scad-core";
+import type { LockedProject, ParamRejection, ParamSchema, ParamValues, ParamsFile } from "@scadforge/scad-core";
 import type { ProjectManifest, ProviderConfig, SnapshotId } from "@scadforge/protocol";
 import { RouteError } from "./errors.js";
 import { projectDir, resolveProjectsRoot } from "./project-paths.js";
@@ -94,22 +95,61 @@ export async function readProject(dir: string): Promise<ProjectManifest> {
   return asRouteResult(() => readProjectManifest(dir), "failed to read project");
 }
 
-/** Reads the project's current `model.scad`. Returns `""` when it has not been written yet. */
+function isEnoent(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "ENOENT";
+}
+
+/**
+ * Reads the project's current `model.scad` under the recovery boundary.
+ * Returns `""` when it has not been written yet (ordinary — a brand-new
+ * project's root files, or a pre-init state). Any OTHER read failure
+ * (permissions, `EISDIR`, ...) is a genuine problem and is surfaced as
+ * `INTERNAL_ERROR` rather than silently degrading to an empty model —
+ * Issue #73: the pre-#73 code folded EVERY failure into `""`, so a real
+ * (if unreadable) model could be silently treated as blank and then
+ * overwritten by the next save.
+ */
 export async function readScad(dir: string): Promise<string> {
+  return asRouteResult(() => withRecoveredProject(dir, (ctx) => readScadLocked(ctx)), "failed to read model.scad");
+}
+
+/** `ctx`-taking sibling of {@link readScad}, for a caller composing this read with other locked reads under one boundary entry. */
+export async function readScadLocked(ctx: LockedProject): Promise<string> {
   try {
-    return await readFile(rootModelPath(dir), "utf8");
-  } catch {
-    return "";
+    return await readFile(rootModelPath(ctx.projectDir), "utf8");
+  } catch (err) {
+    if (isEnoent(err)) return "";
+    throw toRouteError(err, "failed to read model.scad");
   }
 }
 
-/** Reads the project's current parameter values out of the Customizer preset file. */
+/**
+ * Reads the project's current parameter values out of the Customizer preset
+ * file, under the recovery boundary. A MISSING `params.json` (a legacy
+ * pre-S3 project, or a pre-init state) is ordinary and yields `{}`; a
+ * `params.json` that EXISTS but cannot be parsed is corrupt and must never
+ * be silently treated the same way (Issue #73) — the pre-#73 code folded
+ * both into `{}`, which on the next write would have replaced real (if
+ * corrupt) bytes with a fresh file built from nothing.
+ */
 export async function readParams(dir: string): Promise<ParamValues> {
+  return asRouteResult(() => withRecoveredProject(dir, (ctx) => readParamsLocked(ctx)), "failed to read params.json");
+}
+
+/** `ctx`-taking sibling of {@link readParams}. */
+export async function readParamsLocked(ctx: LockedProject): Promise<ParamValues> {
+  let raw: string;
   try {
-    const parsed = JSON.parse(await readFile(rootParamsPath(dir), "utf8")) as ParamsFile;
+    raw = await readFile(rootParamsPath(ctx.projectDir), "utf8");
+  } catch (err) {
+    if (isEnoent(err)) return {};
+    throw toRouteError(err, "failed to read params.json");
+  }
+  try {
+    const parsed = JSON.parse(raw) as ParamsFile;
     return (parsed.parameterSets?.[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
-  } catch {
-    return {};
+  } catch (err) {
+    throw toRouteError(err, "params.json is corrupt");
   }
 }
 
@@ -163,13 +203,18 @@ export async function stageSnapshotModel(dir: string, id: SnapshotId): Promise<S
  * `snapshot: false` path of `PUT /api/projects/:id/params`. Uses the same
  * one-preset Customizer file shape the store writes, so a later snapshot reads
  * back exactly what was persisted here.
+ *
+ * Takes `ctx` (Issue #73): this is a root-state write, so it must run inside
+ * an active recovery boundary — its only caller (`scad-core-impl.ts`'s
+ * `updateParams`) already holds one via `mergeParamsAtomic`'s `persist`
+ * callback.
  */
-export async function writeRootParams(dir: string, params: ParamValues): Promise<void> {
+export async function writeRootParamsLocked(ctx: LockedProject, params: ParamValues): Promise<void> {
   const file: ParamsFile = {
     fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
     parameterSets: { [PARAMS_ACTIVE_PRESET]: params }
   };
-  await writeFile(rootParamsPath(dir), JSON.stringify(file, null, 2), "utf8");
+  await writeFile(rootParamsPath(ctx.projectDir), JSON.stringify(file, null, 2), "utf8");
 }
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */

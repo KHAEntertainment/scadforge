@@ -7,20 +7,39 @@ import type { SnapshotManifest } from "@scadforge/protocol";
 import { initProject, readSnapshotManifest } from "./store.js";
 import { snapshotDir } from "./paths.js";
 import {
-  attachRendersToSnapshot,
-  attachValidationToSnapshot,
+  attachRendersToSnapshotLocked,
+  attachValidationToSnapshotLocked,
   resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   resolveSnapshotValidationPath,
   snapshotMeshPath,
   snapshotRenderPath,
   snapshotValidationPath,
-  snapshotViewsDir
+  snapshotViewsDir,
+  type AttachRendersOptions,
+  type RenderAttachment
 } from "./attachments.js";
+import { withRecoveredProject } from "./recovered.js";
 import type { ValidationResult } from "../types.js";
+import type { SnapshotId } from "@scadforge/protocol";
 
 let projectDir: string;
 let pngPath: string;
+
+/** Test-only convenience: opens the boundary once and calls the ctx-taking attacher, mirroring how a real caller (`apps/server`'s `build`/`renderAndAttach`) does it. */
+function attachRenders(
+  dir: string,
+  snapshotId: SnapshotId,
+  attachments: readonly RenderAttachment[],
+  options?: AttachRendersOptions
+) {
+  return withRecoveredProject(dir, (ctx) => attachRendersToSnapshotLocked(ctx, snapshotId, attachments, options));
+}
+
+/** Test-only convenience: see {@link attachRenders}. */
+function attachValidation(dir: string, snapshotId: SnapshotId, validation: ValidationResult) {
+  return withRecoveredProject(dir, (ctx) => attachValidationToSnapshotLocked(ctx, snapshotId, validation));
+}
 
 const providerConfig = { provider: "claude-agent-sdk", model: null, max_passes: 2 };
 
@@ -54,7 +73,7 @@ describe("attachRendersToSnapshot", () => {
   it("copies the PNG into the snapshot's DERIVED views/ dir and records a RenderRef, WITHOUT touching history/<id>/manifest.json", async () => {
     const rawBefore = await readRawHistoryManifest("0001");
 
-    const manifest = await attachRendersToSnapshot(projectDir, "0001", [
+    const manifest = await attachRenders(projectDir, "0001", [
       { view: "iso", sourcePath: pngPath, render_ms: 42, width: 1024, height: 768 }
     ]);
 
@@ -84,7 +103,7 @@ describe("attachRendersToSnapshot", () => {
   });
 
   it("uses the caller's URL builder, and falls back to a bare relative path without one", async () => {
-    const withBuilder = await attachRendersToSnapshot(
+    const withBuilder = await attachRenders(
       projectDir,
       "0001",
       [{ view: "front", sourcePath: pngPath, render_ms: null, width: 800, height: 600 }],
@@ -92,17 +111,17 @@ describe("attachRendersToSnapshot", () => {
     );
     expect(withBuilder.renders[0].url).toBe("/api/projects/bracket/snapshots/0001/views/front");
 
-    const withoutBuilder = await attachRendersToSnapshot(projectDir, "0001", [
+    const withoutBuilder = await attachRenders(projectDir, "0001", [
       { view: "top", sourcePath: pngPath, render_ms: null, width: 800, height: 600 }
     ]);
     expect(withoutBuilder.renders.find((r) => r.view === "top")?.url).toBe("/views/top.png");
   });
 
   it("replaces an already-attached view instead of duplicating it", async () => {
-    await attachRendersToSnapshot(projectDir, "0001", [
+    await attachRenders(projectDir, "0001", [
       { view: "iso", sourcePath: pngPath, render_ms: 10, width: 1024, height: 768 }
     ]);
-    const second = await attachRendersToSnapshot(projectDir, "0001", [
+    const second = await attachRenders(projectDir, "0001", [
       { view: "iso", sourcePath: pngPath, render_ms: 99, width: 640, height: 480 }
     ]);
 
@@ -114,7 +133,7 @@ describe("attachRendersToSnapshot", () => {
 
   it("leaves the model timeline untouched (append-only history is not violated)", async () => {
     const before = await readRawHistoryManifest("0001");
-    await attachRendersToSnapshot(projectDir, "0001", [
+    await attachRenders(projectDir, "0001", [
       { view: "iso", sourcePath: pngPath, render_ms: 5, width: 1024, height: 768 }
     ]);
     const after = await readRawHistoryManifest("0001");
@@ -127,14 +146,14 @@ describe("attachRendersToSnapshot", () => {
 
   it("fails with a typed SNAPSHOT_NOT_FOUND rather than a raw fs error", async () => {
     await expect(
-      attachRendersToSnapshot(projectDir, "9999", [
+      attachRenders(projectDir, "9999", [
         { view: "iso", sourcePath: pngPath, render_ms: null, width: 1, height: 1 }
       ])
     ).rejects.toMatchObject({ error_code: "SNAPSHOT_NOT_FOUND" });
   });
 
   it("is a no-op on the manifest when given no attachments", async () => {
-    const manifest = await attachRendersToSnapshot(projectDir, "0001", []);
+    const manifest = await attachRenders(projectDir, "0001", []);
     expect(manifest.renders).toEqual([]);
   });
 
@@ -165,7 +184,7 @@ describe("attachValidationToSnapshot", () => {
   it("persists the full report verbatim to the DERIVED location and summarises it into the read-merged manifest, WITHOUT touching history/<id>/validation.json or manifest.json", async () => {
     const rawBefore = await readRawHistoryManifest("0001");
 
-    const manifest = await attachValidationToSnapshot(projectDir, "0001", GREEN_VALIDATION);
+    const manifest = await attachValidation(projectDir, "0001", GREEN_VALIDATION);
 
     expect(manifest.validation).toEqual({
       badge: "green",
@@ -199,14 +218,14 @@ describe("attachValidationToSnapshot", () => {
       export_ms: null,
       validate_ms: 12
     };
-    const manifest = await attachValidationToSnapshot(projectDir, "0001", red);
+    const manifest = await attachValidation(projectDir, "0001", red);
     expect(manifest.validation).toMatchObject({ badge: "red", manifold: false, components: null, warning_count: 1 });
   });
 
   it("re-validating replaces the previous verdict rather than appending, still never touching history/", async () => {
-    await attachValidationToSnapshot(projectDir, "0001", GREEN_VALIDATION);
+    await attachValidation(projectDir, "0001", GREEN_VALIDATION);
     const rawAfterFirst = await readRawHistoryManifest("0001");
-    const second = await attachValidationToSnapshot(projectDir, "0001", {
+    const second = await attachValidation(projectDir, "0001", {
       ...GREEN_VALIDATION,
       gate: { ...GREEN_VALIDATION.gate, badge: "amber", warnings: ["multi-part allowed by override"] }
     });
@@ -217,13 +236,13 @@ describe("attachValidationToSnapshot", () => {
 
   it("leaves the model timeline untouched", async () => {
     const before = await readRawHistoryManifest("0001");
-    await attachValidationToSnapshot(projectDir, "0001", GREEN_VALIDATION);
+    await attachValidation(projectDir, "0001", GREEN_VALIDATION);
     const after = await readRawHistoryManifest("0001");
     expect(after).toEqual(before);
   });
 
   it("fails with a typed SNAPSHOT_NOT_FOUND on an unknown snapshot", async () => {
-    await expect(attachValidationToSnapshot(projectDir, "9999", GREEN_VALIDATION)).rejects.toMatchObject({
+    await expect(attachValidation(projectDir, "9999", GREEN_VALIDATION)).rejects.toMatchObject({
       error_code: "SNAPSHOT_NOT_FOUND"
     });
   });
@@ -285,7 +304,7 @@ describe("legacy fallback: reading a snapshot that predates the derived/ tree", 
   it("prefers the DERIVED location over the legacy one once a fresh attach has happened", async () => {
     await seedLegacySnapshot("0001");
     // A fresh re-render lands in derived/, not history/.
-    await attachRendersToSnapshot(projectDir, "0001", [
+    await attachRenders(projectDir, "0001", [
       { view: "iso", sourcePath: pngPath, render_ms: 7, width: 640, height: 480 }
     ]);
     const resolved = await resolveSnapshotRenderPath(projectDir, "0001", "iso");
