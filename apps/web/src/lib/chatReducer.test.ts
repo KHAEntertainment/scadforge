@@ -9,6 +9,10 @@ function turnStarted(): SseEvent {
   return { type: "turn_started", turn_id: TURN_ID, project_id: "p1", max_passes: 2, started_at: "2026-08-26T00:00:00.000Z" };
 }
 
+function assistantTextItems(items: ChatItem[]): Extract<ChatItem, { kind: "assistant_text" }>[] {
+  return items.filter((item): item is Extract<ChatItem, { kind: "assistant_text" }> => item.kind === "assistant_text");
+}
+
 describe("reduceChatEvents", () => {
   it("accumulates consecutive assistant_text chunks into one growing item", () => {
     const events: SseEvent[] = [
@@ -17,8 +21,9 @@ describe("reduceChatEvents", () => {
       { type: "assistant_text", turn_id: TURN_ID, text: "a bracket." }
     ];
     const state = reduceChatEvents(events);
-    expect(state.items).toHaveLength(1);
-    expect(state.items[0]).toMatchObject({ kind: "assistant_text", text: "Building a bracket." });
+    const assistantItems = assistantTextItems(state.items);
+    expect(assistantItems).toHaveLength(1);
+    expect(assistantItems[0]).toMatchObject({ kind: "assistant_text", text: "Building a bracket." });
   });
 
   it("tracks tool_call → tool_result as one compact activity row, no raw payloads", () => {
@@ -39,15 +44,16 @@ describe("reduceChatEvents", () => {
       }
     ];
     const state = reduceChatEvents(events);
-    expect(state.items).toHaveLength(1);
-    expect(state.items[0]).toMatchObject({
+    const toolItems = state.items.filter((item) => item.kind === "tool_activity");
+    expect(toolItems).toHaveLength(1);
+    expect(toolItems[0]).toMatchObject({
       kind: "tool_activity",
       name: "render_views",
       status: "ok",
       summary: "Rendered 2 views"
     });
     // Counterexample guard: nothing resembling a full envelope/payload dump.
-    expect(JSON.stringify(state.items[0])).not.toContain("bytes");
+    expect(JSON.stringify(toolItems[0])).not.toContain("bytes");
   });
 
   it("marks a failed tool_result distinctly from a running one", () => {
@@ -68,7 +74,8 @@ describe("reduceChatEvents", () => {
       }
     ];
     const state = reduceChatEvents(events);
-    expect(state.items[0]).toMatchObject({ kind: "tool_activity", status: "failed", summary: "Syntax error on line 4" });
+    const toolItem = state.items.find((item) => item.kind === "tool_activity");
+    expect(toolItem).toMatchObject({ kind: "tool_activity", status: "failed", summary: "Syntax error on line 4" });
   });
 
   it("captures the latest mesh artifact from a tool_result for the 3D viewer", () => {
@@ -108,7 +115,9 @@ describe("reduceChatEvents", () => {
     };
     const events: SseEvent[] = [turnStarted(), { type: "snapshot_created", turn_id: TURN_ID, project_id: "p1", snapshot: manifest }];
     const state = reduceChatEvents(events);
-    expect(state.items).toHaveLength(0);
+    // Only the running placeholder from turn_started — snapshot_created still adds no item of its own.
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0].kind).toBe("turn_running");
     expect(state.headSnapshot).toEqual(manifest);
   });
 
@@ -119,6 +128,8 @@ describe("reduceChatEvents", () => {
     ];
     const state = reduceChatEvents(events);
     expect(state.activeTurnId).toBeNull();
+    // Replaces the running placeholder in place — no leftover turn_running item.
+    expect(state.items).toHaveLength(1);
     expect(state.items[0]).toMatchObject({ kind: "turn_status", status: "completed", summary: "Done." });
   });
 
@@ -131,7 +142,11 @@ describe("reduceChatEvents", () => {
     expect(() => reduceChatEvents(events)).not.toThrow();
     const state = reduceChatEvents(events);
     expect(state.activeTurnId).toBeNull();
-    expect(state.items.at(-1)).toMatchObject({ kind: "error", errorCode: "AGENT_ERROR" });
+    // The error replaces the running placeholder in place (no duplicate items),
+    // so it lands where turn_started put the placeholder, not necessarily last.
+    const errorItem = state.items.find((item) => item.kind === "error");
+    expect(errorItem).toMatchObject({ kind: "error", errorCode: "AGENT_ERROR" });
+    expect(state.items.filter((item) => item.kind === "turn_running")).toHaveLength(0);
   });
 
   it("counterexample: an empty event list is a no-op", () => {
@@ -145,6 +160,78 @@ describe("reduceChatEvents", () => {
     const b = reduceChatEvent(initialChatState, event);
     expect(a).toEqual(b);
     expect(initialChatState.items).toHaveLength(0); // original state untouched
+  });
+});
+
+// ── running-turn feedback (Issue #76) ────────────────────────────────────────
+//
+// `turn_started` used to reduce to `activeTurnId` alone — nothing rendered
+// while the model was thinking, which measured ~6 minutes in one real turn.
+
+describe("reduceChatEvents — running-turn placeholder", () => {
+  it("turn_started immediately renders a running placeholder, before any tool or text event (AC)", () => {
+    const state = reduceChatEvents([turnStarted()]);
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]).toMatchObject({
+      kind: "turn_running",
+      turnId: TURN_ID,
+      startedAt: "2026-08-26T00:00:00.000Z",
+      phase: "waiting",
+      lastToolName: null
+    });
+    expect(state.activeTurnId).toBe(TURN_ID);
+  });
+
+  it("flips to the working phase with the tool name once a tool_call arrives, and keeps the placeholder on top", () => {
+    const events: SseEvent[] = [
+      turnStarted(),
+      { type: "tool_call", turn_id: TURN_ID, tool_call_id: "call-1", name: "render_views", pass: 0, input_summary: null }
+    ];
+    const state = reduceChatEvents(events);
+    expect(state.items).toHaveLength(2);
+    expect(state.items[0]).toMatchObject({ kind: "turn_running", phase: "working", lastToolName: "render_views" });
+    expect(state.items[1]).toMatchObject({ kind: "tool_activity", name: "render_views" });
+  });
+
+  it("flips to the working phase (no tool name) once assistant_text arrives with no prior tool activity", () => {
+    const events: SseEvent[] = [turnStarted(), { type: "assistant_text", turn_id: TURN_ID, text: "Thinking…" }];
+    const state = reduceChatEvents(events);
+    expect(state.items[0]).toMatchObject({ kind: "turn_running", phase: "working", lastToolName: null });
+  });
+
+  it("a later tool_result does not clobber a still-more-recent tool_call's name", () => {
+    const events: SseEvent[] = [
+      turnStarted(),
+      { type: "tool_call", turn_id: TURN_ID, tool_call_id: "call-1", name: "write_scad", pass: 0, input_summary: null },
+      {
+        type: "tool_result",
+        turn_id: TURN_ID,
+        tool_call_id: "call-1",
+        name: "write_scad",
+        pass: 0,
+        ok: true,
+        error_code: null,
+        summary: "Saved",
+        artifacts: [],
+        duration_ms: 10
+      }
+    ];
+    const state = reduceChatEvents(events);
+    expect(state.items[0]).toMatchObject({ kind: "turn_running", phase: "working", lastToolName: "write_scad" });
+  });
+
+  it("two turns back to back each get their own running item, with no leftover from the first", () => {
+    const first: SseEvent[] = [
+      turnStarted(),
+      { type: "turn_done", turn_id: TURN_ID, status: "completed", passes_used: 1, summary: "Done.", usage: null, duration_ms: 10 }
+    ];
+    const afterFirst = reduceChatEvents(first);
+    const second: SseEvent = { type: "turn_started", turn_id: "turn-2", project_id: "p1", max_passes: 2, started_at: "2026-08-26T00:05:00.000Z" };
+    const state = reduceChatEvent(afterFirst, second);
+
+    expect(state.items).toHaveLength(2);
+    expect(state.items[0]).toMatchObject({ kind: "turn_status", turnId: TURN_ID });
+    expect(state.items[1]).toMatchObject({ kind: "turn_running", turnId: "turn-2", phase: "waiting" });
   });
 });
 

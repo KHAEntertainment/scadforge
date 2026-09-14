@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { ChatItem, ChatState } from "../lib/chatReducer.js";
 
 export interface ChatPanelProps {
@@ -9,7 +9,20 @@ export interface ChatPanelProps {
   disabled?: boolean;
 }
 
-function ChatItemRow({ item }: { item: ChatItem }) {
+/** `m:ss`, per Issue #76 AC — minutes unpadded, seconds zero-padded. */
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function phaseLabel(item: Extract<ChatItem, { kind: "turn_running" }>): string {
+  if (item.phase === "waiting") return "Waiting for the model";
+  return item.lastToolName ? `Working — ${item.lastToolName}` : "Working";
+}
+
+function ChatItemRow({ item, now }: { item: ChatItem; now: number }) {
   switch (item.kind) {
     case "user_text":
       return (
@@ -40,6 +53,17 @@ function ChatItemRow({ item }: { item: ChatItem }) {
         </p>
       );
 
+    case "turn_running":
+      // Reuses `.chat-item--turn-status` styling with a `--running` modifier
+      // (Issue #76 AC) — no motion beyond the text itself, so reduced-motion
+      // users see the same thing.
+      return (
+        <div className="chat-item chat-item--turn-status chat-item--turn-status--running" data-testid="turn-running">
+          <span className="turn-running-phase">{phaseLabel(item)}</span>
+          <span className="turn-running-elapsed">{formatElapsed(now - Date.parse(item.startedAt))}</span>
+        </div>
+      );
+
     case "error":
       return (
         <p className="chat-item chat-item--error" role="alert">
@@ -54,6 +78,21 @@ function ChatItemRow({ item }: { item: ChatItem }) {
 
 export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }: ChatPanelProps) {
   const [draft, setDraft] = useState("");
+  const hasRunningTurn = state.items.some((item) => item.kind === "turn_running");
+
+  // 1×/sec elapsed-time tick for the running-turn item (Issue #76 AC): a
+  // self-rearming `setTimeout` rather than `setInterval`, matching this
+  // codebase's existing timer convention (see `useParamsController`'s debounce).
+  // Re-running whenever `now` changes re-arms the next tick; the effect is
+  // scoped to whether a running item exists at all, so the timer from one
+  // turn is always cleared before the next turn's begins — no leaks across
+  // back-to-back turns, and none left running after unmount.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasRunningTurn) return;
+    const id = setTimeout(() => setNow(Date.now()), 1000);
+    return () => clearTimeout(id);
+  }, [hasRunningTurn, now]);
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -75,7 +114,7 @@ export function ChatPanel({ state, isStreaming, streamError, onSend, disabled }:
         {state.items.length === 0 ? (
           <p className="chat-empty">Ask ScadForge to build or change your model.</p>
         ) : (
-          state.items.map((item, index) => <ChatItemRow key={index} item={item} />)
+          state.items.map((item, index) => <ChatItemRow key={index} item={item} now={now} />)
         )}
         {streamError ? (
           <p className="chat-item chat-item--error" role="alert" data-testid="chat-stream-error">
