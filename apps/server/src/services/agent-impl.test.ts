@@ -70,22 +70,12 @@ describe("createAgentStderrForwarder", () => {
     expect(createAgentStderrForwarder({ [AGENT_STDERR_ENV_VAR]: "1" })).not.toBeNull();
   });
 
-  it("prefixes a forwarded line with the current turn id, and [agent] when none is set", () => {
+  it("prefixes a forwarded line with the turn id passed alongside it", () => {
     const forwarder = createAgentStderrForwarder({})!;
     const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
-      forwarder.onStderr("connecting to mcp server\n");
-      expect(spy).toHaveBeenCalledWith("[agent] connecting to mcp server\n");
-
-      spy.mockClear();
-      forwarder.setCurrentTurnId("turn-abc");
-      forwarder.onStderr("tool call started\n");
+      forwarder.onStderr("tool call started\n", "turn-abc");
       expect(spy).toHaveBeenCalledWith("[turn turn-abc] tool call started\n");
-
-      spy.mockClear();
-      forwarder.setCurrentTurnId(null);
-      forwarder.onStderr("cleanup\n");
-      expect(spy).toHaveBeenCalledWith("[agent] cleanup\n");
     } finally {
       spy.mockRestore();
     }
@@ -95,9 +85,9 @@ describe("createAgentStderrForwarder", () => {
     const forwarder = createAgentStderrForwarder({})!;
     const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
-      forwarder.onStderr("line one\nline two\nline three\n");
+      forwarder.onStderr("line one\nline two\nline three\n", "turn-1");
       expect(spy).toHaveBeenCalledTimes(1);
-      expect(spy).toHaveBeenCalledWith("[agent] line one\n[agent] line two\n[agent] line three\n");
+      expect(spy).toHaveBeenCalledWith("[turn turn-1] line one\n[turn turn-1] line two\n[turn turn-1] line three\n");
     } finally {
       spy.mockRestore();
     }
@@ -107,10 +97,10 @@ describe("createAgentStderrForwarder", () => {
     const forwarder = createAgentStderrForwarder({})!;
     const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
-      forwarder.onStderr("half a ");
+      forwarder.onStderr("half a ", "turn-1");
       expect(spy).not.toHaveBeenCalled();
-      forwarder.onStderr("line\n");
-      expect(spy).toHaveBeenCalledWith("[agent] half a line\n");
+      forwarder.onStderr("line\n", "turn-1");
+      expect(spy).toHaveBeenCalledWith("[turn turn-1] half a line\n");
     } finally {
       spy.mockRestore();
     }
@@ -121,14 +111,14 @@ describe("createAgentStderrForwarder", () => {
     const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
       const huge = "x".repeat(5000); // past STDERR_CARRY_LIMIT, no trailing newline
-      forwarder.onStderr(huge);
+      forwarder.onStderr(huge, "turn-1");
       expect(spy).toHaveBeenCalledTimes(1);
-      expect(spy).toHaveBeenCalledWith(`[agent] ${huge}\n`);
+      expect(spy).toHaveBeenCalledWith(`[turn turn-1] ${huge}\n`);
 
       // The carry was reset, not left holding the flushed text.
       spy.mockClear();
-      forwarder.onStderr("next\n");
-      expect(spy).toHaveBeenCalledWith("[agent] next\n");
+      forwarder.onStderr("next\n", "turn-1");
+      expect(spy).toHaveBeenCalledWith("[turn turn-1] next\n");
     } finally {
       spy.mockRestore();
     }
@@ -138,8 +128,104 @@ describe("createAgentStderrForwarder", () => {
     const forwarder = createAgentStderrForwarder({})!;
     const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
-      forwarder.onStderr("   \n\n");
+      forwarder.onStderr("   \n\n", "turn-1");
       expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // Issue #75 QA fix 2: `chat.ts` locks per PROJECT, not globally, so two
+  // turns on different projects can run concurrently against the SAME
+  // provider instance and forwarder. State must be keyed by turn id.
+  it("keeps a separate carry buffer per turn id -- concurrent turns never bleed into each other's lines", () => {
+    const forwarder = createAgentStderrForwarder({})!;
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      forwarder.onStderr("half of A's line ", "turn-A");
+      forwarder.onStderr("all of B's line\n", "turn-B");
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith("[turn turn-B] all of B's line\n");
+
+      spy.mockClear();
+      forwarder.onStderr("continues\n", "turn-A");
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith("[turn turn-A] half of A's line continues\n");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("endTurn flushes a trailing unterminated line for that turn and clears its state", () => {
+    const forwarder = createAgentStderrForwarder({})!;
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      forwarder.onStderr("dangling, no newline", "turn-A");
+      expect(spy).not.toHaveBeenCalled();
+      forwarder.endTurn("turn-A");
+      expect(spy).toHaveBeenCalledWith("[turn turn-A] dangling, no newline\n");
+
+      // A second endTurn on the same (now-cleared) id is a harmless no-op.
+      spy.mockClear();
+      forwarder.endTurn("turn-A");
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("endTurn on an id with no dangling line, or with no state at all, does nothing", () => {
+    const forwarder = createAgentStderrForwarder({})!;
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      forwarder.onStderr("complete line\n", "turn-A");
+      spy.mockClear();
+      forwarder.endTurn("turn-A"); // already flushed, carry is empty
+      forwarder.endTurn("turn-never-seen");
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  // Issue #75 QA fix 1: the vendored SDK calls `onStderr` from a raw stream
+  // 'data' handler with no try/catch of its own -- an uncaught throw here
+  // would crash the whole server, not just the turn.
+  it("never throws even when the underlying write fails (e.g. EPIPE), and drops the line instead", () => {
+    const forwarder = createAgentStderrForwarder({})!;
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => {
+      throw new Error("EPIPE");
+    });
+    try {
+      expect(() => forwarder.onStderr("line one\n", "turn-A")).not.toThrow();
+      expect(() => forwarder.onStderr("line two\n", "turn-A")).not.toThrow();
+      expect(() => forwarder.endTurn("turn-A")).not.toThrow();
+
+      // One attempted write per line-bearing call, plus the "dropped" notice
+      // logged exactly once for the turn (not once per dropped line).
+      expect(spy).toHaveBeenCalledTimes(3);
+      const droppedNotices = spy.mock.calls.filter(([line]) =>
+        String(line).includes("further lines are dropped silently")
+      );
+      expect(droppedNotices).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a turn whose writes are failing does not affect a concurrent turn's forwarding", () => {
+    const forwarder = createAgentStderrForwarder({})!;
+    let failA = true;
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      if (failA && String(chunk).includes("turn-A")) throw new Error("EPIPE");
+      return true;
+    });
+    try {
+      expect(() => forwarder.onStderr("line\n", "turn-A")).not.toThrow();
+      failA = false;
+      spy.mockClear();
+      forwarder.onStderr("still working\n", "turn-B");
+      expect(spy).toHaveBeenCalledWith("[turn turn-B] still working\n");
     } finally {
       spy.mockRestore();
     }

@@ -43,17 +43,32 @@ export const AGENT_STDERR_ENV_VAR = "SCADFORGE_AGENT_STDERR";
 /** Never let an unterminated stderr chunk grow the carry buffer forever. */
 const STDERR_CARRY_LIMIT = 4096;
 
+/** Per-turn state {@link createAgentStderrForwarder} keeps: never shared across turns. */
+interface TurnStderrState {
+  /** Unterminated tail carried across chunks, capped at {@link STDERR_CARRY_LIMIT}. */
+  carry: string;
+  /** Lines dropped because the underlying write failed (Issue #75 QA fix 1). */
+  dropped: number;
+  /** Whether the one-per-turn "lines are being dropped" notice has fired. */
+  droppedLogged: boolean;
+}
+
 /** What {@link createAgentStderrForwarder} returns; `null` when disabled. */
 export interface AgentStderrForwarder {
-  /** Passed straight through as `ClaudeAgentSdkProviderOptions.onStderr`. */
-  onStderr: (data: string) => void;
   /**
-   * Call with the running turn's id at the start of `runTurn`, and with
-   * `null` once it ends, so lines are stamped with the turn that actually
-   * produced them. A line that arrives outside any active turn (subprocess
-   * startup/teardown) is stamped `[agent]`.
+   * Passed straight through as `ClaudeAgentSdkProviderOptions.onStderr`
+   * (called with the turn id alongside each chunk — see that option's doc).
+   * Never throws: the vendored SDK invokes this from a raw stream `'data'`
+   * handler with no try/catch of its own, so an uncaught error here would
+   * take down the whole server, not just the turn (Issue #75 QA fix 1).
    */
-  setCurrentTurnId: (turnId: string | null) => void;
+  onStderr: (data: string, turnId: string) => void;
+  /**
+   * Call once a turn ends: flushes any trailing unterminated line for that
+   * turn and drops its per-turn state, so a long-lived server does not
+   * accumulate one carry buffer per turn id forever.
+   */
+  endTurn: (turnId: string) => void;
 }
 
 /**
@@ -62,46 +77,92 @@ export interface AgentStderrForwarder {
  * diagnostics land — was previously discarded entirely (no `onStderr` was
  * ever passed), so nothing about a live turn was observable from the server.
  *
- * One `process.stderr.write` per stderr *event* (one subprocess data chunk),
- * never one per line: chunk boundaries do not line up with newlines, and a
- * chatty subprocess must not turn into a synchronous-write storm. Lines
- * within one chunk are still each stamped individually. An unterminated tail
- * is carried to the next chunk but capped at {@link STDERR_CARRY_LIMIT} —
- * past that it is flushed as-is instead of grown forever, so a pathological
- * stream can never buffer without bound here.
+ * State is keyed by turn id (not shared): `chat.ts` only locks per PROJECT,
+ * so two turns on different projects can run concurrently against the SAME
+ * provider instance, and a single shared carry buffer would interleave their
+ * lines (Issue #75 QA fix 2). One `process.stderr.write` per stderr *event*
+ * (one subprocess data chunk) per turn, never one per line: chunk boundaries
+ * do not line up with newlines, and a chatty subprocess must not turn into a
+ * synchronous-write storm. Lines within one chunk are still each stamped
+ * individually. An unterminated tail is carried to the next chunk for that
+ * SAME turn but capped at {@link STDERR_CARRY_LIMIT} — past that it is
+ * flushed as-is instead of grown forever, so a pathological stream can never
+ * buffer without bound here.
+ *
+ * The write itself can fail (Issue #75 QA fix 1: e.g. `EPIPE` if the
+ * server's own stderr is a closed pipe) — that failure is caught, the line is
+ * dropped, and a "lines are being dropped" notice is logged at most once per
+ * turn rather than once per line.
  */
 export function createAgentStderrForwarder(
   env: NodeJS.ProcessEnv = process.env
 ): AgentStderrForwarder | null {
   if (env[AGENT_STDERR_ENV_VAR] === "0") return null;
 
-  let currentTurnId: string | null = null;
-  let carry = "";
-
-  const onStderr = (data: string): void => {
-    carry += data;
-    const lines: string[] = [];
-    let newlineAt: number;
-    while ((newlineAt = carry.indexOf("\n")) !== -1) {
-      lines.push(carry.slice(0, newlineAt));
-      carry = carry.slice(newlineAt + 1);
+  const stateByTurn = new Map<string, TurnStderrState>();
+  const stateFor = (turnId: string): TurnStderrState => {
+    let state = stateByTurn.get(turnId);
+    if (!state) {
+      state = { carry: "", dropped: 0, droppedLogged: false };
+      stateByTurn.set(turnId, state);
     }
-    if (carry.length > STDERR_CARRY_LIMIT) {
-      lines.push(carry);
-      carry = "";
-    }
-    const nonEmpty = lines.map((line) => line.trimEnd()).filter((line) => line.length > 0);
-    if (nonEmpty.length === 0) return;
-    const prefix = currentTurnId ? `[turn ${currentTurnId}]` : "[agent]";
-    process.stderr.write(nonEmpty.map((line) => `${prefix} ${line}`).join("\n") + "\n");
+    return state;
   };
 
-  return {
-    onStderr,
-    setCurrentTurnId: (turnId) => {
-      currentTurnId = turnId;
+  /** Never throws: a failed write is dropped and counted, nothing more. */
+  const writeLine = (line: string, turnId: string, state: TurnStderrState, prefix: string): void => {
+    try {
+      process.stderr.write(line);
+    } catch {
+      state.dropped++;
+      if (state.droppedLogged) return;
+      state.droppedLogged = true;
+      try {
+        process.stderr.write(`${prefix} stderr forwarding failed for this turn; further lines are dropped silently\n`);
+      } catch {
+        // The notice write failed too -- give up quietly, this must never throw.
+      }
     }
   };
+
+  const onStderr = (data: string, turnId: string): void => {
+    try {
+      const state = stateFor(turnId);
+      state.carry += data;
+      const lines: string[] = [];
+      let newlineAt: number;
+      while ((newlineAt = state.carry.indexOf("\n")) !== -1) {
+        lines.push(state.carry.slice(0, newlineAt));
+        state.carry = state.carry.slice(newlineAt + 1);
+      }
+      if (state.carry.length > STDERR_CARRY_LIMIT) {
+        lines.push(state.carry);
+        state.carry = "";
+      }
+      const nonEmpty = lines.map((line) => line.trimEnd()).filter((line) => line.length > 0);
+      if (nonEmpty.length === 0) return;
+      const prefix = turnId ? `[turn ${turnId}]` : "[agent]";
+      writeLine(nonEmpty.map((line) => `${prefix} ${line}`).join("\n") + "\n", turnId, state, prefix);
+    } catch {
+      // Defense in depth (Issue #75 QA fix 1): this callback runs inside the
+      // SDK's raw stream 'data' handler with no surrounding try/catch of its
+      // own -- it must never throw, whatever goes wrong above.
+    }
+  };
+
+  const endTurn = (turnId: string): void => {
+    try {
+      const state = stateByTurn.get(turnId);
+      stateByTurn.delete(turnId);
+      if (!state || !state.carry.trim()) return;
+      const prefix = turnId ? `[turn ${turnId}]` : "[agent]";
+      writeLine(`${prefix} ${state.carry.trimEnd()}\n`, turnId, state, prefix);
+    } catch {
+      // Same guarantee as onStderr: turn cleanup must never throw either.
+    }
+  };
+
+  return { onStderr, endTurn };
 }
 
 /** Builds the default provider + forwarder pair exactly as production does. */
@@ -200,11 +261,13 @@ export function createRealAgentProvider(options: RealAgentProviderOptions): Agen
 
   return {
     async runTurn(input: AgentTurnInput, onEvent: AgentEventSink): Promise<void> {
-      forwarder?.setCurrentTurnId(input.turnId);
       try {
         await runOneTurn(input, onEvent);
       } finally {
-        forwarder?.setCurrentTurnId(null);
+        // Drops this turn's carry buffer (and flushes any trailing
+        // unterminated line) so a long-lived server never accumulates one
+        // per turn id forever (Issue #75 QA fix 2).
+        forwarder?.endTurn(input.turnId);
       }
     }
   };
