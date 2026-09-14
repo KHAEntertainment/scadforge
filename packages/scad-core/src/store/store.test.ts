@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,7 +30,10 @@ import {
 } from "./attachments.js";
 import { withRecoveredProject } from "./recovered.js";
 import type { SnapshotId } from "@scadforge/protocol";
+import type { EditorFeature, EditorSidecar, ProjectManifest, SnapshotManifest } from "@scadforge/protocol";
 import type { ValidationResult } from "../types.js";
+import { canonicalJson, sidecarDigest } from "../editor/canonical.js";
+import { EMPTY_SIDECAR, readSidecarLocked, sidecarPath, snapshotSidecarPath, writeSidecarLocked } from "../editor/sidecar.js";
 
 /** Test-only convenience: opens the boundary once and calls the ctx-taking attacher, mirroring how a real caller (`apps/server`'s `build`/`renderAndAttach`) does it. */
 function attachRendersToSnapshot(
@@ -849,3 +853,168 @@ describe("corruption vs. legacy absence (Issue #73)", () => {
 async function readdirNames(dir: string): Promise<string[]> {
   return (await readdir(dir)).sort();
 }
+
+// ── editor sidecar snapshot capture and revert copy-forward (Issue #87 / S3-B ticket B3) ──
+
+function makeFeature(overrides: Partial<EditorFeature> = {}): EditorFeature {
+  return {
+    featureId: randomUUID(),
+    label: "Width",
+    projectId: randomUUID(),
+    createdAtRevision: "a".repeat(64),
+    sourceFingerprint: "b".repeat(64),
+    bindingVersion: 1,
+    provenance: { kind: "manual" },
+    binding: { kind: "linear", parameter: "width", axis: "x", mapping: { scale: 1, offset: 0, anchor: "min" } },
+    ...overrides
+  };
+}
+
+/** Test-only convenience mirroring `attachRendersToSnapshot` above. */
+function writeSidecar(dir: string, sidecar: EditorSidecar) {
+  return withRecoveredProject(dir, (ctx) => writeSidecarLocked(ctx, sidecar));
+}
+
+function readSidecar(dir: string) {
+  return withRecoveredProject(dir, (ctx) => readSidecarLocked(ctx));
+}
+
+/** Simulates a snapshot that predates S3 (Issue #68/#87): strips its captured `editor.json` and the manifest's `editor` descriptor, WITHOUT touching the project marker or any other snapshot. Only used to construct a pre-S3 fixture on an otherwise S3-B-created project -- `initProject`'s own first snapshot is always modern (see the "new projects are S3-modern from their first snapshot" test below), so a genuinely legacy snapshot has to be simulated this way. */
+async function stripEditorFromSnapshot(dir: string, id: string): Promise<void> {
+  await rm(snapshotSidecarPath(dir, id), { force: true });
+  const manifestPath = join(snapshotDir(dir, id), PROJECT_LAYOUT.snapshot.manifestFile);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as SnapshotManifest;
+  delete manifest.editor;
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+}
+
+describe("editor sidecar: snapshot capture (Issue #87 / S3-B ticket B3)", () => {
+  it("a brand-new project is S3-modern from its very first ('initial') snapshot -- no init-time special case, an emergent property of ordinary snapshot capture", async () => {
+    const { project, snapshot } = await initProject(projectDir, {
+      id: "p",
+      name: "n",
+      provider: providerConfig,
+      content: "cube(1);\n"
+    });
+
+    expect(project.editor_store_version).toBe(1);
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(canonicalJson(EMPTY_SIDECAR));
+
+    expect(snapshot.editor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(EMPTY_SIDECAR) });
+    const capturedBytes = await readFile(snapshotSidecarPath(projectDir, snapshot.id), "utf8");
+    expect(capturedBytes).toBe(canonicalJson(EMPTY_SIDECAR));
+
+    const projectManifest = JSON.parse(await readFile(projectFilePath(projectDir), "utf8")) as ProjectManifest;
+    expect(projectManifest.editor_store_version).toBe(1);
+  });
+
+  it("an ordinary params snapshot on a READY project embeds editor.json whose digest equals the manifest descriptor", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const sidecar: EditorSidecar = { version: 1, features: [makeFeature()] };
+    await writeSidecar(projectDir, sidecar);
+
+    const snap = await createSnapshot(projectDir, {
+      content: "cube(1);\n",
+      params: { size: 5 },
+      message: "params update",
+      origin: "manual",
+      pass: null
+    });
+
+    expect(snap.editor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(sidecar) });
+    const capturedBytes = await readFile(snapshotSidecarPath(projectDir, snap.id), "utf8");
+    expect(capturedBytes).toBe(canonicalJson(sidecar));
+  });
+
+  it("createSnapshot refuses (INTERNAL_ERROR, naming the status and the absolute path) when the root sidecar is corrupt", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const corruptBytes = "{ not json";
+    await writeFile(sidecarPath(projectDir), corruptBytes, "utf8");
+
+    await expect(
+      createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "must not land", origin: "manual", pass: null })
+    ).rejects.toMatchObject({ error_code: "INTERNAL_ERROR", message: expect.stringContaining(sidecarPath(projectDir)) });
+
+    // No new snapshot was claimed, and the corrupt bytes are untouched.
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]);
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(corruptBytes);
+  });
+});
+
+describe("editor sidecar: revert exact copy-forward (Issue #87 / S3-B ticket B3, AC6)", () => {
+  it("revert to a snapshot with two features when the root has three yields exactly the two, byte-for-byte", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001, S3-modern, empty
+
+    const two: EditorSidecar = { version: 1, features: [makeFeature(), makeFeature()] };
+    await writeSidecar(projectDir, two);
+    const target = await createSnapshot(projectDir, { content: "cube(1);\n", params: {}, message: "two features", origin: "manual", pass: null }); // 0002 -- the revert TARGET
+
+    const three: EditorSidecar = { version: 1, features: [...two.features, makeFeature()] };
+    await writeSidecar(projectDir, three);
+    await createSnapshot(projectDir, { content: "cube(1);\n", params: {}, message: "three features", origin: "manual", pass: null }); // 0003 -- current head/root
+
+    const reverted = await revertToSnapshot(projectDir, target.id);
+
+    // The new ROOT sidecar is EXACTLY the target's two features -- never
+    // merged with the three the root had a moment ago.
+    const rootAfter = await readSidecar(projectDir);
+    expect(rootAfter.status).toBe("ready");
+    expect(rootAfter.sidecar?.features.map((f) => f.featureId).sort()).toEqual(
+      two.features.map((f) => f.featureId).sort()
+    );
+
+    // And the REVERTED snapshot's own captured copy matches, byte-for-byte,
+    // the TARGET's own captured copy (not merely equal in content).
+    const revertedBytes = await readFile(snapshotSidecarPath(projectDir, reverted.id), "utf8");
+    const targetBytes = await readFile(snapshotSidecarPath(projectDir, target.id), "utf8");
+    expect(revertedBytes).toBe(targetBytes);
+    expect(reverted.editor?.sha256).toBe(target.editor?.sha256);
+  });
+
+  it("revert to a PRE-S3 target yields the canonical empty sidecar and keeps the (already-set) marker", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    await stripEditorFromSnapshot(projectDir, "0001"); // simulate: 0001 predates S3
+
+    const sidecar: EditorSidecar = { version: 1, features: [makeFeature()] };
+    await writeSidecar(projectDir, sidecar);
+    await createSnapshot(projectDir, { content: "cube(1);\n", params: {}, message: "modern head", origin: "manual", pass: null }); // 0002 -- root now has 1 feature
+
+    const reverted = await revertToSnapshot(projectDir, "0001");
+
+    const rootAfter = await readSidecar(projectDir);
+    expect(rootAfter).toEqual({ status: "ready", sidecar: EMPTY_SIDECAR, digest: sidecarDigest(EMPTY_SIDECAR), error: null });
+
+    const projectManifest = JSON.parse(await readFile(projectFilePath(projectDir), "utf8")) as ProjectManifest;
+    expect(projectManifest.editor_store_version).toBe(1); // never downgraded
+
+    expect(reverted.editor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(EMPTY_SIDECAR) });
+  });
+
+  it("revertToSnapshot on a CORRUPT root sidecar throws and neither the root sidecar nor head changes", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    const corruptBytes = "{ not json";
+    await writeFile(sidecarPath(projectDir), corruptBytes, "utf8");
+    const headBefore = (await readProjectManifest(projectDir)).head;
+
+    await expect(revertToSnapshot(projectDir, "0001")).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(corruptBytes);
+    expect((await readProjectManifest(projectDir)).head).toBe(headBefore);
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]); // no new snapshot was left behind
+  });
+
+  it("revertToSnapshot on a CORRUPT target snapshot sidecar throws and nothing changes", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001, valid empty sidecar
+    const rootBefore = await readFile(sidecarPath(projectDir), "utf8");
+    const headBefore = (await readProjectManifest(projectDir)).head;
+    // Tamper 0001's OWN captured copy while its manifest descriptor still
+    // points at it -- a digest mismatch, i.e. corruption, never legacy-empty.
+    await writeFile(snapshotSidecarPath(projectDir, "0001"), "{ not json", "utf8");
+
+    await expect(revertToSnapshot(projectDir, "0001")).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(rootBefore); // root untouched
+    expect((await readProjectManifest(projectDir)).head).toBe(headBefore);
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]);
+  });
+});
