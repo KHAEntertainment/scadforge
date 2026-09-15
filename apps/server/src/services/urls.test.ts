@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { describe, expect, it } from "vitest";
 import { API_BASE_PATH } from "@scadforge/protocol";
 import { exportFileUrl, projectUrl, renderFileUrl, snapshotUrl } from "./urls.js";

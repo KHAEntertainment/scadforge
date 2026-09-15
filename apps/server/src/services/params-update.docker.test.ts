@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- Issue #32's central requirement: agent-set and user-set
 // parameters flow through ONE code path. Exercises the REST surface
 // (`scad-core-impl.ts`'s `updateParams`, what `routes/params.ts` calls) and
