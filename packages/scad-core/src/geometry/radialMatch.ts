@@ -75,27 +75,47 @@ function boundingRadius(mesh: WeldedMesh): number {
   return Math.hypot(maxX - minX, maxY - minY, maxZ - minZ) / 2;
 }
 
-/**
- * The declared binding's center matches a recognized region's fitted center
- * when their RADIAL position agrees (the two coordinates perpendicular to
- * `axis`) within the S2 circle-fit deviation tolerance. Axial position is
- * deliberately not compared: `evaluateCylinder`'s returned center sits at
- * the recognized region's own axial midpoint, which tracks whatever extent
- * happened to render (a through-hole vs. a blind hole at a given wall
- * thickness), not necessarily the declared feature's authored axial
- * reference point — "the same hole" is identified by its radial position
- * and axis, not by an axial coordinate that a legitimate render can move.
- */
-function centerMatches(found: Vec3, declared: Vec3, axis: Axis): boolean {
-  const tolerance = INSPECTION_THRESHOLDS.maxDeviationMm;
+/** The two off-axis coordinates of `v` for `axis` — the radial position. */
+function radialCoords(v: Vec3, axis: Axis): [number, number] {
   switch (axis) {
     case "x":
-      return Math.abs(found.y - declared.y) <= tolerance && Math.abs(found.z - declared.z) <= tolerance;
+      return [v.y, v.z];
     case "y":
-      return Math.abs(found.z - declared.z) <= tolerance && Math.abs(found.x - declared.x) <= tolerance;
+      return [v.z, v.x];
     case "z":
-      return Math.abs(found.x - declared.x) <= tolerance && Math.abs(found.y - declared.y) <= tolerance;
+      return [v.x, v.y];
   }
+}
+
+/**
+ * Real parts commonly place several coaxial features at the SAME radial
+ * position and axis but different axial ranges (e.g. the S3-B B5 hinge
+ * fixture's three knuckle bores: same bore diameter/axis/radial center,
+ * separated along X) — radial position and axis alone are not enough to
+ * pick out the one the declared binding actually refers to. A recognized
+ * region matches the declared binding when its RADIAL position agrees (the
+ * two coordinates perpendicular to `axis`) within the S2 circle-fit
+ * deviation tolerance, AND the declared center's axial coordinate falls
+ * within the region's own actual axial span — `evaluateCylinder`'s
+ * `center`'s axial component is the region's axial MIDPOINT and
+ * `evidence.axialLengthMm` its extent, so the span is
+ * `[center ± axialLengthMm/2]` (widened by a small edge tolerance: a
+ * legitimately-declared reference point can sit anywhere along a through-
+ * hole's length, not necessarily exactly at its midpoint).
+ */
+function matchesDeclaredBinding(match: CylinderInspection, declaredCenter: Vec3, axis: Axis): boolean {
+  const radialTolerance = INSPECTION_THRESHOLDS.maxDeviationMm;
+  const [foundU, foundV] = radialCoords(match.center, axis);
+  const [declaredU, declaredV] = radialCoords(declaredCenter, axis);
+  if (Math.abs(foundU - declaredU) > radialTolerance || Math.abs(foundV - declaredV) > radialTolerance) {
+    return false;
+  }
+
+  const axialEdgeToleranceMm = 1;
+  const foundAxialCenter = match.center[axis];
+  const halfSpan = match.evidence.axialLengthMm / 2 + axialEdgeToleranceMm;
+  const declaredAxial = declaredCenter[axis];
+  return Math.abs(declaredAxial - foundAxialCenter) <= halfSpan;
 }
 
 export interface RadialMatchResult {
@@ -135,7 +155,7 @@ export function findRadialMatches(mesh: WeldedMesh, declaredCenter: Vec3, axis: 
     facesVisited += region.length;
 
     const outcome = evaluateSeedRegion(mesh, t, region, axis);
-    if (outcome.status === "recognized" && centerMatches(outcome.inspection.center, declaredCenter, axis)) {
+    if (outcome.status === "recognized" && matchesDeclaredBinding(outcome.inspection, declaredCenter, axis)) {
       matches.push(outcome.inspection);
     }
   }

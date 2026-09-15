@@ -25,16 +25,25 @@ describe("findRadialMatches", () => {
     expect(result.matches.length).toBe(0);
   });
 
-  it("finds two matches (refuse-worthy) for two bores sharing a declared axis/center within tolerance", () => {
-    // Two coaxial bores at the same nominal center (e.g. a through-hole
-    // rendered as two separate cylindrical segments interrupted by an
-    // internal wall) -- both match the declared binding, so the caller
-    // (proof.ts) must refuse on ambiguity.
-    const a = buildTubeMesh("z", [0, 0], 5, 48, [0, 8], "hole");
-    const b = buildTubeMesh("z", [0, 0], 5, 48, [12, 20], "hole");
-    const mesh = mergeMeshes(a, b);
-    const result = findRadialMatches(mesh, { x: 0, y: 0, z: 10 }, "z");
+  it("finds two matches (refuse-worthy) for two concentric walls sharing the same axial span, center and axis", () => {
+    // A double-walled tube: two distinct circular surfaces (different radii)
+    // fully overlapping in Z, both centered on the same axis line -- both
+    // match the declared binding, so the caller (proof.ts) must refuse on
+    // ambiguity.
+    const inner = buildTubeMesh("z", [0, 0], 5, 48, [0, 10], "hole");
+    const outer = buildTubeMesh("z", [0, 0], 8, 48, [0, 10], "outside");
+    const mesh = mergeMeshes(inner, outer);
+    const result = findRadialMatches(mesh, { x: 0, y: 0, z: 5 }, "z");
     expect(result.matches.length).toBe(2);
+  });
+
+  it("does not match a coaxial bore at a different axial position (same radial center/axis, different span -- e.g. the hinge fixture's separate knuckle bores)", () => {
+    const near = buildTubeMesh("z", [0, 0], 5, 48, [0, 8], "hole");
+    const far = buildTubeMesh("z", [0, 0], 5, 48, [20, 28], "hole"); // same radial center/axis, far enough along Z to be a clearly separate feature
+    const mesh = mergeMeshes(near, far);
+    const result = findRadialMatches(mesh, { x: 0, y: 0, z: 4 }, "z"); // declared center sits within `near`'s span only
+    expect(result.matches.length).toBe(1);
+    expect(result.matches[0].evidence.axialLengthMm).toBeCloseTo(8, 5);
   });
 
   it("does not match a bore at a different radial position (declared center identifies a specific hole)", () => {
