@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// GPL ZONE — Issue #31.
+
 import { describe, expect, it } from "vitest";
 import { paramValueToScadLiteral, paramsToDefineArgs } from "./protocol.js";
 
