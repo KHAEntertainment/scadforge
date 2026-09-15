@@ -67,6 +67,21 @@ export function operationsDir(projectDir: string): string {
   return join(metaDir(projectDir), "editor-operations");
 }
 
+/**
+ * `.scadforge/editor-operations/pending/` — the pending-claim marker set (S3-B
+ * ticket B6, carried B4 delta QA). One empty marker file per claim still
+ * `terminal: null`, so `recoverPendingClaimsLocked` can sweep pending claims
+ * without listing (and reading) every terminal claim a project has ever had.
+ */
+export function pendingClaimsDir(projectDir: string): string {
+  return join(operationsDir(projectDir), "pending");
+}
+
+/** `.scadforge/editor-operations/pending/<uuid>.json` — one pending-claim marker. Content is not read; existence is the signal. */
+export function pendingClaimMarkerPath(projectDir: string, operationId: string): string {
+  return join(pendingClaimsDir(projectDir), `${operationId}.json`);
+}
+
 /** `.scadforge/editor-operations/<uuid>.json` — one durable operation claim. */
 export function operationPath(projectDir: string, operationId: string): string {
   return join(operationsDir(projectDir), `${operationId}.json`);
