@@ -192,16 +192,25 @@ export async function recordClaimCommittedLocked(
  * and `unknown` are the only other two states.
  */
 export type ClaimLookupResult =
-  | { kind: "committed"; receipt: EditorReceipt }
+  | { kind: "committed"; receipt: EditorReceipt; accepted?: AcceptedOperationRecord }
   | { kind: "definitely_not_committed"; requestDigest: string | null; reason: "unclaimed" | "rejected" | "aborted"; error: ApiError | null }
   | { kind: "unknown"; requestDigest: string | null };
 
-/** The read side of a `GET .../editor/operations/:id` (B6's future route calls this). */
+/**
+ * The read side of a `GET .../editor/operations/:id` (B6's route calls this)
+ * AND of B6's own undo/redo traversal, which resolves `traversal.operationId`
+ * through this same function to reach the original accepted operation's
+ * `accepted` before/after record — `accepted` is internal-only (never part of
+ * the frozen `EditorReceipt`/`EditorOperationResponse` wire); a caller
+ * building the wire response simply does not forward it.
+ */
 export async function lookupClaimLocked(ctx: LockedProject, operationId: string): Promise<ClaimLookupResult> {
   const claim = await readClaimLocked(ctx, operationId);
   if (!claim) return { kind: "definitely_not_committed", requestDigest: null, reason: "unclaimed", error: null };
   if (claim.terminal === null) return { kind: "unknown", requestDigest: claim.requestDigest };
-  if (claim.terminal.kind === "committed") return { kind: "committed", receipt: claim.terminal.receipt };
+  if (claim.terminal.kind === "committed") {
+    return { kind: "committed", receipt: claim.terminal.receipt, accepted: claim.terminal.accepted };
+  }
   if (claim.terminal.kind === "rejected") {
     return { kind: "definitely_not_committed", requestDigest: claim.requestDigest, reason: "rejected", error: claim.terminal.error };
   }
