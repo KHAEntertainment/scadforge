@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// GPL ZONE — Issue #31.
+
 import { describe, expect, it } from "vitest";
 import { BOSL2_FILES, BOSL2_FILE_COUNT, BOSL2_SOURCE_BYTES } from "./bosl2Bundle.js";
 
