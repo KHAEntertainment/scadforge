@@ -42,7 +42,8 @@ export const notWiredScadCoreApi: ScadCoreApi = {
   build: async () => notWired(),
   renderViews: async () => notWired(),
   runExport: async () => notWired(),
-  getExportFile: async () => notWired()
+  getExportFile: async () => notWired(),
+  verifyEditorCommand: async () => notWired()
 };
 
 export const notWiredAgentProvider: AgentProvider = {

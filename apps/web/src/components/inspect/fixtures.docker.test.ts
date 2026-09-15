@@ -5,12 +5,15 @@
 // real STL (three's STLLoader + Raycaster — no WebGL, no browser), and
 // asserts `inspectSurface`'s outcome against those closed-form values.
 //
-// `apps/web` has no dependency on `@scadforge/scad-core` (and this ticket
-// must not add one), so rendering goes straight through the `docker` CLI
-// with the pinned digest, and "one connected component" is checked with a
-// small local union-find over welded vertices rather than the real
-// manifold-3d gate — a structural stand-in for the true validation gate,
-// which already ran (via `validateModel()`) when
+// `apps/web` now depends on `@scadforge/scad-core` for the browser-safe
+// `./geometry` subpath only (S3-B B5, Issue #91: the S2 recognizer moved
+// there, this app re-imports it — see `surfaceRegion.ts`'s header). It
+// still has no dependency on scad-core's Docker/CLI runner, store or
+// validation machinery, so rendering here goes straight through the
+// `docker` CLI with the pinned digest, and "one connected component" is
+// checked with a small local union-find over welded vertices rather than
+// the real manifold-3d gate — a structural stand-in for the true
+// validation gate, which already ran (via `validateModel()`) when
 // evals/surface-inspection/README.md's numbers were produced.
 
 import { execFileSync, spawnSync } from "node:child_process";

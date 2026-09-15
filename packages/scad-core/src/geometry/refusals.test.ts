@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatMm } from "../measure.js";
+import { formatMm } from "./vec.js";
 import {
   notAxisAlignedRefusal,
   notCircularRefusal,

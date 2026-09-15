@@ -206,3 +206,27 @@ export {
   reserveClaimLocked
 } from "./store/claims.js";
 export type { ClaimLookupResult, ClaimTerminalState, OperationClaim, ReplayDecision, ReserveClaimResult } from "./store/claims.js";
+
+// ── proof service and eligibility (Issue #91 / S3-B ticket B5) ─────────────
+//
+// Kept as its own block for the same merge-friendliness reason as B1/B2/B3
+// above. The recognizer port itself (`geometry/**`) is NOT re-exported here
+// deliberately — it is reached ONLY through the separate browser-safe
+// `./geometry` package-export subpath (see `package.json` and
+// `src/geometry/index.ts`'s header), never through this root barrel.
+export { editorEligibility, checkBindingEligibility } from "./editor/eligibility.js";
+export {
+  PROOF_TTL_MS,
+  RECOGNIZER_VERSION,
+  lookupProofLocked,
+  persistProofRecord,
+  runProbe
+} from "./editor/proof.js";
+export type {
+  ProofLookupResult,
+  ProofRecord,
+  ProofRenderDeps,
+  ProofSample,
+  ProbeResult,
+  RunProbeInput
+} from "./editor/proof.js";

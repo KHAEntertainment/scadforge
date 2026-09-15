@@ -27,6 +27,7 @@ import type {
   BuildResponse,
   CreateProjectRequest,
   EditorFeature,
+  EditorProofResponse,
   EditorSidecarStatus,
   ExportRecord,
   ExportRequest,
@@ -64,6 +65,7 @@ import {
   listSnapshots,
   mergeParamsAtomic,
   normalizeLineEndings,
+  persistProofRecord,
   readProjectManifestLocked,
   readSidecarLocked,
   readSnapshotManifest,
@@ -75,6 +77,7 @@ import {
   revertToSnapshot,
   rootModelPath,
   runParamExport,
+  runProbe,
   runSyntaxCheck,
   snapshotDir,
   snapshotMeshPath,
@@ -894,6 +897,67 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       // route has already rejected any `file` that is not a bare path segment.
       if (file === PROJECT_LAYOUT.snapshot.manifestFile) return null;
       return readFileOrNull(join(exportsDir(dir), file));
+    },
+
+    // ── editor (S3-B B5, Issue #91) ───────────────────────────────────────
+    async verifyEditorCommand(projectId, request): Promise<EditorProofResponse> {
+      const dir = runtime.dirFor(projectId);
+
+      const state = await asRouteResult(() => coherentSourceState(dir), "failed to read the coherent editor state");
+
+      // Story seam ("Source fingerprint and unreadable-sidecar revision",
+      // settled 2026-09-14): a sidecar that is not `ready`/`legacy-empty`
+      // supports no editor command at all, whatever revision the client
+      // sent -- `coherentSourceState`'s `editorRevision` is `null` in
+      // exactly this case, so it can never equal a real (64-hex) client
+      // revision below; this check gives that a clearer refusal reason.
+      if (state.sidecarStatus !== "ready" && state.sidecarStatus !== "legacy-empty") {
+        throw new RouteError("CONFLICT", `Editor commands are unsupported while the sidecar status is "${state.sidecarStatus}".`);
+      }
+      if (state.editorRevision !== request.baseEditorRevision) {
+        throw new RouteError("CONFLICT", "The base editor revision is stale; refresh and retry.");
+      }
+
+      // Schema comes from the exact pinned source text just read under the
+      // lock (never a fresh re-read of the root file), the same
+      // compile-outside/recheck-inside split `compileProposedSource`
+      // documents on itself -- there is no unlocked window where the probe
+      // could compile against source that has since moved.
+      const compiled = await asRouteResult(() => compileProposedSource(runtime, state.scad), "failed to read the parameter schema");
+      if (!compiled.syntax_ok) {
+        throw new RouteError("RENDER_FAILED", "The project's committed source failed to syntax-check.");
+      }
+
+      const probeResult = await asRouteResult(
+        () =>
+          runProbe({
+            projectId,
+            baseEditorRevision: request.baseEditorRevision,
+            scad: state.scad,
+            authoritativeParams: state.params,
+            schema: compiled.schema,
+            features: state.sidecarFeatures,
+            command: request.command,
+            intent: request.intent,
+            traversal: request.traversal,
+            libraryPaths: runtime.libraryPaths
+          }),
+        "proof probe failed"
+      );
+
+      if (probeResult.status === "refused") {
+        throw new RouteError("VALIDATION_FAILED", probeResult.reason);
+      }
+
+      await asRouteResult(() => persistProofRecord(dir, probeResult.record), "failed to persist the proof record");
+
+      return {
+        version: 1,
+        proofId: probeResult.record.proofId,
+        commandDigest: probeResult.record.commandDigest,
+        baseEditorRevision: probeResult.record.baseEditorRevision,
+        expiresAt: probeResult.record.expiresAt
+      };
     }
   };
 }

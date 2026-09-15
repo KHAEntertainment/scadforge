@@ -40,6 +40,7 @@ import {
   attachValidationToSnapshotLocked,
   computeSourceRevision,
   createSnapshotLocked,
+  editorEligibility,
   editorRevision,
   exportRun,
   exportsDir,
@@ -66,7 +67,6 @@ import type {
   ValidationResult
 } from "@scadforge/scad-core";
 import type { ExportRecord } from "@scadforge/protocol";
-import { editorEligibility } from "./editor-eligibility-standin.js";
 import { renderAndAttach } from "./scad-core-impl.js";
 import {
   planParamUpdate,

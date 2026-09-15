@@ -22,6 +22,8 @@ import type {
   BuildRequest,
   BuildResponse,
   CreateProjectRequest,
+  EditorProofResponse,
+  EditorVerifyRequest,
   ExportRequest,
   ExportResponse,
   ListProjectsResponse,
@@ -131,4 +133,16 @@ export interface ScadCoreApi {
   runExport(projectId: string, request: ExportRequest): Promise<ExportResponse>;
   /** Returns `null` when the project or export file does not exist. */
   getExportFile(projectId: string, file: string): Promise<RenderFile | null>;
+
+  // ── editor (S3-B B5, Issue #91) ──────────────────────────────────────────
+  /**
+   * Server-authorized proof that `request.command` produces the geometry its
+   * binding claims, run outside any lock and persisted with a 10-minute TTL.
+   * Throws `PROJECT_NOT_FOUND`; `CONFLICT` on a stale `baseEditorRevision` or
+   * when the sidecar status does not support editor commands;
+   * `VALIDATION_FAILED` on an unsupported/ambiguous mapping or a schema
+   * violation (the refusal reason is the message, verbatim — never source
+   * text or a stack); `RENDER_FAILED` / `TIMEOUT` on an engine failure.
+   */
+  verifyEditorCommand(projectId: string, request: EditorVerifyRequest): Promise<EditorProofResponse>;
 }
