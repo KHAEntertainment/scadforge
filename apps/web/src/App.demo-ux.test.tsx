@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // Regression coverage for Issue #41 — the three defects from the first
 // hands-on demo session, wired end to end through the real `App`.
 //

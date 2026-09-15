@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker — S2-3 fixture tests. Renders every sample of both fixtures
 // (evals/surface-inspection/fixture/{hinge,clamp}.scad) with the pinned
 // OpenSCAD image, raycasts the known points recorded in

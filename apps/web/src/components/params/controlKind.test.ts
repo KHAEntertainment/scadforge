@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { describe, expect, it } from "vitest";
 import type { ParamDefinitionWire } from "@scadforge/protocol";
 import { controlKind } from "./controlKind.js";

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { describe, expect, it } from "vitest";
 import { ScadForgeError } from "../errors.js";
 import { buildBinaryStl } from "../test-support/stl-fixtures.js";

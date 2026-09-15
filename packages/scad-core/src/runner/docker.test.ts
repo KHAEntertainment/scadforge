@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // Unit tests for the docker runner's OWN spawn/timeout/error-handling logic,
 // using a fake `docker` script on PATH so these run without a real Docker
 // daemon (the `@docker`-tagged suites separately exercise the real pinned

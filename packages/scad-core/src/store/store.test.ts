@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

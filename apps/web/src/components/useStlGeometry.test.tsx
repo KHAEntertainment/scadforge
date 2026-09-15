@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { StrictMode } from "react";
 import { act, renderHook } from "@testing-library/react";
 import { BufferGeometry, CylinderGeometry } from "three";

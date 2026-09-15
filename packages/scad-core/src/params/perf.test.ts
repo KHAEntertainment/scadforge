@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @scadforge/scad-core — perf regression tests (Tech Lead / QA finding on
 // PR #38): `RANGE_STEP_RE`/`RANGE_RE` (annotation.ts) and `NUMBER_RE`
 // (literal.ts) previously used a `\d+\.?\d*` shape that is quadratic-time to

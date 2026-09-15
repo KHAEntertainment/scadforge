@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { describe, expect, it } from "vitest";
 import { SCAD_CORE_PACKAGE_NAME } from "./index.js";
 

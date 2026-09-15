@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @scadforge/scad-core — static safety test for the browser-facing
 // `./geometry` package export (Issue #91, S3-B ticket B5, correction C1).
 //
