@@ -73,7 +73,12 @@ export type SnapshotOrigin =
   /** A "Revert to this" that copied an older snapshot forward. */
   | "revert"
   /** The project's initial snapshot. */
-  | "initial";
+  | "initial"
+  /**
+   * A committed studio-editor command (S3 `POST …/editor/commands`).
+   * Added by the contract fix for B6 (S3-B); additive, no other member changed.
+   */
+  | "editor";
 
 /**
  * Paths (relative to the snapshot directory) of the files this snapshot

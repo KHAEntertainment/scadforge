@@ -28,6 +28,7 @@ import type {
   ProjectManifest,
   ScadForgeErrorCode,
   SnapshotManifest,
+  SnapshotOrigin,
   SseEvent,
   SseEventOf,
   SseEventType
@@ -203,6 +204,30 @@ describe("snapshot / project model (SDP §8)", () => {
     };
     expect(snapshot.annotations).toEqual([]);
     expect(String(1).padStart(SNAPSHOT_ID_PAD_WIDTH, "0")).toBe("0001");
+  });
+
+  it("names every snapshot origin, including the S3 studio editor (Issue #104)", () => {
+    // An exhaustive switch that must stay exhaustive. Adding a member to
+    // SnapshotOrigin without a case here, or removing one, fails compilation.
+    const describeOrigin = (origin: SnapshotOrigin): SnapshotOrigin => {
+      switch (origin) {
+        case "agent":
+          return origin;
+        case "manual":
+          return origin;
+        case "revert":
+          return origin;
+        case "initial":
+          return origin;
+        case "editor":
+          return origin;
+        default: {
+          const unreachable: never = origin;
+          return unreachable;
+        }
+      }
+    };
+    expect(describeOrigin("editor")).toBe("editor");
   });
 
   it("records the pinned OpenSCAD image on the project manifest", () => {
