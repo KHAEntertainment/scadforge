@@ -23,10 +23,10 @@
 // an OOM) wedged every future writer of that resource forever: the lock
 // directory never gets removed by a `finally` that never runs, and the
 // retry loop below has no way to tell "a live process still holds this"
-// from "the holder is gone" -- it can only spin `FILE_LOCK_MAX_ATTEMPTS`
-// times and fail `CONFLICT`, which then repeats for every subsequent
-// caller too. The recovery boundary (`recovered.ts`) can never run if the
-// params lock it depends on can be wedged this way.
+// from "the holder is gone" -- it can only keep retrying until
+// `FILE_LOCK_MAX_WAIT_MS` elapses and fail `CONFLICT`, which then repeats
+// for every subsequent caller too. The recovery boundary (`recovered.ts`)
+// can never run if the params lock it depends on can be wedged this way.
 //
 // The lock directory now carries an `owner.json` (`{pid, startedAt,
 // hostname}`), written best-effort right after the winning `mkdir`. A
@@ -67,8 +67,34 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { ScadForgeError } from "../errors.js";
 
-/** Max attempts to acquire a file lock before failing with `CONFLICT` (mirrors `SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS`). */
-export const FILE_LOCK_MAX_ATTEMPTS = 50;
+/**
+ * Wall-clock deadline (ms) to keep retrying acquisition before failing with
+ * `CONFLICT` -- the real governing budget (Issue #115). A fixed ATTEMPT
+ * COUNT is a poor proxy for this: it says nothing about how many writers are
+ * legitimately queued ahead of this caller, or how long each one's held
+ * critical section actually takes under host CPU/disk contention. Since
+ * Issue #73, every writer of a given project fully serializes on ONE params
+ * lock, so N legitimate concurrent callers become N fully-serialized holders
+ * -- a count-based budget that ignores N (and load) fails a live, legitimate
+ * waiter exactly the same way it would fail against a truly stuck lock.
+ * 10s comfortably absorbs the fsync-heavy holders S3-B ticket B4 introduced
+ * (measured: 12 fully-serialized `createSnapshot` calls) under contention,
+ * while staying safely under the 15s driver-process timeout that B8's
+ * `fault-matrix.test.ts` (not owned here) depends on for its live-holder
+ * case. Callers needing a different real-time budget (mainly tests) may
+ * override it via {@link withFileLock}'s `maxWaitMs` parameter.
+ */
+export const FILE_LOCK_MAX_WAIT_MS = 10_000;
+
+/**
+ * Hard ceiling on retry attempts -- a safety net against a runaway loop, NOT
+ * the governing budget: under the backoff curve below, `FILE_LOCK_MAX_WAIT_MS`
+ * is always reached well before this count is (Issue #115), so this never
+ * binds in practice. Kept generous (mirrors `SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS`'s
+ * shape) purely so a future backoff regression fails loudly on this cap
+ * rather than spinning forever.
+ */
+export const FILE_LOCK_MAX_ATTEMPTS = 200;
 
 /** File name of the lock owner record inside a held lock directory. */
 export const LOCK_OWNER_FILE = "owner.json";
@@ -177,8 +203,19 @@ async function reclaimStaleLock(lockDir: string): Promise<boolean> {
  *
  * Keep `fn` to filesystem I/O only — anything slow should run BEFORE
  * acquiring the lock, so a long-held lock cannot wedge every other writer.
+ *
+ * `maxWaitMs` (default {@link FILE_LOCK_MAX_WAIT_MS}) is the wall-clock
+ * budget to keep retrying before giving up -- overridable so tests can prove
+ * the give-up behavior on a short, fast deadline instead of the real one
+ * (Issue #115).
  */
-export async function withFileLock<T>(lockDir: string, description: string, fn: () => Promise<T>): Promise<T> {
+export async function withFileLock<T>(
+  lockDir: string,
+  description: string,
+  fn: () => Promise<T>,
+  maxWaitMs: number = FILE_LOCK_MAX_WAIT_MS
+): Promise<T> {
+  const startedAt = Date.now();
   for (let attempt = 0; attempt < FILE_LOCK_MAX_ATTEMPTS; attempt++) {
     try {
       // Non-recursive, exclusive create: this IS the lock (same trick as
@@ -190,7 +227,8 @@ export async function withFileLock<T>(lockDir: string, description: string, fn: 
           const reclaimed = await reclaimStaleLock(lockDir);
           if (reclaimed) continue; // retry mkdir(lockDir) immediately -- now unoccupied
         }
-        if (attempt < FILE_LOCK_MAX_ATTEMPTS - 1) await backoffDelay(attempt);
+        if (Date.now() - startedAt >= maxWaitMs) break; // deadline reached -- fall through to CONFLICT
+        await backoffDelay(attempt);
         continue; // another writer (this process or another) holds the lock; retry
       }
       throw err;
@@ -204,6 +242,6 @@ export async function withFileLock<T>(lockDir: string, description: string, fn: 
   }
   throw new ScadForgeError(
     "CONFLICT",
-    `could not acquire the ${description} lock at '${lockDir}' after ${FILE_LOCK_MAX_ATTEMPTS} attempts (high write contention, or a lock held by a live owner)`
+    `could not acquire the ${description} lock at '${lockDir}' after ${Date.now() - startedAt}ms (high write contention, or a lock held by a live owner)`
   );
 }
