@@ -90,12 +90,6 @@ describe("coherentProjectState (Issue #87 / S3-B ticket B3)", () => {
   });
 
   it("readProject()'s wire ProjectState now legitimately carries editor (Issue #92 / S3-B ticket B7) -- otherwise unchanged", async () => {
-    // Known interim failure (Tech Lead, 2026-09-14): `AgentEditorContext.
-    // projectId` is currently validated as a UUID by the frozen protocol
-    // parsers, but real project ids are slugs -- this test (and every other
-    // one below that calls `readProject()`) fails on `projectId` alone until
-    // the separate contract-fix issue merges. The id is deliberately a real
-    // slug ("my-bracket"), never a UUID-shaped workaround.
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
     await initProject(dir, { id: "my-bracket", name: "n", provider: providerConfig, content: "cube(1);\n" });
@@ -132,9 +126,13 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     expect(editor?.editorRevision).not.toBe(editor?.sourceRevision);
   });
 
-  it("a ready sidecar with two features reports them (and their eligibility) in featureId order, not insertion order", async () => {
+  it("a ready sidecar with two features reports them (and their real eligibility, Issue #91 / S3-B ticket B5) in featureId order, not insertion order", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
+    // No Customizer parameters declared, so the compiled schema is empty --
+    // `feature()`'s default binding (parameter "width") is legitimately
+    // unsupported here (real editorEligibility, not the stand-in, which
+    // always reported "requires-proof" regardless of the schema).
     await initProject(dir, { id: "my-bracket", name: "n", provider: providerConfig, content: "cube(1);\n" });
     const agentCore = createAgentScadCore({ runtime, projectId: "my-bracket" });
 
@@ -148,9 +146,23 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
 
     expect(editor?.features.map((f) => f.featureId)).toEqual([low.featureId, high.featureId]);
     expect(editor?.eligibility).toEqual([
-      { featureId: low.featureId, state: "requires-proof", reason: null },
-      { featureId: high.featureId, state: "requires-proof", reason: null }
+      { featureId: low.featureId, state: "unsupported", reason: 'Parameter "width" is not in the current parameter schema.' },
+      { featureId: high.featureId, state: "unsupported", reason: 'Parameter "width" is not in the current parameter schema.' }
     ]);
+  });
+
+  it("a ready sidecar feature bound to a real Customizer parameter reports requires-proof (real eligibility)", async () => {
+    const runtime = runtimeFor(root);
+    const dir = runtime.dirFor("my-bracket");
+    await initProject(dir, { id: "my-bracket", name: "n", provider: providerConfig, content: "width = 20; // [5:50]\ncube([width, 10, 10]);\n" });
+    const agentCore = createAgentScadCore({ runtime, projectId: "my-bracket" });
+
+    const sidecar: EditorSidecar = { version: 1, features: [feature()] };
+    await withRecoveredProject(dir, (ctx) => writeSidecarLocked(ctx, sidecar));
+
+    const { editor } = await agentCore.readProject();
+
+    expect(editor?.eligibility).toEqual([{ featureId: sidecar.features[0].featureId, state: "requires-proof", reason: null }]);
   });
 
   it("a legacy (pre-S3) project reads legacy-empty with an empty feature list", async () => {
