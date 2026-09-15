@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // Exercises validateMesh end-to-end against manifold-3d (pure JS/WASM --
 // no Docker/OpenSCAD needed). Mesh fixtures are synthetic binary STL buffers
 // built by test-support/stl-fixtures.ts, mirroring Spike 4's good/bad/

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { describe, expect, it } from "vitest";
 import type { Triangle } from "./stl.js";
 import { weldTriangleSoup, WELD_EPSILON_MM } from "./mesh-utils.js";

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- exercises the export orchestration (mesh export + validate_mesh
 // gate + refusal/override) against the REAL pinned OpenSCAD image.
 import { mkdtemp, readdir, rm } from "node:fs/promises";

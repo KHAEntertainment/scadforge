@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- Issue #32's headline AC: a REAL render whose resulting mesh
 // geometry (bbox / volume) actually changes when a Customizer parameter
 // changes -- not merely that the render command ran. Also the AC's
