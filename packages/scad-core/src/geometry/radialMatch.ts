@@ -1,5 +1,5 @@
 // @scadforge/scad-core — declared-binding radial match scan (Issue #91,
-// S3-B ticket B5, correction C3).
+// S3-B ticket B5, correction C3; match-criteria ruling below).
 //
 // The B5 proof service has no user click to seed recognition from (unlike
 // web's `inspectSurface`) — it must find the region(s) matching a DECLARED
@@ -10,7 +10,7 @@
 // threshold, the same test `selectAxis`/`growRegion` use) and centroid
 // distance to the declared axis line no larger than a generous
 // mesh-bounding-box-derived bound (prunes faces on the far side of a large
-// part; the real radius/center match is still checked after growing).
+// part; the real match test is still applied after growing).
 //
 // Every face grown into a region is marked assigned and never reseeded, so
 // total faces visited across the whole scan is bounded by the mesh's own
@@ -21,6 +21,32 @@
 // seed, but that path can only ever return a refusal (never "recognized",
 // see its source), so it can never inflate the match count; it costs a
 // bounded, small amount of redundant work, not a correctness risk.
+//
+// MATCH-CRITERIA RULING (Tech Lead, S3-B B5 plan correction, recorded here
+// and in the S3-B ticket story so B6 and reviewers judge new work against
+// the same rule): a region matches a declared radial binding IN A GIVEN
+// SAMPLE only when ALL of:
+//   1. its axis matches the declared axis within the S2 angular threshold
+//      (guaranteed by construction here: every region is grown ALONG the
+//      declared axis, never a seed-discovered one — see
+//      `evaluateSeedRegion`'s doc comment);
+//   2. its center lies on the declared axis line through the declared
+//      center within the S2 distance threshold (`distanceToAxisLine`);
+//   3. its measured diameter equals the diameter the declared binding
+//      implies AT THAT SAMPLE's parameter value (via `parameterMeaning`,
+//      radius or diameter), within the S2 radial tolerance.
+// Exactly one matching region per sample passes; zero or more-than-one
+// refuses (ambiguous) — this is deliberate: a coaxial bore and its own
+// outer wall are excluded from each other by criterion 3 (different
+// diameters), but two coaxial features that happen to share the SAME
+// diameter (e.g. the S3-B B5 hinge fixture's three identical knuckle
+// bores, which criteria 1-2 alone cannot tell apart — this rule does not
+// use axial position to disambiguate within one sample) are indeed
+// ambiguous and correctly refuse. `../editor/proof.ts` additionally checks
+// that the SAME region — its fitted radial center and axial position —
+// is found across every sample (baseline/candidate/perturbation), so a
+// proof can never "hop" between two different physical surfaces that
+// happen to match different samples' expected diameters.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -88,52 +114,53 @@ function radialCoords(v: Vec3, axis: Axis): [number, number] {
 }
 
 /**
- * Real parts commonly place several coaxial features at the SAME radial
- * position and axis but different axial ranges (e.g. the S3-B B5 hinge
- * fixture's three knuckle bores: same bore diameter/axis/radial center,
- * separated along X) — radial position and axis alone are not enough to
- * pick out the one the declared binding actually refers to. A recognized
- * region matches the declared binding when its RADIAL position agrees (the
- * two coordinates perpendicular to `axis`) within the S2 circle-fit
- * deviation tolerance, AND the declared center's axial coordinate falls
- * within the region's own actual axial span — `evaluateCylinder`'s
- * `center`'s axial component is the region's axial MIDPOINT and
- * `evidence.axialLengthMm` its extent, so the span is
- * `[center ± axialLengthMm/2]` (widened by a small edge tolerance: a
- * legitimately-declared reference point can sit anywhere along a through-
- * hole's length, not necessarily exactly at its midpoint).
+ * Criteria 2-3 of the match-criteria ruling (module header): the region's
+ * center lies on the declared axis line through the declared center within
+ * the S2 distance threshold, AND its measured diameter equals
+ * `expectedDiameterMm` (already resolved by the caller from the binding's
+ * `parameterMeaning` and this sample's parameter value) within the S2
+ * radial tolerance. Criterion 1 (axis) is guaranteed by construction — see
+ * `evaluateSeedRegion`. Axial position is deliberately NOT checked here
+ * (per the ruling): a region's axial position is used only for cross-sample
+ * region-IDENTITY comparison, in `../editor/proof.ts`, never to decide
+ * whether a single sample's region matches the binding at all.
  */
-function matchesDeclaredBinding(match: CylinderInspection, declaredCenter: Vec3, axis: Axis): boolean {
+function matchesDeclaredBinding(match: CylinderInspection, declaredCenter: Vec3, axis: Axis, expectedDiameterMm: number): boolean {
   const radialTolerance = INSPECTION_THRESHOLDS.maxDeviationMm;
   const [foundU, foundV] = radialCoords(match.center, axis);
   const [declaredU, declaredV] = radialCoords(declaredCenter, axis);
   if (Math.abs(foundU - declaredU) > radialTolerance || Math.abs(foundV - declaredV) > radialTolerance) {
     return false;
   }
-
-  const axialEdgeToleranceMm = 1;
-  const foundAxialCenter = match.center[axis];
-  const halfSpan = match.evidence.axialLengthMm / 2 + axialEdgeToleranceMm;
-  const declaredAxial = declaredCenter[axis];
-  return Math.abs(declaredAxial - foundAxialCenter) <= halfSpan;
+  return Math.abs(match.diameterMm - expectedDiameterMm) <= radialTolerance;
 }
 
 export interface RadialMatchResult {
-  /** Every recognized region whose fitted axis is `axis` and whose fitted center matches `declaredCenter`. Zero or 2+ means refuse (see `../editor/proof.ts`). */
+  /**
+   * Every recognized region whose axis matches the declared axis, whose
+   * center lies on the declared axis line through the declared center, and
+   * whose diameter equals `expectedDiameterMm` — the MATCHED SET for one
+   * sample (module header's match-criteria ruling). Zero or more regions;
+   * `../editor/proof.ts` decides pass/refuse using this set together with
+   * every other sample's set (same non-empty set, by region identity, in
+   * every sample), not from this one sample's count alone.
+   */
   matches: CylinderInspection[];
   /** Diagnostic for the PR/tests: total faces grown across every seed. Bounded by `mesh.triangles.length` (see module header). */
   facesVisited: number;
 }
 
 /**
- * Scans `mesh` for circular regions matching a declared radial binding's
- * `axis` (already resolved to a principal axis — see
- * `regionGrowth.ts`'s `principalAxisOf`) and `declaredCenter`, seeding only
- * from axis-perpendicular, plausibly-radiused faces rather than segmenting
- * the whole mesh. See the module header for the runtime bound and the one
+ * Scans `mesh` for every circular region matching a declared radial
+ * binding's `axis` (already resolved to a principal axis — see
+ * `regionGrowth.ts`'s `principalAxisOf`), `declaredCenter` and
+ * `expectedDiameterMm` (this sample's parameter value resolved through the
+ * binding's `parameterMeaning`) — seeding only from axis-perpendicular,
+ * plausibly-radiused faces rather than segmenting the whole mesh. See the
+ * module header for the match criteria, the runtime bound and the one
  * documented exception.
  */
-export function findRadialMatches(mesh: WeldedMesh, declaredCenter: Vec3, axis: Axis): RadialMatchResult {
+export function findRadialMatches(mesh: WeldedMesh, declaredCenter: Vec3, axis: Axis, expectedDiameterMm: number): RadialMatchResult {
   const threshold = INSPECTION_THRESHOLDS.maxAxialNormalComponent;
   const maxPlausibleRadius = boundingRadius(mesh);
   const assigned = new Uint8Array(mesh.triangles.length);
@@ -155,7 +182,7 @@ export function findRadialMatches(mesh: WeldedMesh, declaredCenter: Vec3, axis: 
     facesVisited += region.length;
 
     const outcome = evaluateSeedRegion(mesh, t, region, axis);
-    if (outcome.status === "recognized" && matchesDeclaredBinding(outcome.inspection, declaredCenter, axis)) {
+    if (outcome.status === "recognized" && matchesDeclaredBinding(outcome.inspection, declaredCenter, axis, expectedDiameterMm)) {
       matches.push(outcome.inspection);
     }
   }

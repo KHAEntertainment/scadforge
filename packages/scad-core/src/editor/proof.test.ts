@@ -183,14 +183,18 @@ describe("runProbe — radial bindings", () => {
       for (const sample of result.record.samples) {
         expect(sample.geometry.kind).toBe("radial");
         if (sample.geometry.kind === "radial") {
-          expect(sample.geometry.matchCount).toBe(1);
+          expect(sample.geometry.regions).toBe(1);
           expect(sample.geometry.diameterMm).toBeCloseTo(sample.paramValues.boreDiameter as number, 5);
         }
       }
     }
   });
 
-  it("refuses when two regions match the declared center/axis (ambiguous)", async () => {
+  // (d) required mocked scenario: collinear same-diameter segments that ALL
+  // track the parameter (e.g. the hinge fixture's three knuckle bores under
+  // pin_d) count as ONE segmented feature and pass, with the region count
+  // recorded on the proof record.
+  it("passes with regions > 1 for collinear same-diameter segments that all track the parameter (segmented feature)", async () => {
     const render = vi.fn(async (_scad: string, params: ParamValues) => {
       const d = (params.boreDiameter as number) / 2;
       return mergeMeshes(buildTubeMesh("z", [0, 0], d, 48, [0, 4], "hole"), buildTubeMesh("z", [0, 0], d, 48, [6, 10], "hole"));
@@ -203,9 +207,65 @@ describe("runProbe — radial bindings", () => {
     });
     const result = await runProbe(input, fakeDeps(render));
 
+    expect(result.status).toBe("proved");
+    if (result.status === "proved") {
+      for (const sample of result.record.samples) {
+        expect(sample.geometry.kind).toBe("radial");
+        if (sample.geometry.kind === "radial") expect(sample.geometry.regions).toBe(2);
+      }
+    }
+  });
+
+  // (c) required mocked scenario: a coaxial surface that equals the implied
+  // diameter at the BASELINE sample only, and does not change when the
+  // parameter changes, refuses as ambiguous -- it joins the matched set at
+  // one sample and leaves it at another, which is the real ambiguity the
+  // cross-sample identity check exists to catch.
+  it("refuses (ambiguous) when a coaxial surface matches the baseline diameter but does not track the parameter", async () => {
+    const FIXED_DIAMETER = 10; // a second, unrelated bore whose diameter never changes
+    const render = vi.fn(async (_scad: string, params: ParamValues) => {
+      const trackingBore = buildTubeMesh("z", [0, 0], (params.boreDiameter as number) / 2, 48, [0, 8], "hole");
+      const fixedBore = buildTubeMesh("z", [0, 0], FIXED_DIAMETER / 2, 48, [20, 28], "hole"); // same radial center/axis, different axial position, fixed diameter
+      return mergeMeshes(trackingBore, fixedBore);
+    });
+    const input = baseInput({
+      schema: radialSchema,
+      authoritativeParams: { boreDiameter: FIXED_DIAMETER }, // baseline: tracking bore ALSO happens to be 10mm, so both match at baseline
+      features: [radialFeature()],
+      command: { kind: "set-value", featureId: "f1", bindingVersion: 1, value: 16 } // candidate: tracking bore is now 16mm, fixed bore is still 10mm -- no longer matches
+    });
+    const result = await runProbe(input, fakeDeps(render));
+
     expect(result.status).toBe("refused");
     if (result.status === "refused") {
-      expect(result.reason).toMatch(/ambiguous|regions matched/);
+      expect(result.reason).toMatch(/ambiguous radial mapping/);
+    }
+  });
+
+  // Neither the clamp nor hinge @docker fixture has a schema parameter
+  // whose VALUE is a true radius (both `pipe_dia` and `pin_d` control
+  // diameter directly), so a genuinely passing radius-meaning proof is only
+  // constructible here, against a synthetic schema -- see
+  // proof.docker.test.ts's note for the real-fixture refusal counterpart.
+  it("passes with parameterMeaning: radius when the parameter genuinely controls a radius", async () => {
+    const render = vi.fn(async (_scad: string, params: ParamValues) => buildTubeMesh("z", [0, 0], params.boreRadius as number, 48, [0, 10], "hole"));
+    const schema: ParamSchema = { title: "t", parameters: [{ name: "boreRadius", type: "number", initial: 5, min: 1, max: 20, step: 0.5 }] };
+    const input = baseInput({
+      schema,
+      authoritativeParams: { boreRadius: 5 },
+      features: [radialFeature({ binding: { kind: "radial", parameter: "boreRadius", center: [0, 0, 5], axis: [0, 0, 1], parameterMeaning: "radius", presentation: "radius" } })],
+      command: { kind: "set-value", featureId: "f1", bindingVersion: 1, value: 7 }
+    });
+    const result = await runProbe(input, fakeDeps(render));
+
+    expect(result.status).toBe("proved");
+    if (result.status === "proved") {
+      for (const sample of result.record.samples) {
+        expect(sample.geometry.kind).toBe("radial");
+        if (sample.geometry.kind === "radial") {
+          expect(sample.geometry.diameterMm).toBeCloseTo(2 * (sample.paramValues.boreRadius as number), 5);
+        }
+      }
     }
   });
 

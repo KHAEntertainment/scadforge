@@ -8,6 +8,39 @@
 // `withRecoveredProject` and this ticket's route). `lookupProofLocked`, the
 // one function here that DOES take a locked `ctx`, is for B6's commit path.
 //
+// RADIAL MATCH-CRITERIA RULING (Tech Lead, S3-B B5 plan correction,
+// recorded here and in the S3-B ticket story so B6 and reviewers judge new
+// work against the same rule; the per-sample criteria themselves are
+// implemented in `../geometry/radialMatch.ts`, which this file calls):
+//
+// Per sample, `../geometry/radialMatch.ts`'s `findRadialMatches` computes
+// the MATCHED SET — every recognized region whose axis matches the
+// declared axis (S2 angular threshold), whose center lies on the declared
+// axis LINE (S2 distance threshold; axial position is deliberately not
+// checked here), and whose measured diameter equals the binding-implied
+// diameter at THAT sample's parameter value (via `parameterMeaning`),
+// within the S2 radial tolerance.
+//   - PASS iff the matched set is non-empty in EVERY sample AND it is the
+//     SAME SET of regions, by region identity (this file's
+//     `radialIdentity`/`sameIdentity`: each region's radial position, which
+//     the match criteria already pin to the declared center, plus its
+//     axial center — axial position is exactly the signal the per-sample
+//     match criteria omit, so it is what distinguishes "the same regions
+//     showed up again" from "a different set of regions happened to match
+//     this time"), in every sample.
+//   - REFUSE if the set is empty in any sample (no matching region).
+//   - REFUSE if the set's region identity CHANGES between samples — a
+//     surface that coincidentally matches the expected diameter at one
+//     sample's parameter value but does not track the parameter (so it
+//     joins or leaves the set as the value changes) is the real ambiguity;
+//     message: "ambiguous radial mapping: a surface matches at one sample
+//     but does not track the parameter".
+//   - Collinear same-diameter segments that ALL track the parameter (e.g.
+//     the S3-B B5 hinge fixture's three knuckle bores under `pin_d`) count
+//     as ONE segmented feature and PASS, with the matched region count
+//     recorded on the proof record's radial sample geometry (`regions`) so
+//     the evidence is visible.
+//
 // SPDX-License-Identifier: Apache-2.0
 
 import { randomUUID } from "node:crypto";
@@ -29,6 +62,7 @@ import { findRadialMatches } from "../geometry/radialMatch.js";
 import { principalAxisOf } from "../geometry/regionGrowth.js";
 import type { Axis, Vec3 } from "../geometry/vec.js";
 import type { WeldedMesh } from "../geometry/mesh.js";
+import type { CylinderInspection } from "../geometry/inspectionTypes.js";
 import { checkBindingEligibility } from "./eligibility.js";
 import { commandDigest } from "./canonical.js";
 import type { LockedProject } from "../store/recovered.js";
@@ -51,8 +85,8 @@ const PROOF_THRESHOLDS = {
   linearExtentToleranceMm: 0.05,
   /** Max drift in the anchored face's absolute position (mm) across samples before a linear check refuses. */
   linearAnchorToleranceMm: 0.05,
-  /** Max |rendered diameter − expected diameter| in mm before a radial check refuses. Diameter tolerance is double the S2 circle-fit deviation tolerance since diameter = 2×radius. */
-  radialDiameterToleranceMm: 0.02
+  /** Max drift (mm) in a matched region's axial center position across samples before it is treated as a DIFFERENT region for the cross-sample identity comparison (module header's ruling). A genuinely unchanged physical feature's axial position is numerically identical run to run; this only needs to absorb float noise, not tolerate real movement. */
+  radialIdentityAxialToleranceMm: 0.05
 } as const;
 
 export interface ProofSample {
@@ -61,7 +95,8 @@ export interface ProofSample {
   paramValues: ParamValues;
   geometry:
     | { kind: "linear"; extentMm: number; anchorPositionMm: number }
-    | { kind: "radial"; matchCount: number; diameterMm: number | null; centerMm: [number, number, number] | null };
+    /** `regions`: size of this sample's matched set (module header's match-criteria ruling) — 1 for an ordinary single bore, >1 for a legitimately segmented collinear feature (e.g. the hinge's three knuckle bores under `pin_d`), 0 when nothing matched (always a refusal). `diameterMm`/`centerMm` are representative (the first matched region's), since every region in a matched set shares the same diameter by construction. */
+    | { kind: "radial"; regions: number; diameterMm: number | null; centerMm: [number, number, number] | null };
 }
 
 export interface ProofRecord {
@@ -296,24 +331,43 @@ function checkLinearSample(mesh: WeldedMesh, binding: Extract<Binding, { kind: "
   return { sample: { kind: "linear", extentMm, anchorPositionMm }, refusal };
 }
 
-function checkRadialSample(mesh: WeldedMesh, binding: Extract<Binding, { kind: "radial" }>, axis: Axis, paramValue: number): { sample: ProofSample["geometry"]; refusal: string | null } {
-  const declaredCenter = toVec3(binding.center);
-  const { matches } = findRadialMatches(mesh, declaredCenter, axis);
+/**
+ * A sample's matched set, reduced to what the cross-sample identity
+ * comparison needs: one axial-center value per matched region (module
+ * header's ruling — axial position is exactly the signal the per-sample
+ * match criteria omit, so it is what "the same regions showed up again"
+ * across samples is checked against). Sorted so two sets can be compared
+ * position-by-position regardless of scan order.
+ */
+function radialIdentity(matches: readonly CylinderInspection[], axis: Axis): number[] {
+  return matches.map((m) => m.center[axis]).sort((a, b) => a - b);
+}
 
-  if (matches.length !== 1) {
-    return {
-      sample: { kind: "radial", matchCount: matches.length, diameterMm: null, centerMm: null },
-      refusal: matches.length === 0 ? "no circular region matched the declared center and axis" : `${matches.length} circular regions matched the declared center and axis (ambiguous)`
-    };
+/** Same size, and every corresponding (sorted) axial center within tolerance — module header's "same set of regions, by region identity". */
+function sameRadialIdentity(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((v, i) => Math.abs(v - b[i]) <= PROOF_THRESHOLDS.radialIdentityAxialToleranceMm);
+}
+
+/**
+ * Never decides the refusal message itself: whether an empty matched set is
+ * "no candidate at all" or "the bound surface moved/changed shape between
+ * samples" depends on what OTHER samples found, which only the caller
+ * (`runProbe`'s loop, which sees every sample in order) can determine.
+ */
+function checkRadialSample(mesh: WeldedMesh, binding: Extract<Binding, { kind: "radial" }>, axis: Axis, paramValue: number): { sample: ProofSample["geometry"]; matches: CylinderInspection[] } {
+  const declaredCenter = toVec3(binding.center);
+  const expectedDiameterMm = binding.parameterMeaning === "diameter" ? paramValue : paramValue * 2;
+  const { matches } = findRadialMatches(mesh, declaredCenter, axis, expectedDiameterMm);
+
+  if (matches.length === 0) {
+    return { sample: { kind: "radial", regions: 0, diameterMm: null, centerMm: null }, matches };
   }
 
-  const match = matches[0];
-  const expectedDiameterMm = binding.parameterMeaning === "diameter" ? paramValue : paramValue * 2;
-  const diameterRefusal = Math.abs(match.diameterMm - expectedDiameterMm) > PROOF_THRESHOLDS.radialDiameterToleranceMm ? `rendered diameter ${match.diameterMm.toFixed(3)}mm does not track the declared ${binding.parameterMeaning} (expected ${expectedDiameterMm.toFixed(3)}mm)` : null;
-
+  const primary = matches[0];
   return {
-    sample: { kind: "radial", matchCount: 1, diameterMm: match.diameterMm, centerMm: [match.center.x, match.center.y, match.center.z] },
-    refusal: diameterRefusal
+    sample: { kind: "radial", regions: matches.length, diameterMm: primary.diameterMm, centerMm: [primary.center.x, primary.center.y, primary.center.z] },
+    matches
   };
 }
 
@@ -415,6 +469,8 @@ export async function runProbe(input: RunProbeInput, depsOverride: Partial<Proof
   }
 
   const samples: ProofSample[] = [];
+  const radialIdentities: number[][] = []; // one per sample, only for radial bindings -- module header's cross-sample identity check
+  let anyRadialSampleMatched = false; // baseline is always samples[0] -- distinguishes "no candidate at all" from "moved/changed between samples"
   for (const { kind, value } of plan.values) {
     const sampleParams: ParamValues = { ...input.authoritativeParams, [binding.parameter]: value };
     let mesh: WeldedMesh;
@@ -425,10 +481,28 @@ export async function runProbe(input: RunProbeInput, depsOverride: Partial<Proof
       throw typed; // surfaced by the route as RENDER_FAILED/TIMEOUT per the error mapping table
     }
 
-    const { sample, refusal } = binding.kind === "linear" ? checkLinearSample(mesh, binding, value) : checkRadialSample(mesh, binding, axis as Axis, value);
-    samples.push({ kind, paramValues: sampleParams, geometry: sample });
-    if (refusal !== null) {
-      return { status: "refused", reason: refusal };
+    if (binding.kind === "linear") {
+      const { sample, refusal } = checkLinearSample(mesh, binding, value);
+      samples.push({ kind, paramValues: sampleParams, geometry: sample });
+      if (refusal !== null) return { status: "refused", reason: refusal };
+    } else {
+      const { sample, matches } = checkRadialSample(mesh, binding, axis as Axis, value);
+      samples.push({ kind, paramValues: sampleParams, geometry: sample });
+      if (matches.length === 0) {
+        // A prior sample (baseline, or an earlier perturbation) already
+        // matched, but this one doesn't: the bound surface moved or
+        // changed shape when the parameter changed -- a fixed-center
+        // radial binding cannot describe that edit. Distinct from "no
+        // candidate ever existed" below.
+        return {
+          status: "refused",
+          reason: anyRadialSampleMatched
+            ? "the bound surface moves or changes shape when the parameter changes; a fixed-center radial binding cannot describe it"
+            : "no circular region matched the declared center, axis and diameter"
+        };
+      }
+      anyRadialSampleMatched = true;
+      radialIdentities.push(radialIdentity(matches, axis as Axis));
     }
   }
 
@@ -438,6 +512,16 @@ export async function runProbe(input: RunProbeInput, depsOverride: Partial<Proof
     const unstable = anchorPositions.some((p) => Math.abs(p - first) > PROOF_THRESHOLDS.linearAnchorToleranceMm);
     if (unstable) {
       return { status: "refused", reason: "The anchored face's position moved across samples; the binding's anchor does not hold." };
+    }
+  } else {
+    // Module header's ruling: the matched set must be the SAME set of
+    // regions, by region identity, in every sample -- a surface that
+    // matches one sample's expected diameter but not another's (so it
+    // joins or leaves the set) is the real ambiguity, not the count itself.
+    const first = radialIdentities[0];
+    const identityChanged = radialIdentities.some((identity) => !sameRadialIdentity(identity, first));
+    if (identityChanged) {
+      return { status: "refused", reason: "ambiguous radial mapping: a surface matches at one sample but does not track the parameter" };
     }
   }
 
