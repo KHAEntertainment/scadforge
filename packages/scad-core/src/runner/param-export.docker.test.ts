@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- runParamExport against the REAL pinned OpenSCAD image, and the
 // AC "param round-trip" -- output parses into the frozen ParamSchema.
 import { describe, expect, it } from "vitest";

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- exercises render_views against the REAL pinned OpenSCAD image.
 // Skips automatically when Docker is not reachable (Issue #14 AC).
 import { mkdtemp, rm, stat } from "node:fs/promises";

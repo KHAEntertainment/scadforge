@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- runSyntaxCheck against the REAL pinned OpenSCAD image.
 import { describe, expect, it } from "vitest";
 import { dockerAvailable, fixture } from "../test-support/docker-available.js";

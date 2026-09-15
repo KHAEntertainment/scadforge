@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 import { render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PreviewErrorBoundary } from "./PreviewErrorBoundary.js";

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- malicious-input containment. A `.scad` source that tries to
 // `import()` an absolute host path must stay confined to the container's
 // filesystem (only `/work`, the per-render mkdtemp, is bind-mounted) and must
