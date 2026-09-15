@@ -36,10 +36,17 @@
 //     message: "ambiguous radial mapping: a surface matches at one sample
 //     but does not track the parameter".
 //   - Collinear same-diameter segments that ALL track the parameter (e.g.
-//     the S3-B B5 hinge fixture's three knuckle bores under `pin_d`) count
-//     as ONE segmented feature and PASS, with the matched region count
-//     recorded on the proof record's radial sample geometry (`regions`) so
-//     the evidence is visible.
+//     the test-only `editor/__fixtures__/segmented-bores.scad`'s three
+//     coaxial tube segments at fixed axial positions) count as ONE
+//     segmented feature and PASS, with the matched region count recorded
+//     on the proof record's radial sample geometry (`regions`) so the
+//     evidence is visible. A binding whose bound surface's POSITION (not
+//     just its size) is itself derived from the same parameter — e.g.
+//     `evals/surface-inspection/fixture/hinge.scad`'s knuckle bores, whose
+//     Y position is `pin_d/2 + knuckle_wall - 1` — cannot be described by
+//     one fixed declared center and correctly REFUSES via the empty-set
+//     path below once the bore has moved past the S2 tolerance; this is
+//     verified directly in `proof.docker.test.ts`.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -64,9 +71,8 @@ import type { Axis, Vec3 } from "../geometry/vec.js";
 import type { WeldedMesh } from "../geometry/mesh.js";
 import type { CylinderInspection } from "../geometry/inspectionTypes.js";
 import { checkBindingEligibility } from "./eligibility.js";
-import { commandDigest } from "./canonical.js";
+import { commandDigest, sourceFingerprint } from "./canonical.js";
 import type { LockedProject } from "../store/recovered.js";
-import * as canonicalModule from "./canonical.js";
 
 /** Recognizer/probe algorithm version, recorded on every proof so a future threshold/algorithm change can be detected as invalidating old proofs. Bump on any change to the linear/radial check logic or the S2 recognizer thresholds. */
 export const RECOGNIZER_VERSION = "s3-b-b5.1";
@@ -95,7 +101,7 @@ export interface ProofSample {
   paramValues: ParamValues;
   geometry:
     | { kind: "linear"; extentMm: number; anchorPositionMm: number }
-    /** `regions`: size of this sample's matched set (module header's match-criteria ruling) — 1 for an ordinary single bore, >1 for a legitimately segmented collinear feature (e.g. the hinge's three knuckle bores under `pin_d`), 0 when nothing matched (always a refusal). `diameterMm`/`centerMm` are representative (the first matched region's), since every region in a matched set shares the same diameter by construction. */
+    /** `regions`: size of this sample's matched set (module header's match-criteria ruling) — 1 for an ordinary single bore, >1 for a legitimately segmented collinear feature (e.g. `editor/__fixtures__/segmented-bores.scad`'s three coaxial segments), 0 when nothing matched (always a refusal). `diameterMm`/`centerMm` are representative (the first matched region's), since every region in a matched set shares the same diameter by construction. */
     | { kind: "radial"; regions: number; diameterMm: number | null; centerMm: [number, number, number] | null };
 }
 
@@ -179,36 +185,9 @@ async function defaultRenderSampleMesh(scad: string, params: ParamValues, librar
   }
 }
 
-/**
- * `canonical.ts`'s `sourceFingerprint` is being added by B7 in parallel
- * (S3-B ticket story, "Source fingerprint and unreadable-sidecar revision",
- * Issue #92). A normal `import { sourceFingerprint } from "./canonical.js"`
- * fails at module-LOAD time with a real "does not provide an export named"
- * error the instant anything imports this file — not only when this
- * function is actually called — breaking every proof.ts test, not only
- * ones exercising it. Read through a namespace import instead so the rest
- * of this package keeps building and testing before B7 merges; only this
- * one call path is broken until then. This is NOT a reimplementation —
- * `defaultSourceFingerprint` never computes a hash itself, it only calls
- * through once the real export exists. Once B7 merges into
- * feat/s3-b-recoverable-store and this branch rebases onto it, replace
- * this whole function with a plain `import { sourceFingerprint } from
- * "./canonical.js"` and delete the namespace import above.
- */
-function defaultSourceFingerprint(scad: string): string {
-  const impl = (canonicalModule as unknown as { sourceFingerprint?: (scad: string) => string }).sourceFingerprint;
-  if (!impl) {
-    throw new ScadForgeError(
-      "INTERNAL_ERROR",
-      "canonical.ts's sourceFingerprint is not available yet (S3-B B7, Issue #92, not yet merged into feat/s3-b-recoverable-store) -- rebase this branch once it lands."
-    );
-  }
-  return impl(scad);
-}
-
 const DEFAULT_DEPS: ProofRenderDeps = {
   renderSampleMesh: defaultRenderSampleMesh,
-  computeSourceFingerprint: defaultSourceFingerprint
+  computeSourceFingerprint: sourceFingerprint
 };
 
 function toVec3(tuple: readonly [number, number, number]): Vec3 {
