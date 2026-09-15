@@ -41,6 +41,26 @@
 // naming #111, so the SAME case starts asserting for real the moment the
 // fixup lands and B6 wires the route through the fault-armed path.
 //
+// ── WHY THE CLASSIFIER IS ITS OWN FUNCTION, WITH ITS OWN PROOF TEST ────────
+//
+// An earlier version of this file raced `postCommand(...).catch(() => null)`
+// against the child's `exit` event, so a REJECTED fetch (a connection reset
+// -- the common real-world signature of a genuine kill: the socket reset
+// usually reaches this client BEFORE the parent observes the child's own
+// `exit` event) collapsed into the SAME resolved value a successful HTTP 200
+// produces, making a real kill indistinguishable from "the route just
+// completed normally" and able to SKIP a case that should have failed --
+// exactly the silent-never-runs failure a fixup-pending cell must not have.
+// `raceEditorCommandAgainstExit` below keeps resolve and reject strictly
+// distinct and only ever reaches `dead-code` on a resolved HTTP 200 carrying
+// THIS operation's own committed receipt while the child is still alive;
+// anything else resolved is `unexpected-response` (fails loudly, never
+// skips); a rejection is always `killed` (a bounded, throwing wait for the
+// exit event -- never a silent skip). Its own dedicated test below proves
+// this against a GUARANTEED, reachable kill (`after-full-staging`, the same
+// `postCommand`/server-child code path) so a regression here cannot silently
+// start skipping the moment #111 lands.
+//
 // ── FINDING F4 (discovered building this file, empirically verified) ──────
 //
 // The abort-marking-failure injection (AC4) does NOT leave `lookupClaimLocked`
@@ -68,6 +88,7 @@
 // transient claim-marking failure is far more disruptive than "one claim
 // stuck pending" -- it is "this whole project is unreadable for a while".
 
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -106,6 +127,7 @@ import {
   assertFaultPointEnvClean,
   assertServerBuilt,
   createChildTracker,
+  isRunning,
   killChild,
   startServerChild,
   waitForExit
@@ -137,6 +159,77 @@ function feature(id: string): EditorFeature {
 
 function removeCommand(featureId: string): EditorCommand {
   return { kind: "remove-feature", featureId, bindingVersion: 1 };
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// after-claim's crash/dead-code classifier -- see the F3 module-header note
+// above for why a rejected fetch must never be collapsed into "responded".
+// ═════════════════════════════════════════════════════════════════════════
+
+type EditorCommandRaceOutcome =
+  | { kind: "dead-code"; status: number; body: unknown }
+  | { kind: "killed"; signal: NodeJS.Signals | null }
+  | { kind: "unexpected-response"; status: number; body: unknown };
+
+function looksLikeCommittedReceiptFor(body: unknown, operationId: string): boolean {
+  if (typeof body !== "object" || body === null) return false;
+  const candidate = body as Record<string, unknown>;
+  return candidate.operationId === operationId && typeof candidate.snapshotId === "string" && typeof candidate.editorRevision === "string";
+}
+
+/**
+ * Classifies a `POST .../editor/commands` request against its own armed
+ * server child. `dead-code` is reached ONLY on a resolved HTTP 200 whose
+ * body is exactly this operation's own committed receipt AND the child is
+ * still alive at the moment that is checked -- a resolved response of ANY
+ * OTHER shape (a different status, or a 200 without a matching receipt) is
+ * `unexpected-response`, which the caller must FAIL on, never skip. A
+ * REJECTED fetch (a connection reset) is always `killed`: `waitForExit`
+ * throws (a real test failure, never a silent skip) if the child does not
+ * actually exit within its bound.
+ */
+async function raceEditorCommandAgainstExit(
+  child: ChildProcess,
+  responsePromise: Promise<Response>,
+  operationId: string
+): Promise<EditorCommandRaceOutcome> {
+  type Settlement = { kind: "resolved"; status: number; body: unknown } | { kind: "rejected" };
+  const settlementPromise: Promise<Settlement> = responsePromise.then(
+    async (res) => ({ kind: "resolved" as const, status: res.status, body: await res.json().catch(() => null) }),
+    () => ({ kind: "rejected" as const })
+  );
+
+  const exitPromise = new Promise<{ signal: NodeJS.Signals | null }>((resolve) => {
+    if (!isRunning(child)) {
+      resolve({ signal: child.signalCode });
+      return;
+    }
+    child.once("exit", (_code, signal) => resolve({ signal }));
+  });
+
+  const raced = await Promise.race([
+    settlementPromise.then((settlement) => ({ from: "settlement" as const, settlement })),
+    exitPromise.then((exit) => ({ from: "exit" as const, exit }))
+  ]);
+
+  if (raced.from === "exit") {
+    return { kind: "killed", signal: raced.exit.signal };
+  }
+
+  if (raced.settlement.kind === "rejected") {
+    // The common real-world ordering for a genuine kill: the socket reset
+    // reaches this client before the parent observes the child's own
+    // 'exit' event. Bounded wait (throws on timeout -- a test FAILURE,
+    // never a skip); this is what proves a real kill is never masked.
+    const exitInfo = await waitForExit(child, 10000);
+    return { kind: "killed", signal: exitInfo.signal };
+  }
+
+  const { status, body } = raced.settlement;
+  if (status === 200 && looksLikeCommittedReceiptFor(body, operationId) && isRunning(child)) {
+    return { kind: "dead-code", status, body };
+  }
+  return { kind: "unexpected-response", status, body };
 }
 
 // `FaultPointName`'s own declaration order in `transaction.ts` is its
@@ -393,18 +486,16 @@ describe("editor remove-feature crash matrix", () => {
     const body = commitRequestFor(seeded, FEATURE_A, operationId, proofId);
 
     const armed = await startServerChild(tracker, projectsDir, { faultPoint: "after-claim" });
-    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-      armed.child.once("exit", (code, signal) => resolve({ code, signal }));
-    });
-    const responsePromise = postCommand(armed.baseUrl, seeded.projectId, body).catch(() => null);
+    const outcome = await raceEditorCommandAgainstExit(armed.child, postCommand(armed.baseUrl, seeded.projectId, body), operationId);
 
-    const winner = await Promise.race([
-      responsePromise.then(() => ({ kind: "responded" as const })),
-      exitPromise.then((info) => ({ kind: "killed" as const, info }))
-    ]);
-    responsePromise.catch(() => {}); // avoid an unhandled rejection if this loses the race
+    if (outcome.kind === "unexpected-response") {
+      throw new Error(
+        `fault-editor-matrix: after-claim commit returned an unexpected response ` +
+          `(status=${outcome.status}): ${JSON.stringify(outcome.body)}`
+      );
+    }
 
-    if (winner.kind === "responded") {
+    if (outcome.kind === "dead-code") {
       // vitest 2.x's `TestContext.skip()` takes no reason argument -- logged
       // here instead, so it is still visible in the run's own output.
       console.warn(
@@ -412,11 +503,13 @@ describe("editor remove-feature crash matrix", () => {
           "(F3, fixup Issue #111): submitEditorCommand never calls commitWithClaimLocked, so the fault " +
           "point never fires. Re-enable once #111 lands -- this same case will then observe the real SIGKILL."
       );
+      await killChild(armed.child); // the request completed normally -- the child is still alive, clean it up
       ctx.skip();
       return;
     }
 
-    expect(winner.info.signal).toBe("SIGKILL");
+    // outcome.kind === "killed"
+    expect(outcome.signal).toBe("SIGKILL");
     const restarted = await startServerChild(tracker, projectsDir);
     const { body: opBody } = await getOperation(restarted.baseUrl, seeded.projectId, operationId);
     const after = await readRootBytes(seeded.dir);
@@ -429,6 +522,22 @@ describe("editor remove-feature crash matrix", () => {
     const transactionsDir = join(seeded.dir, ".scadforge", "editor-transactions");
     const stillStaged = await pathExists(transactionsDir);
     expect(stillStaged).toBe(false);
+  }, 15000);
+});
+
+describe("raceEditorCommandAgainstExit classifier", () => {
+  it("never classifies a guaranteed real kill as dead-code (proof against a reachable fault point, after-full-staging, same postCommand/server-child code path)", async () => {
+    const projectsDir = await freshProjectsDir();
+    const seeded = await seedProject(tracker, projectsDir, [feature(FEATURE_A)]);
+    const operationId = randomUUID();
+    const proofId = await issueRemoveFeatureProof(seeded, FEATURE_A);
+    const body = commitRequestFor(seeded, FEATURE_A, operationId, proofId);
+
+    const armed = await startServerChild(tracker, projectsDir, { faultPoint: "after-full-staging" });
+    const outcome = await raceEditorCommandAgainstExit(armed.child, postCommand(armed.baseUrl, seeded.projectId, body), operationId);
+
+    expect(outcome.kind).toBe("killed");
+    if (outcome.kind === "killed") expect(outcome.signal).toBe("SIGKILL");
   }, 15000);
 });
 
