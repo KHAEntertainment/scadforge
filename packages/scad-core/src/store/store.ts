@@ -64,6 +64,8 @@ import { dirname, join } from "node:path";
 import { createTwoFilesPatch } from "diff";
 import {
   PROJECT_LAYOUT,
+  type EditorReceipt,
+  type EditorSidecar,
   type ExportRecord,
   type ProjectManifest,
   type ProviderConfig,
@@ -85,6 +87,7 @@ import {
   nextSnapshotId,
   projectFilePath,
   rootParamsPath,
+  sidecarPath,
   snapshotDir
 } from "./paths.js";
 import { readDerivedEnrichmentLocked, writeDerivedValidationLocked } from "./derived.js";
@@ -92,8 +95,9 @@ import { withFileLock } from "./file-lock.js";
 import { type LockedProject, type ReadResult, withRecoveredProject } from "./recovered.js";
 import {
   captureSidecarForSnapshotLocked,
+  readSidecarLocked,
   readSnapshotSidecarLocked,
-  writeSidecarBytesLocked
+  serializeCanonicalSidecar
 } from "../editor/sidecar.js";
 import {
   attachRendersToSnapshotLocked,
@@ -107,8 +111,12 @@ import {
   publishLocked,
   reconcileTransactionLocked,
   stageTransactionLocked,
+  type TransactionClaimLink,
   type TransactionIntent
 } from "./transaction.js";
+import type { AcceptedOperationRecord } from "./claims.js";
+import { computeSourceRevision } from "./revision.js";
+import { editorRevision as computeEditorRevision } from "../editor/canonical.js";
 
 // ── ProjectManifest (project.json) ──────────────────────────────────────────
 
@@ -269,6 +277,73 @@ export interface CreateSnapshotInput {
   buildRenderUrl?: (snapshotId: SnapshotId, view: RenderRef["view"], file: string) => string;
 }
 
+/**
+ * Additive extension for a snapshot-producing commit that must publish a
+ * durable operation claim + receipt in the SAME transaction as the snapshot
+ * (S3-B ticket B6, Issue #98). Only ever present for an editor command.
+ */
+export interface CreateSnapshotEditorExtension {
+  /** Links this transaction to the caller's already-reserved durable operation claim. */
+  claim: TransactionClaimLink;
+  /**
+   * The claim's undo/redo before/after record. Omitted (not just falsy —
+   * genuinely absent) for an undo/redo commit itself, which deliberately
+   * does not become traversable (`editor/commands.ts`'s
+   * `applyEditorTraversal`).
+   */
+  accepted?: AcceptedOperationRecord;
+  /**
+   * Builds the `EditorReceipt` to stage and publish alongside everything
+   * else. Called synchronously, AFTER the snapshot id is claimed and the
+   * resulting source revision / sidecar digest / editor revision are known,
+   * BEFORE staging begins — so a caller that only needs the receipt (rather
+   * than restructuring this function's return type) captures it via a
+   * closure variable set inside this callback.
+   */
+  buildReceipt: (facts: { snapshotId: SnapshotId; sourceRevision: string; sidecarDigest: string; editorRevision: string }) => EditorReceipt;
+}
+
+/**
+ * Additive options for a snapshot-producing commit (S3-B ticket B6, Issue
+ * #98 — Tech Lead ruling, generalized after the F1 fault-matrix finding
+ * (#103) that the sidecar override must stand alone, independent of any
+ * operation-claim/receipt concern). Omitted entirely, `createSnapshotLocked`
+ * behaves byte-for-byte as before: the default
+ * `captureSidecarForSnapshotLocked` "read current root" capture, no claim
+ * link, no receipt.
+ *
+ * Every field here lands in the SAME `commit.json` as the snapshot/root
+ * files this call already stages — there is no second write, and no caller
+ * (editor commands, revert, the legacy-empty first-mutation path) ever calls
+ * `writeSidecarBytesLocked` as a SEPARATE transaction before this one.
+ * Store.ts keeps sole ownership of the id claim, the empty-claimed-directory
+ * cleanup on a pre-decide failure, and the single stage → decide → publish;
+ * a caller never reaches into any of that itself.
+ */
+export interface CreateSnapshotOptions {
+  /**
+   * The COMPLETE new sidecar this snapshot should carry, staged as BOTH the
+   * root `.scadforge/editor.json` AND this snapshot's own captured copy +
+   * manifest descriptor — instead of `captureSidecarForSnapshotLocked`'s
+   * "whatever the current root sidecar already is" default. Canonicalized
+   * here via B3's `serializeCanonicalSidecar`; a caller must never hand-roll
+   * canonical bytes itself. Omitted for an ordinary (non-sidecar-changing)
+   * snapshot: `revert` and editor `put-feature`/`remove-feature` supply
+   * this; editor `set-value` does not (its sidecar is unchanged).
+   */
+  sidecar?: EditorSidecar;
+  /**
+   * Flips `project.editor_store_version` to 1 in the SAME `project.json`
+   * write this call already stages for `head`/`updated`. The caller decides
+   * this (it already read the current sidecar/project state to get here) —
+   * store.ts never re-derives it. Ignored when omitted/false; never
+   * downgrades an already-modern project.
+   */
+  markerFlip?: boolean;
+  /** Present only for a durable-operation-claim commit (an editor command). */
+  editor?: CreateSnapshotEditorExtension;
+}
+
 /** Max attempts to claim a snapshot id before failing with `CONFLICT` (see the concurrency policy above). */
 export const SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS = 50;
 
@@ -290,11 +365,32 @@ function backoffDelay(attempt: number): Promise<void> {
  * ORPHANED CLAIM (issue #28): it carries no `manifest.json` (a committed
  * snapshot always has one -- it is written before `project.json.head`
  * advances, so its presence means the id is genuinely taken and must never
- * be touched) AND it has been quiet longer than `ORPHANED_CLAIM_MIN_AGE_MS`
- * (a live writer keeps the directory's mtime fresh while it creates files,
- * so a directory this old with no manifest can only be the debris of a
- * process that died between the exclusive mkdir and either the manifest
- * write or the cleanup path).
+ * be touched).
+ *
+ * EMPTY orphans reclaim IMMEDIATELY, no age wait (Issue #98 F2 — B8's fault
+ * matrix, PR #103): since B2/B4, `claimNextSnapshotId` is the ONLY thing
+ * that ever creates this directory directly, and always empty — B4's own
+ * publish step populates it exclusively via an atomic rename from staging,
+ * never an in-place write. Both this call and the `recover()` that already
+ * ran earlier in THIS boundary entry hold the SAME exclusive params lock, so
+ * nothing can be concurrently "still writing into" a directory this call can
+ * see right now; an empty, manifest-less directory found here can only be
+ * the debris of an earlier lock-holder that crashed before publish ever
+ * reached this id. The OLD unconditional age gate wedged every writer for up
+ * to `ORPHANED_CLAIM_MIN_AGE_MS` after exactly this crash.
+ *
+ * A NON-EMPTY, manifest-less orphan should no longer be PRODUCIBLE under
+ * B4's model at all: `publishHistoryDirIdempotent` populates `history/<id>/`
+ * exclusively via one atomic rename of the fully-staged directory, never an
+ * in-place/partial write — so there is no code path left that can leave
+ * behind a manifest-less directory with SOME content in it. This branch is
+ * kept anyway, conservatively, for two reasons: (1) defense in depth against
+ * a future writer that reintroduces a partial in-place write, and (2) a
+ * directory tree inherited from BEFORE this migration (pre-B4-shaped
+ * debris) could still carry exactly this shape. For that case the original
+ * age-gated wait (issue #28) still applies — a live writer keeps the
+ * directory's mtime fresh while it creates files, so quiet-long-enough with
+ * no manifest can only be dead-process debris.
  */
 async function isReclaimableOrphanClaim(dir: string): Promise<boolean> {
   const hasManifest = await stat(join(dir, PROJECT_LAYOUT.snapshot.manifestFile)).then(
@@ -302,8 +398,11 @@ async function isReclaimableOrphanClaim(dir: string): Promise<boolean> {
     () => false
   );
   if (hasManifest) return false;
+  const entries = await readdir(dir).catch(() => null);
+  if (entries === null) return false; // vanished (a concurrent reclaimer freed it) -- just retry the mkdir
+  if (entries.length === 0) return true;
   const dirStat = await stat(dir).catch(() => null);
-  if (!dirStat) return false; // vanished (a concurrent reclaimer freed it) -- just retry the mkdir
+  if (!dirStat) return false; // vanished mid-check -- just retry the mkdir
   return Date.now() - dirStat.mtimeMs >= ORPHANED_CLAIM_MIN_AGE_MS;
 }
 
@@ -389,13 +488,17 @@ export async function createSnapshot(projectDir: string, input: CreateSnapshotIn
  * gap, never a partial entry" true even for an ordinary in-process failure,
  * not only a real crash.
  */
-export async function createSnapshotLocked(ctx: LockedProject, input: CreateSnapshotInput): Promise<SnapshotManifest> {
+export async function createSnapshotLocked(
+  ctx: LockedProject,
+  input: CreateSnapshotInput,
+  opts?: CreateSnapshotOptions
+): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
       const { id, parent } = await claimNextSnapshotId(ctx);
       const transactionId = randomUUID();
       try {
-        const intent = await buildSnapshotIntent(ctx, transactionId, id, parent, input);
+        const intent = await buildSnapshotIntent(ctx, transactionId, id, parent, input, opts);
         const staged = await stageTransactionLocked(ctx, intent);
         const decided = await decideLocked(ctx, staged);
         await publishLocked(ctx, decided);
@@ -436,7 +539,8 @@ async function buildSnapshotIntent(
   transactionId: string,
   id: SnapshotId,
   parent: SnapshotId | null,
-  input: CreateSnapshotInput
+  input: CreateSnapshotInput,
+  opts?: CreateSnapshotOptions
 ): Promise<TransactionIntent> {
   const projectRead = await readProjectManifestOrNullLocked(ctx);
   if (projectRead.kind === "corrupt") throw projectRead.error;
@@ -504,15 +608,34 @@ async function buildSnapshotIntent(
   }
 
   // editor.json (S3-B B3, Issue #87): every new snapshot -- including
-  // ordinary source/params snapshots, not just editor commands -- captures
-  // the CURRENT root editor sidecar verbatim. Refuses (never silently drops
-  // or fabricates) when the current root sidecar is missing/corrupt/
-  // unsupported-version; a legacy project's sidecar-naive first snapshot
-  // establishes the root sidecar (its OWN small transaction,
-  // `sidecar.ts`'s `writeSidecarBytesLocked`) and reports `legacyMarkerFlip`,
-  // which this transaction folds into the SAME `project.json` write it
-  // already stages for `head`/`updated`.
-  const sidecarCapture = await captureSidecarForSnapshotLocked(ctx);
+  // ordinary source/params snapshots, not just editor commands -- captures a
+  // sidecar verbatim. `captureSidecarForSnapshotLocked` (S3-B ticket B6,
+  // Issue #98 F1 fix, PR #103) is a PURE READ: it refuses (never silently
+  // drops or fabricates) when the current root sidecar is missing/corrupt/
+  // unsupported-version, and otherwise just RETURNS the bytes to stage --
+  // it no longer writes anything itself. `opts.sidecar` overrides this
+  // default for a caller with its own resulting sidecar (an editor
+  // put-feature/remove-feature command, or `revertToSnapshotLocked` copying
+  // the target's exact sidecar forward): the caller has already verified
+  // (or, for revert, copied wholesale) whatever trustworthiness that sidecar
+  // needs, so no extra check is repeated here. Either way, `root.sidecar` is
+  // staged and published as PART OF THIS SAME transaction below -- never a
+  // separate `writeSidecarBytesLocked` call first. That used to run as its
+  // own stage → decide → publish for BOTH the legacy-empty first-mutation
+  // case and every revert, so a crash between the two left the root sidecar
+  // changed with no snapshot (revert: a MIXED ROOT, the target's sidecar
+  // next to the OLD model.scad/params.json) -- the exact defect B8's fault
+  // matrix (#103) found.
+  const sidecarCapture = opts?.sidecar
+    ? (() => {
+        const { bytes, digest } = serializeCanonicalSidecar(opts.sidecar!);
+        return {
+          descriptor: { version: 1 as const, file: "editor.json" as const, sha256: digest },
+          bytes,
+          legacyMarkerFlip: opts.markerFlip === true
+        };
+      })()
+    : await captureSidecarForSnapshotLocked(ctx);
 
   const manifest: SnapshotManifest = {
     id,
@@ -544,11 +667,33 @@ async function buildSnapshotIntent(
       }
     : undefined;
 
+  // S3-B ticket B6: the receipt is built HERE, not by the caller, because
+  // `editorRevision`/`sourceRevision` need the id THIS call just claimed as
+  // the new `head` — a caller could not have computed them beforehand.
+  let receipt: EditorReceipt | undefined;
+  if (opts?.editor) {
+    const sourceRevision = computeSourceRevision(id, content, input.params);
+    const sidecarDigest = sidecarCapture.descriptor.sha256;
+    receipt = opts.editor.buildReceipt({
+      snapshotId: id,
+      sourceRevision,
+      sidecarDigest,
+      editorRevision: computeEditorRevision(sourceRevision, sidecarDigest)
+    });
+  }
+
   return {
     transactionId,
     root: {
       model: content,
       params: paramsFile,
+      // Staged unconditionally now (F1 fix): `publishRootFileIdempotent`
+      // skips the actual write when the target already matches this exact
+      // digest, so re-staging byte-identical bytes on an ordinary
+      // (non-sidecar-changing) snapshot is a harmless no-op at publish time
+      // -- the alternative (staging it only sometimes) is what produced the
+      // separate-transaction defect this fix closes.
+      sidecar: sidecarCapture.bytes,
       ...(updatedProject ? { project: updatedProject } : {})
     },
     snapshot: {
@@ -561,7 +706,8 @@ async function buildSnapshotIntent(
       validation: validationJson,
       sidecar: sidecarCapture.bytes,
       renders: renderEntries
-    }
+    },
+    ...(opts?.editor ? { receipt, claim: opts.editor.claim, accepted: opts.editor.accepted } : {})
   };
 }
 
@@ -740,13 +886,33 @@ export async function revertToSnapshotLocked(
       // revert). A pre-S3 target yields the canonical empty sidecar. Refuses
       // when either the target's OWN captured sidecar, or the CURRENT root
       // sidecar this overwrites, is corrupt -- never silently drop/repair
-      // either side. This must happen BEFORE `createSnapshotLocked` below:
-      // that call's own `writeSnapshotFiles` captures whatever the root
-      // sidecar reads as AT THAT POINT into the new revert snapshot, so
-      // overwriting the root here is what makes the capture correct.
+      // either side.
+      //
+      // S3-B ticket B6 (Issue #98 F1 fix, PR #103): this used to write the
+      // root sidecar via its OWN separate `writeSidecarBytesLocked`
+      // transaction, BEFORE `createSnapshotLocked` below -- so a crash
+      // between the two left a MIXED ROOT (the target's sidecar published
+      // next to the OLD model.scad/params.json, no new snapshot at all).
+      // The target's sidecar is now passed through `createSnapshotLocked`'s
+      // `opts.sidecar`, staged and published as part of the SAME transaction
+      // as the snapshot -- the current-root corruption check that
+      // `writeSidecarBytesLocked` used to perform internally is replicated
+      // here instead, still BEFORE anything is staged.
       const targetSidecar = await readSnapshotSidecarLocked(ctx, targetId);
       if (targetSidecar.status === "corrupt") throw targetSidecar.error;
-      await writeSidecarBytesLocked(ctx, targetSidecar.sidecar);
+      const currentSidecar = await readSidecarLocked(ctx);
+      if (currentSidecar.status === "corrupt" || currentSidecar.status === "unsupported-version") {
+        throw new ScadForgeError(
+          "INTERNAL_ERROR",
+          `refusing to revert: current root sidecar at '${sidecarPath(ctx.projectDir)}' is ${currentSidecar.status}` +
+            (currentSidecar.error ? ` (${currentSidecar.error.message})` : "") +
+            "; quarantine the file first, then retry"
+        );
+      }
+      // A still-legacy project reverting (to ANY target, including a pre-S3
+      // one) becomes modern going forward -- matches
+      // `captureSidecarForSnapshotLocked`'s own "legacy-empty -> flip" rule.
+      const revertMarkerFlip = currentSidecar.status === "legacy-empty";
 
       // Resolve read locations before creating the new snapshot. Each
       // resolver checks the post-creation `derived/` tree first and then
@@ -770,13 +936,17 @@ export async function revertToSnapshotLocked(
         : null;
       const meshSource = await resolveSnapshotMeshPath(ctx.projectDir, targetId);
 
-      const reverted = await createSnapshotLocked(ctx, {
-        content: modelContent,
-        params,
-        message: `Revert to ${targetId}`,
-        origin: "revert",
-        pass: null
-      });
+      const reverted = await createSnapshotLocked(
+        ctx,
+        {
+          content: modelContent,
+          params,
+          message: `Revert to ${targetId}`,
+          origin: "revert",
+          pass: null
+        },
+        { sidecar: targetSidecar.sidecar, markerFlip: revertMarkerFlip }
+      );
 
       if (renderSources.length > 0) {
         await attachRendersToSnapshotLocked(
