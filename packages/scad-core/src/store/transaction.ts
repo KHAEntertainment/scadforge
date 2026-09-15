@@ -70,12 +70,7 @@ import {
 } from "./paths.js";
 import { computeSourceRevision } from "./revision.js";
 import type { LockedProject } from "./recovered.js";
-import {
-  ABORTED_REPLAY_MESSAGE,
-  recordClaimAbortedLocked,
-  recordClaimCommittedLocked,
-  reserveClaimLocked
-} from "./claims.js";
+import { recordClaimAbortedLocked, recordClaimCommittedLocked } from "./claims.js";
 import type { AcceptedOperationRecord } from "./claims.js";
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -108,13 +103,19 @@ function killSelf(): never {
 let faultAction: FaultAction = killSelf;
 
 /**
- * TEST-ONLY escape hatch. Deliberately NOT exported from `index.ts` — the
- * package barrel never re-exports it, so no production code path (server,
- * agent, mcp-server) can reach it; only a test file importing this module's
- * relative source path (`transaction.test.ts`, `store.test.ts`) can swap the
- * fault action for a throwing stand-in ("the tests use a helper that throws
+ * TEST-ONLY escape hatch. Swaps the armed fault point's action (default:
+ * `killSelf`, a real self-`SIGKILL`, which B8's separate-process crash matrix
+ * relies on) for a throwing stand-in ("the tests use a helper that throws
  * instead of killing" — Issue #90). Arming itself is STILL env-var-only
  * (`SCADFORGE_FAULT_POINT`); this only changes what happens once armed.
+ *
+ * Re-exported from `index.ts` (Issue #111) so an IN-PROCESS test in a
+ * consuming package -- apps/server's `scad-core-impl.test.ts`, which fires
+ * `"after-claim"` on the real `submitEditorCommand` path -- can observe the
+ * fault point firing without killing the test runner. Only a test file that
+ * explicitly imports and calls this is ever affected; production code has no
+ * reason to import a `__`-prefixed test hook, and arming stays gated by the
+ * env var regardless.
  */
 export function __setFaultActionForTests(action: FaultAction | null): void {
   faultAction = action ?? killSelf;
@@ -788,50 +789,3 @@ export async function recoverPendingClaimsLocked(ctx: LockedProject): Promise<vo
   }
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// 9. commitWithClaimLocked — the claim-plus-commit driver (B6's future seam)
-// ═════════════════════════════════════════════════════════════════════════════
-
-export type CommitWithClaimResult =
-  | { kind: "committed"; receipt: EditorReceipt }
-  | { kind: "conflict"; message: string | null }
-  /** Same id+digest, not yet terminal — another submission of the identical request is still being processed (or crashed mid-flight; the caller should poll/retry the lookup, never re-run `produce`). */
-  | { kind: "pending" };
-
-/**
- * Ties a durable operation claim (`claims.ts`) to its staged transaction:
- * reserves the claim, fires the `"after-claim"` fault point the instant that
- * reservation is durable (Issue #90 lists this crash boundary explicitly for
- * B8 to drive — it is real, exercised code here, not dead code), then either
- * replays an already-terminal claim (same id+digest never re-runs `produce`
- * — never a second snapshot) or runs `produce` to completion. `produce` is
- * responsible for building a `TransactionIntent` whose `claim.operationId`
- * matches `request.operationId` and whose `receipt` is set, so
- * {@link publishLocked} materializes the claim's `committed` terminal state
- * as part of the SAME publish it already performs.
- *
- * B6 (the real `EditorCommand` producer) is out of scope for this ticket;
- * this driver exists so the claim lifecycle and its fault point are real,
- * B8-drivable code rather than inert scaffolding — B6 will call this
- * directly once it exists.
- */
-export async function commitWithClaimLocked(
-  ctx: LockedProject,
-  request: { operationId: string; requestDigest: string; payload: unknown },
-  produce: (ctx: LockedProject) => Promise<EditorReceipt>
-): Promise<CommitWithClaimResult> {
-  const reserved = await reserveClaimLocked(ctx, request.operationId, request.requestDigest, request.payload);
-  await faultPoint("after-claim");
-
-  if (reserved.kind === "conflict") return { kind: "conflict", message: null };
-  if (reserved.kind === "same-request") {
-    if (reserved.terminal === null) return { kind: "pending" };
-    if (reserved.terminal.kind === "committed") return { kind: "committed", receipt: reserved.terminal.receipt };
-    if (reserved.terminal.kind === "aborted") return { kind: "conflict", message: ABORTED_REPLAY_MESSAGE };
-    return { kind: "conflict", message: null }; // rejected -- the caller reads its ApiError from the claim record itself
-  }
-
-  // reserved.kind === "reserved" -- a fresh claim; run the actual work.
-  const receipt = await produce(ctx);
-  return { kind: "committed", receipt };
-}

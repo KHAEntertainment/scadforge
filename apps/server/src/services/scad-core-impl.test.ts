@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  ABORTED_REPLAY_MESSAGE,
   DEFAULT_VIEWS,
+  __setFaultActionForTests,
   canonicalSidecar,
   commandDigest,
   createSnapshotLocked,
@@ -16,6 +18,7 @@ import {
   lookupClaimLocked,
   mergeParamsAtomic,
   persistProofRecord,
+  rootModelPath,
   sidecarDigest,
   sourceFingerprint,
   withRecoveredProject,
@@ -649,5 +652,140 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
       proofId: redoProof
     });
     expect(redoReceipt.values).toEqual({ wall: 9 });
+  });
+
+  // ── "after-claim" fault point (Issue #111) ──────────────────────────────
+  //
+  // B4 added the "after-claim" fault point inside the now-deleted
+  // `commitWithClaimLocked` (B6's originally-planned future seam), but B6's
+  // real `submitEditorCommand` never routed through it, so the crash window
+  // "claim durable, no staging transaction started" was unreachable on the
+  // product path. `submitEditorCommand` now fires `faultPoint("after-claim")`
+  // itself, right after `reserveClaimLocked` returns a genuinely NEW
+  // reservation. These tests drive that fault on the REAL path -- in-process,
+  // via `__setFaultActionForTests` swapping the default self-`SIGKILL` for a
+  // throwing stand-in (re-exported from `@scadforge/scad-core` for exactly
+  // this purpose).
+  it("fires \"after-claim\" on the REAL submitEditorCommand path for a genuinely new reservation, and recovers the claim to aborted", async () => {
+    const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
+    const dir = runtime.dirFor("p7");
+    await initProject(dir, { id: "p7", name: "n", provider: providerConfig, content: "cube(1);\n", params: { wall: 2 } });
+    const feature = fixtureFeature({ projectId: "p7" });
+    await withRecoveredProject(dir, (ctx) => writeSidecarLocked(ctx, { version: 1, features: [feature] }));
+    const api = createScadCoreApi(runtime);
+
+    const state = await coherentSourceState(dir);
+    const command: EditorCommand = { kind: "set-value", featureId: feature.featureId, bindingVersion: 1, value: 9 };
+    const proofId = await persistFakeProof(dir, {
+      projectId: "p7",
+      baseEditorRevision: state.editorRevision!,
+      command,
+      intent: "edit",
+      traversal: null,
+      authoritativeParams: state.params,
+      candidateParams: { ...state.params, wall: 9 }
+    });
+    const operationId = randomUUID();
+    const request: EditorCommitRequest = {
+      version: 1,
+      baseEditorRevision: state.editorRevision!,
+      command,
+      intent: "edit",
+      traversal: null,
+      operationId,
+      proofId
+    };
+    const snapshotCountBefore = (await listSnapshots(dir)).length;
+
+    process.env.SCADFORGE_FAULT_POINT = "after-claim";
+    __setFaultActionForTests(() => {
+      throw new Error("simulated crash: after-claim");
+    });
+    try {
+      // The fault fires the instant the reservation is durable -- before any
+      // proof lookup or staging -- so this always throws the same simulated
+      // crash, never a validation/proof-shaped rejection.
+      await expect(api.submitEditorCommand("p7", request)).rejects.toThrow(/simulated crash: after-claim/);
+
+      // Nothing durable happened beyond the reservation itself: no new
+      // snapshot, root model untouched. (The staging directory and pending
+      // marker are scad-core-internal state, already covered directly by
+      // transaction.ts's own crash-table tests; this proves the REAL,
+      // previously-unreachable path drives the identical recovery contract.)
+      expect(await listSnapshots(dir)).toHaveLength(snapshotCountBefore);
+      expect(await readFile(rootModelPath(dir), "utf8")).toBe("cube(1);\n");
+
+      // The NEXT boundary entry recovers the orphaned pending claim to
+      // aborted (crash-table row 1) -- `getEditorOperation` runs its own
+      // `withRecoveredProject`, so `recover()` runs automatically before this
+      // lookup executes.
+      const looked = await api.getEditorOperation("p7", operationId);
+      expect(looked).toMatchObject({ state: "definitely_not_committed", reason: "aborted" });
+
+      // Re-sending the IDENTICAL request now gets the aborted-replay
+      // CONFLICT, never a fresh reservation -- `reserveClaimLocked` returns
+      // `same-request` (same digest) with an `aborted` terminal, which
+      // `submitEditorCommand` maps to `ABORTED_REPLAY_MESSAGE` WITHOUT ever
+      // reaching the fault-point call again (that branch returns/throws
+      // before the "reserved.kind === 'reserved'" fallthrough).
+      await expect(api.submitEditorCommand("p7", request)).rejects.toMatchObject({
+        code: "CONFLICT",
+        message: ABORTED_REPLAY_MESSAGE
+      });
+    } finally {
+      delete process.env.SCADFORGE_FAULT_POINT;
+      __setFaultActionForTests(null);
+    }
+  });
+
+  it("does not fire \"after-claim\" on a same-request replay of an already-committed operation -- proves the fault fires only on a NEW reservation", async () => {
+    const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
+    const dir = runtime.dirFor("p8");
+    await initProject(dir, { id: "p8", name: "n", provider: providerConfig, content: "cube(1);\n", params: { wall: 2 } });
+    const feature = fixtureFeature({ projectId: "p8" });
+    await withRecoveredProject(dir, (ctx) => writeSidecarLocked(ctx, { version: 1, features: [feature] }));
+    const api = createScadCoreApi(runtime);
+
+    const state = await coherentSourceState(dir);
+    const command: EditorCommand = { kind: "set-value", featureId: feature.featureId, bindingVersion: 1, value: 9 };
+    const proofId = await persistFakeProof(dir, {
+      projectId: "p8",
+      baseEditorRevision: state.editorRevision!,
+      command,
+      intent: "edit",
+      traversal: null,
+      authoritativeParams: state.params,
+      candidateParams: { ...state.params, wall: 9 }
+    });
+    const request: EditorCommitRequest = {
+      version: 1,
+      baseEditorRevision: state.editorRevision!,
+      command,
+      intent: "edit",
+      traversal: null,
+      operationId: randomUUID(),
+      proofId
+    };
+
+    // Commit normally FIRST, fault disarmed.
+    const firstReceipt = await api.submitEditorCommand("p8", request);
+
+    // NOW arm the fault and re-send the IDENTICAL request. A same-request
+    // replay of an already-committed operation returns early (`reserved.kind
+    // === "same-request"` with `terminal.kind === "committed"`), which is
+    // BEFORE the "reserved.kind === 'reserved'" fallthrough that fires the
+    // fault point -- so this must return the cached receipt normally, never
+    // throw the armed fault's stand-in.
+    process.env.SCADFORGE_FAULT_POINT = "after-claim";
+    __setFaultActionForTests(() => {
+      throw new Error("must never fire on an already-committed replay");
+    });
+    try {
+      const replay = await api.submitEditorCommand("p8", request);
+      expect(replay).toEqual(firstReceipt);
+    } finally {
+      delete process.env.SCADFORGE_FAULT_POINT;
+      __setFaultActionForTests(null);
+    }
   });
 });
