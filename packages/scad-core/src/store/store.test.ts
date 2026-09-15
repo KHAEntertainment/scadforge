@@ -14,9 +14,11 @@ import {
   readProjectManifest,
   readSnapshotManifest,
   recordExport,
-  revertToSnapshot
+  revertToSnapshot,
+  updateRootParamsLocked
 } from "./store.js";
-import { historyDir, projectFilePath, snapshotDir, rootParamsPath } from "./paths.js";
+import { historyDir, projectFilePath, snapshotDir, rootModelPath, rootParamsPath, transactionsDir } from "./paths.js";
+import { __setFaultActionForTests } from "./transaction.js";
 import {
   attachRendersToSnapshotLocked,
   attachValidationToSnapshotLocked,
@@ -57,6 +59,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  __setFaultActionForTests(null);
+  delete process.env.SCADFORGE_FAULT_POINT;
   await rm(projectDir, { recursive: true, force: true });
 });
 
@@ -671,7 +675,7 @@ describe("project store (filesystem, temp dir)", () => {
     // is a real id from this run, not stale/duplicated.
     const project = await readProjectManifest(projectDir);
     expect(new Set(ids).has(project.head as string)).toBe(true);
-  });
+  }, 20000); // S3-B ticket B4: staging now does per-file digesting plus a flush/fsync per staged and published file, so 12 fully-serialized contenders legitimately need more headroom than the default timeout under load -- matches the sibling concurrency tests below.
 
   it("exhausting SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS surfaces the typed CONFLICT error instead of silently overwriting", async () => {
     await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
@@ -1016,5 +1020,121 @@ describe("editor sidecar: revert exact copy-forward (Issue #87 / S3-B ticket B3,
     expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(rootBefore); // root untouched
     expect((await readProjectManifest(projectDir)).head).toBe(headBefore);
     expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]);
+  });
+});
+
+// ── staged roll-forward transactions (Issue #90 / S3-B ticket B4) ───────────
+
+/** Arms `SCADFORGE_FAULT_POINT=name` for the duration of `action`, always disarming afterward — even a caller that never awaits the fault (an untouched name) must not leak the env var into a later test. */
+async function withFaultPoint<T>(name: string, action: () => Promise<T>): Promise<T> {
+  process.env.SCADFORGE_FAULT_POINT = name;
+  try {
+    return await action();
+  } finally {
+    delete process.env.SCADFORGE_FAULT_POINT;
+  }
+}
+
+class SimulatedCrash extends Error {}
+
+describe("staged roll-forward transactions (Issue #90 / S3-B ticket B4)", () => {
+  it("a crash during staging (before commit.json) leaves root and history byte-identical -- no partial entry is ever visible", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    __setFaultActionForTests(() => {
+      throw new SimulatedCrash("simulated crash: after-partial-staging");
+    });
+
+    await withFaultPoint("after-partial-staging", () =>
+      expect(
+        createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "should not land", origin: "manual", pass: null })
+      ).rejects.toThrow(/simulated crash/)
+    );
+
+    expect(await readFile(rootModelPath(projectDir), "utf8")).toBe("cube(1);\n");
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]); // no partial directory left behind
+
+    const snapshots = await listSnapshots(projectDir);
+    expect(snapshots.map((s) => s.id)).toEqual(["0001"]);
+  });
+
+  it("a crash after decision (commit.json durable) but mid-publication is completed by the next boundary entry -- the receipt matches exactly what was decided", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    __setFaultActionForTests(() => {
+      throw new SimulatedCrash("simulated crash: after-publish-root-source");
+    });
+
+    await withFaultPoint("after-publish-root-source", () =>
+      expect(
+        createSnapshot(projectDir, { content: "cube(2);\n", params: { a: 1 }, message: "second", origin: "manual", pass: null })
+      ).rejects.toThrow(/simulated crash/)
+    );
+
+    // The ORIGINAL call rejected -- the caller gets no success response. The
+    // operation is nonetheless durably committed: the fault is disarmed now
+    // (withFaultPoint's finally already ran), so this fresh boundary entry's
+    // own `recover()` finishes publication idempotently before it does
+    // anything else.
+    const snapshots = await listSnapshots(projectDir);
+    expect(snapshots.map((s) => s.id)).toEqual(["0001", "0002"]);
+    expect(snapshots[1]?.message).toBe("second");
+    expect(snapshots[1]?.params).toEqual({ a: 1 });
+    expect(await readFile(rootModelPath(projectDir), "utf8")).toBe("cube(2);\n");
+    const project = await readProjectManifest(projectDir);
+    expect(project.head).toBe("0002");
+  });
+
+  it("a manifest-less history/<id> directory (an abandoned id claim with no linked transaction) is skipped by listSnapshots, never a hard failure (Tech Lead correction C2)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    // Simulates a crash right after claimNextSnapshotId's exclusive mkdir but
+    // BEFORE any staging transaction ever started -- recover() has nothing to
+    // reconcile (no transaction is linked to this directory at all), so this
+    // gap can ONLY ever be closed by Issue #28's existing age-gated orphan
+    // reclaim, never by B4's own transaction recovery.
+    const orphan = snapshotDir(projectDir, "0002");
+    await mkdir(orphan);
+    const past = new Date(Date.now() - 2 * ORPHANED_CLAIM_MIN_AGE_MS);
+    await utimes(orphan, past, past);
+
+    const snapshots = await listSnapshots(projectDir);
+    expect(snapshots.map((s) => s.id)).toEqual(["0001"]); // skipped, not a hard failure -- listSnapshots itself never claims/deletes anything
+
+    // The store keeps working: the next writer reclaims the stale, manifest-less debris and reuses the id -- gapless.
+    const next = await createSnapshot(projectDir, {
+      content: "cube(2);\n",
+      params: {},
+      message: "after gap",
+      origin: "manual",
+      pass: null
+    });
+    expect(next.id).toBe("0002");
+  });
+
+  it("updateRootParamsLocked (the snapshot-free params write) stages and publishes ONLY params.json -- history and root model.scad are untouched, and no staging directory is left behind", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n", params: { a: 1 } }); // 0001
+    const historyBefore = await readdirNames(historyDir(projectDir));
+
+    await withRecoveredProject(projectDir, (ctx) => updateRootParamsLocked(ctx, { a: 1, b: 2 }));
+
+    expect(await readdirNames(historyDir(projectDir))).toEqual(historyBefore); // no snapshot created
+    expect(await readFile(rootModelPath(projectDir), "utf8")).toBe("cube(1);\n"); // root model untouched
+    const params = JSON.parse(await readFile(rootParamsPath(projectDir), "utf8")) as { parameterSets: { current: unknown } };
+    expect(params.parameterSets.current).toEqual({ a: 1, b: 2 });
+
+    const stagingEntries = await readdir(transactionsDir(projectDir)).catch(() => []);
+    expect(stagingEntries).toEqual([]);
+  });
+
+  it("a crash during updateRootParamsLocked's staging leaves root params.json untouched", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n", params: { a: 1 } });
+    const before = await readFile(rootParamsPath(projectDir), "utf8");
+    __setFaultActionForTests(() => {
+      throw new SimulatedCrash("simulated crash: after-full-staging");
+    });
+
+    await withFaultPoint("after-full-staging", () =>
+      expect(withRecoveredProject(projectDir, (ctx) => updateRootParamsLocked(ctx, { a: 1, c: 3 }))).rejects.toThrow(/simulated crash/)
+    );
+
+    expect(await readFile(rootParamsPath(projectDir), "utf8")).toBe(before);
   });
 });
