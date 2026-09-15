@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // Integration tests for the Issue #20 wiring that needs NO Docker and no live
 // model: the three host-owned seam mappings, and the provider adapter's event
 // contract (exactly one `turn_started`, emitted by the host, and exactly one

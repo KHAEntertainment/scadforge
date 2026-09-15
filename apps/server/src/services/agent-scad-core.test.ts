@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: Apache-2.0
 //
 // Issue #87 (S3-B ticket B3): the agent's `coherentProjectState` internal
 // coherent-read result carries the editor sidecar's status/features/digest
