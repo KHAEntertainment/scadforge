@@ -50,6 +50,7 @@ const WRITE_PRIMITIVE_PATTERN = /\b(writeFile|rename)\s*\(/;
 const ALLOW_LISTED_BOUNDARY_MODULES = [
   "packages/scad-core/src/store/store.ts",
   "packages/scad-core/src/editor/sidecar.ts", // Issue #87 / S3-B ticket B3: readSidecarLocked/writeSidecarLocked/etc. all take an already-open `LockedProject` ctx and never reacquire the lock.
+  "packages/scad-core/src/store/transaction.ts", // Issue #90 / S3-B ticket B4: stageTransactionLocked/publishLocked/recovery all take an already-open `LockedProject` ctx and never reacquire the lock -- this IS the recovery boundary's own staged-write mechanism.
   "apps/server/src/services/runtime.ts",
   "apps/server/src/services/scad-core-impl.ts",
   "apps/server/src/services/agent-scad-core.ts"

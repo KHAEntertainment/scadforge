@@ -13,7 +13,6 @@ import { CLAUDE_AGENT_SDK_PROVIDER_ID, resolveMaxPasses } from "@scadforge/agent
 import { bosl2Path, mcadPath } from "@scadforge/libs";
 import {
   PARAMS_ACTIVE_PRESET,
-  PARAMS_FILE_FORMAT_VERSION,
   ScadForgeError,
   readProjectManifest,
   readSnapshotManifest,
@@ -198,24 +197,13 @@ export async function stageSnapshotModel(dir: string, id: SnapshotId): Promise<S
   return { scadPath, params, cleanup: () => rm(stageDir, { recursive: true, force: true }).catch(() => {}) };
 }
 
-/**
- * Writes the project's root `params.json` WITHOUT creating a snapshot — the
- * `snapshot: false` path of `PUT /api/projects/:id/params`. Uses the same
- * one-preset Customizer file shape the store writes, so a later snapshot reads
- * back exactly what was persisted here.
- *
- * Takes `ctx` (Issue #73): this is a root-state write, so it must run inside
- * an active recovery boundary — its only caller (`scad-core-impl.ts`'s
- * `updateParams`) already holds one via `mergeParamsAtomic`'s `persist`
- * callback.
- */
-export async function writeRootParamsLocked(ctx: LockedProject, params: ParamValues): Promise<void> {
-  const file: ParamsFile = {
-    fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
-    parameterSets: { [PARAMS_ACTIVE_PRESET]: params }
-  };
-  await writeFile(rootParamsPath(ctx.projectDir), JSON.stringify(file, null, 2), "utf8");
-}
+// `writeRootParamsLocked` (the `snapshot: false` path of `PUT
+// /api/projects/:id/params`) moved to `@scadforge/scad-core`'s
+// `updateRootParamsLocked` (S3-B ticket B4, declared deviation): a bare
+// `writeFile` here bypassed the staged roll-forward transaction mechanism
+// entirely, and this write is exactly the "snapshot-free params write" the
+// ticket's acceptance criteria require. `scad-core-impl.ts`'s `updateParams`
+// is the only caller and now imports the scad-core version directly.
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */
 const EMPTY_PARAM_SCHEMA: ParamSchema = { title: "", parameters: [] };
