@@ -29,7 +29,6 @@ import type {
   EditorFeature,
   EditorProofResponse,
   EditorSidecarStatus,
-  EditorVerifyRequest,
   ExportRecord,
   ExportRequest,
   ExportResponse,
