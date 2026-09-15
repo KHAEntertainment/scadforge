@@ -35,11 +35,15 @@ async function writeOwner(dir: string, owner: { pid: number; startedAt: string; 
 }
 
 describe("withFileLock stale-owner reclaim (Issue #73)", () => {
-  it("a lock held by a live pid is NOT reclaimed -- the contender exhausts the backoff ceiling and fails CONFLICT", async () => {
+  it("a lock held by a live pid is NOT reclaimed -- the contender exhausts the wait budget and fails CONFLICT", async () => {
     await mkdir(lockDir);
     await writeOwner(lockDir, { pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname() });
 
-    await expect(withFileLock(lockDir, "test", async () => "should never run")).rejects.toMatchObject({
+    // A short custom maxWaitMs -- this test only cares that a live holder is
+    // never reclaimed and the caller eventually fails CONFLICT, not the real
+    // production budget (proven separately below), so it need not spend the
+    // default FILE_LOCK_MAX_WAIT_MS on every run.
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
       error_code: "CONFLICT"
     });
 
@@ -71,7 +75,7 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
   it("a lock with NO owner.json and a FRESH mtime is NOT reclaimed -- it may simply be mid-acquisition", async () => {
     await mkdir(lockDir); // no owner.json written -- simulates the narrow window before writeOwnerFile runs
 
-    await expect(withFileLock(lockDir, "test", async () => "should never run")).rejects.toMatchObject({
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
       error_code: "CONFLICT"
     });
   }, 20000);
@@ -89,7 +93,7 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
     await mkdir(lockDir);
     await writeOwner(lockDir, { pid: deadPid(), startedAt: new Date().toISOString(), hostname: `not-${hostname()}` });
 
-    await expect(withFileLock(lockDir, "test", async () => "should never run")).rejects.toMatchObject({
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
       error_code: "CONFLICT"
     });
   }, 20000);
@@ -107,4 +111,49 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
     const exists = await readdir(workDir).then((entries) => entries.includes("some.lock"));
     expect(exists).toBe(false);
   });
+});
+
+describe("withFileLock wall-clock wait budget (Issue #115)", () => {
+  it("N live, fully-serialized holders whose total real hold time exceeds a fixed attempt-count-equivalent, but stays under maxWaitMs, all succeed", async () => {
+    // Old behavior: a FIXED ATTEMPT COUNT gave up after ~50 attempts
+    // regardless of how many legitimate holders were queued or how long
+    // each one's critical section took -- proven failing pre-fix against
+    // the real default budget (see the PR body for that one-off run). This
+    // proves the fix's direction on a small, fast, injectable deadline: 6
+    // holders x 120ms fully serialize to ~720ms, comfortably under a 2000ms
+    // maxWaitMs, so every caller succeeds even though none of them is the
+    // first to acquire.
+    const N = 6;
+    const holdMs = 120;
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        withFileLock(
+          lockDir,
+          "test",
+          async () => {
+            await new Promise((r) => setTimeout(r, holdMs));
+            return i;
+          },
+          2000
+        )
+      )
+    );
+    expect(new Set(results).size).toBe(N);
+  }, 10000);
+
+  it("a live holder that outlasts maxWaitMs fails the waiter with CONFLICT at about the deadline, not at attempt exhaustion", async () => {
+    await mkdir(lockDir);
+    await writeOwner(lockDir, { pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname() });
+
+    const start = Date.now();
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+    const elapsedMs = Date.now() - start;
+    // Gives up close to the 300ms deadline -- nowhere near the default
+    // FILE_LOCK_MAX_WAIT_MS (10s), which the old attempt-count mechanism
+    // would have forced regardless of this caller's own maxWaitMs.
+    expect(elapsedMs).toBeGreaterThanOrEqual(300);
+    expect(elapsedMs).toBeLessThan(2000);
+  }, 10000);
 });
