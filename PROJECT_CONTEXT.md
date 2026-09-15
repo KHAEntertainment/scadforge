@@ -45,6 +45,42 @@
 - **Contract freeze rule**: after their freeze issue merges, `packages/protocol/**`, `packages/scad-core/src/types.ts`, `packages/agent/src/tools/contract.ts` are Tech-Lead-owned. Workers must not edit them inside feature PRs — request changes via issue comment.
 - **Agent output contract**: never paste full `.scad` into chat; short summaries only.
 
+## Verification Gate
+The gate every PR head must pass before QA, review or merge. QA lanes run it exactly as written. A command that fails, or that did not run, fails the gate.
+
+Run from the worktree root, in this order. Each command must exit 0:
+
+1. `pnpm install --frozen-lockfile`
+2. `pnpm -r build`
+3. `pnpm -r test`. The Docker daemon must be up so every `@docker` suite executes. A skipped `@docker` suite counts as not run.
+4. `pnpm lint`
+5. `node scripts/check-licenses.mjs`
+
+**Evidence rules**
+- Report each command with its exit code, from one final run at the head being reported. A result carried over from an earlier commit, or from a partial re-run, is not evidence.
+- Report per-package test counts, including executed and skipped `@docker` counts. Keep the test output unfiltered: a filter that drops Vitest's summary lines hides skips.
+- After any fix, re-run the whole gate, not only the check that failed.
+
+**CI also runs these** (`.github/workflows/ci.yml`). Run them locally when a change touches the license gate, the Docker image or the M2 integration path:
+- `node scripts/check-licenses.mjs --self-test`
+- `node scripts/check-licenses.e2e.mjs`. It temporarily injects a GPL dependency and edits `package.json` and `pnpm-lock.yaml`, then reverts. Never run it in a read-only lane.
+- `bash docker/ci-smoke-render.sh` (pinned image build plus a smoke render)
+- `node evals/scenario-a2/run.mjs --no-compose` (M2 parameter and preview agreement)
+
+**Shared host**
+- Only one full `pnpm -r test` runs on a machine at a time; parallel Docker suites overload the host.
+- Serialize runs with a lock directory, `$HOME/.scadforge-suite.lock`. Its `owner` file holds the holder's agent id and a UTC timestamp.
+- Hold the lock only for the test run, never while editing, and always release it.
+- Report a lock whose owner is older than 45 minutes to the Tech Lead rather than breaking it.
+- A single non-Docker test file (`pnpm --filter <package> exec vitest run <file>`) needs no lock.
+
+**Known flake**
+- Issue #83: the same-key test in `apps/server/src/services/params-update.docker.test.ts` can time out under host load.
+- If it is the only failure, re-run that one file once and report both results.
+- Any other failure is a real failure.
+
+**Docs-only changes** (Markdown or comment lines only; no code, configuration or lockfile change) run `pnpm lint` and `node scripts/check-licenses.mjs`. The full suite is not required.
+
 ## Spike Decisions (Round-0 close, 2026-08-26 — all four spikes GO or GO-WITH-CAVEATS)
 - **OpenSCAD pin**: `docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7` → OpenSCAD **2026.01.19** (git e43242666), official weekly CI image, multi-arch (native arm64). AppImage-in-Docker rejected (x86 nightly segfaults under QEMU on Apple Silicon; arm64 AppImage too old; source build OOMs). Caveat: trails newest x86-only nightly ~5 weeks — recheck tags if a newer feature becomes load-bearing.
 - **render_views camera constants** (frozen into contract): common flags `--viewall --autocenter --projection=ortho --imgsize=1024,768 --backend=Manifold --render --colorscheme=Cornfield`; rotations iso `55,0,25`, front `90,0,0`, top `0,0,0`, right `90,0,90`. Verified: 3MF color export ✓, `--export-format=param` ✓, byte-identical determinism ✓, ~3.7s per 5-view set.
