@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @scadforge/scad-core — fault-qualification harness (Issue #99, S3-B ticket
 // B8, Phase 1).
 //
