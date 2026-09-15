@@ -26,8 +26,7 @@ import {
   rootParamsPath,
   sidecarPath,
   snapshotDir,
-  transactionDir,
-  transactionsDir
+  transactionDir
 } from "./paths.js";
 import { withRecoveredProject } from "./recovered.js";
 import type { LockedProject } from "./recovered.js";
@@ -42,7 +41,6 @@ import {
   __setFaultActionForTests,
   __setSyncImplForTests,
   abortTransactionLocked,
-  commitWithClaimLocked,
   decideLocked,
   faultPoint,
   publishLocked,
@@ -646,91 +644,11 @@ describe("claims: reserve / lookup / replay", () => {
   });
 });
 
-// ═════════════════════════════════════════════════════════════════════════════
-// commitWithClaimLocked + the "after-claim" fault point (Tech Lead fix batch #3)
-// ═════════════════════════════════════════════════════════════════════════════
-
-describe("commitWithClaimLocked", () => {
-  it("reserves, commits through produce, and replays the SAME receipt on a same-id-same-digest resubmission -- never a second call to produce", async () => {
-    const operationId = randomUUID();
-    let produceCalls = 0;
-    const receipt = fakeReceipt(operationId);
-
-    const first = await withCtx((ctx) =>
-      commitWithClaimLocked(ctx, { operationId, requestDigest: "digest-ok", payload: { n: 1 } }, async (innerCtx) => {
-        produceCalls++;
-        const intent: TransactionIntent = {
-          transactionId: randomUUID(),
-          root: { model: "cube(50);\n" },
-          claim: { operationId },
-          receipt
-        };
-        const staged = await stageTransactionLocked(innerCtx, intent);
-        const decided = await decideLocked(innerCtx, staged);
-        await publishLocked(innerCtx, decided);
-        return receipt;
-      })
-    );
-    expect(first).toEqual({ kind: "committed", receipt });
-    expect(produceCalls).toBe(1);
-
-    const second = await withCtx((ctx) =>
-      commitWithClaimLocked(ctx, { operationId, requestDigest: "digest-ok", payload: { n: 1 } }, async () => {
-        produceCalls++;
-        throw new Error("produce must never run again for an identical resubmission");
-      })
-    );
-    expect(second).toEqual({ kind: "committed", receipt });
-    expect(produceCalls).toBe(1); // produce was NOT called a second time
-  });
-
-  it("a different digest against the same operation id is CONFLICT and never runs produce", async () => {
-    const operationId = randomUUID();
-    await withCtx((ctx) => commitWithClaimLocked(ctx, { operationId, requestDigest: "digest-a", payload: {} }, async () => fakeReceipt(operationId)));
-
-    const conflict = await withCtx((ctx) =>
-      commitWithClaimLocked(ctx, { operationId, requestDigest: "digest-b", payload: {} }, async () => {
-        throw new Error("produce must never run on a digest conflict");
-      })
-    );
-    expect(conflict.kind).toBe("conflict");
-  });
-
-  it("wires the \"after-claim\" fault point: a throw immediately after the claim reservation is durable leaves the claim reserved, stages nothing, and root/history stay untouched", async () => {
-    const operationId = randomUUID();
-    __setFaultActionForTests(() => {
-      throw new Error("simulated crash: after-claim");
-    });
-
-    await withCtx(async (ctx) => {
-      await withFaultPoint("after-claim", () =>
-        expect(
-          commitWithClaimLocked(ctx, { operationId, requestDigest: "digest-x", payload: {} }, async () => {
-            throw new Error("produce must never run -- the fault fires before it");
-          })
-        ).rejects.toThrow("simulated crash: after-claim")
-      );
-
-      // The claim is durably reserved but not yet terminal.
-      const midLookup = await lookupClaimLocked(ctx, operationId);
-      expect(midLookup).toEqual({ kind: "unknown", requestDigest: "digest-x" });
-
-      // No staging directory was ever created -- the fault fires before `produce` (staging) runs.
-      const txEntries = await readdir(transactionsDir(projectDir)).catch(() => []);
-      expect(txEntries).toEqual([]);
-      expect(await readFile(rootModelPath(projectDir), "utf8")).toBe("cube(1);\n");
-    });
-
-    // The NEXT boundary entry (a fresh `withRecoveredProject` call, `recover()`
-    // running automatically before this callback ever executes) recovers the
-    // orphaned pending claim to `aborted` (crash-table row 1: "Claim, ... no
-    // durable commit decision" -> aborted tombstone -- this crash boundary has
-    // no linked transaction directory at all for `recoverTransactionsLocked`
-    // to find, which is exactly why `recoverPendingClaimsLocked` exists) and
-    // reports it consistently from then on.
-    await withCtx(async (ctx) => {
-      const after = await lookupClaimLocked(ctx, operationId);
-      expect(after).toEqual({ kind: "definitely_not_committed", requestDigest: "digest-x", reason: "aborted", error: null });
-    });
-  });
-});
+// `commitWithClaimLocked` + its "after-claim" fault-point tests were removed
+// here (Issue #111): the driver itself had no production caller (B6's real
+// `submitEditorCommand` never called it) and is now deleted from
+// transaction.ts/index.ts. The replay-same-digest and digest-conflict cases
+// above were redundant with "claims: reserve / lookup / replay" (reserveClaimLocked
+// is exercised directly there); the unique after-claim crash-recovery
+// assertions now live in apps/server/src/services/scad-core-impl.test.ts,
+// exercised against the REAL `submitEditorCommand` path instead.

@@ -174,20 +174,33 @@ export { sourceFingerprint } from "./editor/canonical.js";
 // and `editor/sidecar.ts` internally via relative imports; exported here so
 // B6 (editor commands) and B8 (fault qualification) can drive the same
 // mechanism without reaching into `store/` by a relative path.
+//
+// `faultPoint`: production-safe to call unconditionally -- it is a no-op
+// unless `SCADFORGE_FAULT_POINT` names the exact boundary, so B6's real
+// `submitEditorCommand` path (apps/server) calls it directly rather than
+// through a test-only seam (Issue #111).
+//
+// `__setFaultActionForTests`: TEST-ONLY. Swaps the armed fault point's
+// action (default: self-`SIGKILL`, which B8's separate-process crash matrix
+// relies on) for a throwing stand-in, so an IN-PROCESS test in a consuming
+// package (e.g. apps/server's `scad-core-impl.test.ts`) can observe the
+// "after-claim" boundary firing on the real path without killing the test
+// runner. Arming stays env-var-only (`SCADFORGE_FAULT_POINT`) regardless --
+// this only changes what happens once armed, and only a test that explicitly
+// imports and calls it is ever affected.
 export {
   abortTransactionLocked,
-  commitWithClaimLocked,
   decideLocked,
   faultPoint,
   publishLocked,
   reconcileTransactionLocked,
   recoverPendingClaimsLocked,
   recoverTransactionsLocked,
-  stageTransactionLocked
+  stageTransactionLocked,
+  __setFaultActionForTests
 } from "./store/transaction.js";
 export type {
   CommitDecision,
-  CommitWithClaimResult,
   DecidedTransaction,
   FaultPointName,
   StagedTransaction,

@@ -72,6 +72,7 @@ import {
   editorRevision,
   exportRunWithValidation,
   exportsDir,
+  faultPoint,
   initProject,
   listSnapshots,
   lookupClaimLocked,
@@ -575,12 +576,20 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
             throw new ScadForgeError("CONFLICT", ABORTED_REPLAY_MESSAGE); // aborted
           }
 
-          // reserved.kind === "reserved" -- a genuinely fresh claim. Returns
-          // (never throws) the error to construct -- an explicit `throw` at
-          // each call site is what TypeScript's control-flow analysis
-          // reliably narrows on; a `never`-returning helper thrown FROM
-          // INSIDE itself does not narrow a caller's later reads the same
-          // way when only awaited, not thrown, at the call site.
+          // reserved.kind === "reserved" -- a genuinely fresh claim. Fires the
+          // "after-claim" fault point the instant this reservation is durable
+          // (Issue #111): the real editor-command path, not B4's dead
+          // `commitWithClaimLocked` driver. Never fires on a same-request
+          // replay or a conflict (both already returned/threw above) and
+          // always before any proof lookup or staging below -- inert unless
+          // `SCADFORGE_FAULT_POINT=after-claim` is set.
+          await faultPoint("after-claim");
+
+          // Returns (never throws) the error to construct -- an explicit
+          // `throw` at each call site is what TypeScript's control-flow
+          // analysis reliably narrows on; a `never`-returning helper thrown
+          // FROM INSIDE itself does not narrow a caller's later reads the
+          // same way when only awaited, not thrown, at the call site.
           const rejectionError = async (code: "VALIDATION_FAILED" | "CONFLICT", message: string): Promise<ScadForgeError> => {
             await recordClaimRejectedLocked(ctx, request.operationId, { error_code: code, message });
             return new ScadForgeError(code, message);
@@ -955,6 +964,15 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       // the commit can never be force-overwritten (Tech Lead correction:
       // "never hold the lock across the compile" -- two sequential entries,
       // never one held across the engine work, same pattern as `build`).
+      //
+      // NOTE: every throw inside this callback MUST be a `ScadForgeError`,
+      // never `apps/server`'s `RouteError` -- same convention as
+      // `submitEditorCommand` above (see its NOTE comment for why): a
+      // `RouteError` thrown here would be flattened by scad-core's own
+      // `withTypedError` to a generic `INTERNAL_ERROR`, silently losing this
+      // CONFLICT (Issue #109). `asRouteResult`/`toRouteError` still convert
+      // the `ScadForgeError` back into the equivalent `RouteError` once it
+      // propagates past this boundary.
       await asRouteResult(
         () =>
           withRecoveredProject(dir, async (ctx) => {
@@ -962,7 +980,7 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
             const currentScad = await readScadLocked(ctx);
             const currentParams = await readParamsLocked(ctx);
             if (computeSourceRevision(current.head, currentScad, currentParams) !== request.base_revision) {
-              throw new RouteError("CONFLICT", "Source changed while saving; refresh and retry.");
+              throw new ScadForgeError("CONFLICT", "Source changed while saving; refresh and retry.");
             }
             await createSnapshotLocked(ctx, {
               content: scad,
