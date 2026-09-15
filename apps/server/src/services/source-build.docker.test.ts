@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker — Issue #54's central requirements: the source CAS (coherent
 // head+source+params revision), the preflight dry run, the acknowledged
 // removed/incompatible overrides, the pinned build, and LF normalization.

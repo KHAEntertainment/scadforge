@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- Issue #45 regression suite: a snapshot's own files must never
 // change after creation, and validating/rendering/exporting must always
 // describe the snapshot it's attached to (its OWN persisted model/params),
