@@ -16,17 +16,38 @@
 // `FaultPointName` has 10 members, but only a SUBSET fires for each of this
 // ticket's three writer kinds -- `after-claim` and `after-publish-record`
 // only fire for a claim-linked editor-command commit (`commitWithClaimLocked`,
-// B6/Phase 2), and `after-publish-root-sidecar` only fires when a
-// transaction's `root.sidecar` is set, which NONE of these three writers do
-// (`store.ts`'s `buildSnapshotIntent`/`updateRootParamsLocked` never set it --
-// only B3's own sidecar-establishing transaction and a future editor commit
-// do). Testing a fault point a writer never reaches would hang the case
-// waiting for a `SIGKILL` that never comes, so each writer kind below is
+// B6/Phase 2). Testing a fault point a writer never reaches would hang the
+// case waiting for a `SIGKILL` that never comes, so each writer kind below is
 // matched against exactly the fault points its own `TransactionIntent`
-// exercises (verified by reading `buildSnapshotIntent` and
-// `updateRootParamsLocked` in `store.ts`); the three points above are
-// recorded as Phase 2 (editor-command) cells in the results artifact, not
-// silently dropped.
+// exercises (verified by reading `buildSnapshotIntent`/`updateRootParamsLocked`
+// in `store.ts`); those two points are recorded as Phase 2 (editor-command)
+// cells in the results artifact, not silently dropped.
+//
+// `after-publish-root-sidecar` DOES fire for `revert` and for a brand-new
+// project's first-ever snapshot (Issue #98 / S3-B ticket B6, F1 fix): this
+// suite originally found that `createSnapshotLocked` was not always ONE
+// staged transaction -- `sidecar.ts`'s `captureSidecarForSnapshotLocked`
+// used to embed its OWN separate stage/decide/publish transaction (`root:
+// { sidecar: bytes }` only) BEFORE the real snapshot transaction, whenever
+// the current sidecar read as `legacy-empty` (true for a brand-new project's
+// very first snapshot, and unconditionally for `revertToSnapshotLocked`, via
+// `writeSidecarBytesLocked`). Both embedded transactions shared the
+// IDENTICAL fault-point names as every other staged transaction, so a
+// process kill armed with one of those names always landed on whichever
+// transaction was reached FIRST -- observably, the embedded sidecar
+// transaction could itself commit and roll forward while the OUTER
+// operation (the actual new snapshot / the actual revert) never started and
+// was never retried: a completed-looking root `editor.json` write with no
+// corresponding new history entry, a MIXED ROOT. B6's F1 fix (`store.ts`'s
+// `buildSnapshotIntent` now always stages `root.sidecar` itself, in the SAME
+// transaction as everything else; `captureSidecarForSnapshotLocked` is a
+// pure read; `revertToSnapshotLocked` passes the target sidecar through
+// `createSnapshotLocked`'s own `opts.sidecar` instead of writing it
+// separately) closes this: `revert` and a project's first snapshot are now
+// each exactly ONE transaction, so `SIDECAR_STAGING_SNAPSHOT_POINTS` below
+// (`PARAMS_SNAPSHOT_POINTS` plus `after-publish-root-sidecar`, in its actual
+// chronological publish position) covers both completely -- there is no
+// "embedded" transaction left to test separately.
 //
 // ── DURABILITY / DETERMINISM ────────────────────────────────────────────
 //
@@ -50,6 +71,7 @@ import {
   rootParamsPath
 } from "@scadforge/scad-core";
 import type { ParamValues } from "@scadforge/scad-core";
+import { sidecarPath } from "./paths.js";
 import type { FaultPointName } from "./transaction.js";
 import {
   assertFaultPointEnvClean,
@@ -105,39 +127,21 @@ const PARAMS_SNAPSHOT_POINTS: readonly FaultPointName[] = [
 /** `mergeParamsAtomic` + `updateRootParamsLocked` (snapshot:false) -- root: params ONLY. */
 const PARAMS_NOSNAPSHOT_POINTS: readonly FaultPointName[] = ["after-partial-staging", "after-full-staging", "after-commit", "after-publish-root-params"];
 
-// ── FINDING (recorded here, reported to the Tech Lead -- not fixed in this
-// PR, per the ticket's own instruction): a project's `createSnapshotLocked`
-// is not always ONE staged transaction under one lock hold. `sidecar.ts`'s
-// `captureSidecarForSnapshotLocked` embeds its OWN separate stage/decide/
-// publish transaction (`root: { sidecar: bytes }` only) BEFORE the real
-// snapshot transaction, whenever the current sidecar reads as
-// "legacy-empty" -- true for a brand-new project's very FIRST snapshot
-// (`initProjectLocked`'s own `createSnapshotLocked` call), and, separately,
-// `revertToSnapshotLocked` calls `writeSidecarBytesLocked` (the SAME
-// mechanism) UNCONDITIONALLY before its own `createSnapshotLocked` call.
-// Both embedded transactions share the IDENTICAL fault-point names
-// (`after-partial-staging`/`after-full-staging`/`after-commit`/
-// `after-publish-root-sidecar`) as every other staged transaction, so a
-// process kill armed with one of those names always lands on whichever
-// transaction is reached FIRST -- observably: the embedded sidecar
-// transaction may itself commit and roll forward cleanly on recovery, while
-// the OUTER operation (the actual new snapshot / the actual revert) never
-// starts in that process, and IS NEVER RETRIED -- no error is ever
-// surfaced to the original caller (the process just died), yet a
-// completed-looking write (root `editor.json`) is left on disk with no
-// corresponding new history entry. Both cases below name this explicitly.
-const EMBEDDED_SIDECAR_TRANSACTION_POINTS: readonly FaultPointName[] = [
+// ── FIXED (Issue #98 / S3-B ticket B6, F1): see the module header for the
+// original finding this suite made against B4/B3 and how B6's rebase onto
+// this PR fixed it. `revert` and a brand-new project's first snapshot are
+// now each exactly ONE transaction, and that transaction ALWAYS stages
+// `root.sidecar` (either the caller's override, for revert, or the default
+// capture, which is never again a separate write) -- so the SAME point set
+// applies to both, in the transaction's actual chronological publish order.
+const SIDECAR_STAGING_SNAPSHOT_POINTS: readonly FaultPointName[] = [
   "after-partial-staging",
   "after-full-staging",
   "after-commit",
-  "after-publish-root-sidecar"
-];
-
-/** `revertToSnapshot`'s OUTER `createSnapshotLocked` call, reached only once the embedded sidecar transaction above has already fully finished -- identical intent shape to `PARAMS_SNAPSHOT_POINTS`, minus the three points already proven unreachable-in-isolation by the finding above (they always land on the embedded transaction first; that transaction's own code path is `createSnapshotLocked`'s STAGING/DECIDE machinery already independently proven by the params-snapshot matrix above). */
-const REVERT_OUTER_TRANSACTION_POINTS: readonly FaultPointName[] = [
   "after-publish-history",
   "after-publish-root-source",
   "after-publish-root-params",
+  "after-publish-root-sidecar",
   "after-publish-project"
 ];
 
@@ -316,63 +320,48 @@ describe("crash matrix: params-nosnapshot write (PUT /params, snapshot:false)", 
 });
 
 describe("crash matrix: revert", () => {
-  describe("embedded sidecar copy-forward transaction (writeSidecarBytesLocked, ALWAYS runs first -- see the FINDING above)", () => {
-    for (const faultPoint of EMBEDDED_SIDECAR_TRANSACTION_POINTS) {
-      it(`${faultPoint} -> the revert operation never completes in this process: no new snapshot, root model/params/head untouched`, async () => {
-        const dir = await freshProjectDir();
-        await initFixture(dir, "fault-revert-sidecar", "cube(1);", {}); // 0001: params {}
-        await paramsWriteFixture(dir, { a: 1 }, true); // 0002: params {a:1}
-        const before = await readRootState(dir);
-        expect(before.head).toBe("0002");
+  // F1 fix (Issue #98): revert is now exactly ONE transaction -- the
+  // target's sidecar copy-forward is staged as `root.sidecar` in the SAME
+  // `commit.json` as the new snapshot, never a separate write first. A
+  // pre-decide fault therefore leaves EVERYTHING untouched, root
+  // `editor.json` included (no more mixed root); a post-decide fault rolls
+  // the whole thing forward together.
+  for (const faultPoint of SIDECAR_STAGING_SNAPSHOT_POINTS) {
+    const committed = isCommittedAt(faultPoint);
+    it(`${faultPoint} -> ${committed ? "committed, rolls forward" : "aborted, old state intact including root editor.json"}`, async () => {
+      const dir = await freshProjectDir();
+      await initFixture(dir, "fault-revert", "cube(1);", {}); // 0001: params {}
+      await paramsWriteFixture(dir, { a: 1 }, true); // 0002: params {a:1}
+      const before = await readRootState(dir);
+      const beforeSidecar = await readFile(sidecarPath(dir), "utf8").catch(() => null);
+      expect(before.head).toBe("0002");
 
-        const result = await runDriverToCompletion("revert", [], {
-          faultPoint,
-          env: { SCADFORGE_DRIVER_PROJECT_DIR: dir, SCADFORGE_DRIVER_TARGET_ID: "0001" }
-        });
-        expect(result.signal).toBe("SIGKILL");
+      const result = await runDriverToCompletion("revert", [], {
+        faultPoint,
+        env: { SCADFORGE_DRIVER_PROJECT_DIR: dir, SCADFORGE_DRIVER_TARGET_ID: "0001" }
+      });
+      expect(result.signal).toBe("SIGKILL");
 
-        // Whether the embedded transaction itself committed or aborted, the
-        // OUTER revert (a new snapshot 0003 with 0001's params restored)
-        // never started in this process and is never retried -- this is the
-        // FINDING documented above, not a mixed-root defect: root
-        // model/params/head are exactly as they were before the attempt, and
-        // no partial "0003" history entry ever appears.
-        const after = await readRootState(dir);
-        await assertRootCoherentWithHead(dir);
+      const after = await readRootState(dir);
+      const afterSidecar = await readFile(sidecarPath(dir), "utf8").catch(() => null);
+      await assertRootCoherentWithHead(dir);
+
+      if (committed) {
+        expect(after.head).toBe("0003");
+        expect(after.snapshotIds).toEqual(["0001", "0002", "0003"]);
+        expect(after.params).toEqual({}); // 0001's own params, restored wholesale
+      } else {
+        // No mixed root: model/params/head AND the root sidecar are all
+        // exactly as they were before the attempt -- never a partial "0003"
+        // history entry, never a sidecar write with no matching snapshot.
         expect(after.head).toBe(before.head);
         expect(after.snapshotIds).toEqual(before.snapshotIds);
         expect(after.params).toEqual(before.params);
         expect(after.model).toBe(before.model);
-      }, 15000);
-    }
-  });
-
-  describe("outer snapshot-creation transaction (createSnapshotLocked, reached only once the embedded step above has already finished)", () => {
-    for (const faultPoint of REVERT_OUTER_TRANSACTION_POINTS) {
-      it(`${faultPoint} -> committed, rolls forward`, async () => {
-        const dir = await freshProjectDir();
-        await initFixture(dir, "fault-revert-outer", "cube(1);", {}); // 0001: params {}
-        await paramsWriteFixture(dir, { a: 1 }, true); // 0002: params {a:1}
-        const before = await readRootState(dir);
-        expect(before.head).toBe("0002");
-
-        const result = await runDriverToCompletion("revert", [], {
-          faultPoint,
-          env: { SCADFORGE_DRIVER_PROJECT_DIR: dir, SCADFORGE_DRIVER_TARGET_ID: "0001" }
-        });
-        expect(result.signal).toBe("SIGKILL");
-
-        // Every point in this group is only ever reached AFTER the embedded
-        // sidecar transaction fully finished uneventfully, so the outer
-        // revert transaction itself is what commits and rolls forward here.
-        const after = await readRootState(dir);
-        await assertRootCoherentWithHead(dir);
-        expect(after.head).toBe("0003");
-        expect(after.snapshotIds).toEqual(["0001", "0002", "0003"]);
-        expect(after.params).toEqual({}); // 0001's own params, restored wholesale
-      }, 15000);
-    }
-  });
+        expect(afterSidecar).toBe(beforeSidecar);
+      }
+    }, 15000);
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -382,81 +371,59 @@ describe("crash matrix: revert", () => {
 // `initProjectLocked` writes the bootstrap `project.json` directly (no
 // `.scadforge/` exists yet for the transaction mechanism to stage into) and
 // only THEN creates its first snapshot through the normal staged
-// transaction -- whose OWN sidecar capture ALSO embeds a separate
-// transaction here, because a brand-new project's sidecar always reads as
-// "legacy-empty" (the FINDING documented above at
-// `EMBEDDED_SIDECAR_TRANSACTION_POINTS`). So a project's first-ever
-// snapshot is, on disk, the SAME two-transaction shape as `revert`: this
-// group proves the embedded transaction's crash cells (the operation never
-// completes: `project.json` keeps `head: null`, exactly the bootstrap
-// window the B4 review named), and the second group proves the OUTER
-// (real first-snapshot) transaction's own points, reached only once the
-// embedded one has already finished.
+// transaction. A brand-new project's sidecar always reads as
+// `legacy-empty`, so (post-F1) this first snapshot's ONE transaction always
+// stages `root.sidecar` too -- the same `SIDECAR_STAGING_SNAPSHOT_POINTS`
+// set `revert` uses above. A pre-decide fault here is exactly the bootstrap
+// window the B4 review named: `project.json` keeps `head: null`, no partial
+// "0001" ever appears -- and (Issue #98 F2) an immediate retry against the
+// same directory now recovers cleanly, rather than wedging on
+// `claimNextSnapshotId`'s old age-gated orphan reclaim.
 
 describe("project bootstrap window", () => {
-  describe("embedded sidecar-establishment transaction (a brand-new project's sidecar always reads legacy-empty -- see the FINDING above)", () => {
-    for (const faultPoint of EMBEDDED_SIDECAR_TRANSACTION_POINTS) {
-      it(`${faultPoint} -> the project's first snapshot never completes in this process: project.json keeps head:null, no partial "0001"`, async () => {
-        const dir = await freshProjectDir();
-        const result = await runDriverToCompletion("init", [], {
-          faultPoint,
-          env: {
-            SCADFORGE_DRIVER_PROJECT_DIR: dir,
-            SCADFORGE_DRIVER_PROJECT_ID: "fault-bootstrap",
-            SCADFORGE_DRIVER_CONTENT_B64: b64("cube(1);")
-          }
-        });
-        expect(result.signal).toBe("SIGKILL");
-
-        // Observation 1: a plain read recovers cleanly -- bootstrap
-        // project.json intact, head still null, no partial "0001" entry.
-        const afterRead = await readRootState(dir);
-        expect(afterRead.head).toBeNull();
-        expect(afterRead.snapshotIds).toEqual([]);
-
-        // Observation 2: a RETRIED create against the same directory.
-        // Recorded here, not asserted pass/fail against a spec this ticket
-        // does not own -- if this throws or leaves an incoherent state, that
-        // is a FINDING against B4, reported to the Tech Lead, not fixed in
-        // this PR.
-        const retry = await initFixture(dir, "fault-bootstrap", "cube(1);", {}).then(
-          () => ({ outcome: "recovered" as const }),
-          (err: unknown) => ({ outcome: "refused" as const, message: err instanceof Error ? err.message : String(err) })
-        );
-        if (retry.outcome === "recovered") {
-          const finalState = await readRootState(dir);
-          expect(finalState.head).toBe("0001");
-          expect(finalState.snapshotIds).toEqual(["0001"]);
+  for (const faultPoint of SIDECAR_STAGING_SNAPSHOT_POINTS) {
+    const committed = isCommittedAt(faultPoint);
+    it(`${faultPoint} -> ${committed ? "committed, the project's first-ever snapshot rolls forward normally" : 'aborted; project.json keeps head:null, no partial "0001", and an immediate retry recovers (Issue #98 F2)'}`, async () => {
+      const dir = await freshProjectDir();
+      const result = await runDriverToCompletion("init", [], {
+        faultPoint,
+        env: {
+          SCADFORGE_DRIVER_PROJECT_DIR: dir,
+          SCADFORGE_DRIVER_PROJECT_ID: "fault-bootstrap",
+          SCADFORGE_DRIVER_CONTENT_B64: b64("cube(1);")
         }
-        // A "refused" retry is recorded in the results artifact verbatim, not
-        // asserted against here -- either outcome is "clean" as long as it
-        // did not corrupt the project; a corrupt result would already fail
-        // `readRootState` above.
-      }, 15000);
-    }
-  });
+      });
+      expect(result.signal).toBe("SIGKILL");
 
-  describe("outer first-snapshot transaction (reached only once the embedded step above has already finished)", () => {
-    for (const faultPoint of REVERT_OUTER_TRANSACTION_POINTS) {
-      it(`${faultPoint} -> committed, the project's first-ever snapshot rolls forward normally`, async () => {
-        const dir = await freshProjectDir();
-        const result = await runDriverToCompletion("init", [], {
-          faultPoint,
-          env: {
-            SCADFORGE_DRIVER_PROJECT_DIR: dir,
-            SCADFORGE_DRIVER_PROJECT_ID: "fault-bootstrap-committed",
-            SCADFORGE_DRIVER_CONTENT_B64: b64("cube(1);")
-          }
-        });
-        expect(result.signal).toBe("SIGKILL");
-
+      if (committed) {
         const after = await readRootState(dir);
         await assertRootCoherentWithHead(dir);
         expect(after.head).toBe("0001");
         expect(after.snapshotIds).toEqual(["0001"]);
-      }, 15000);
-    }
-  });
+        return;
+      }
+
+      // Pre-decide: bootstrap project.json intact, head still null, no
+      // partial "0001" entry.
+      const afterRead = await readRootState(dir);
+      expect(afterRead.head).toBeNull();
+      expect(afterRead.snapshotIds).toEqual([]);
+
+      // A retry against the same directory now recovers IMMEDIATELY (Issue
+      // #98 F2: claimNextSnapshotId reclaims an empty, manifest-less
+      // orphaned claim directory under the lock without waiting
+      // ORPHANED_CLAIM_MIN_AGE_MS) -- pinned as a regression guard, not
+      // merely recorded, per the Tech Lead's addendum on this suite.
+      const retry = await initFixture(dir, "fault-bootstrap", "cube(1);", {}).then(
+        () => ({ outcome: "recovered" as const }),
+        (err: unknown) => ({ outcome: "refused" as const, message: err instanceof Error ? err.message : String(err) })
+      );
+      expect(retry.outcome).toBe("recovered");
+      const finalState = await readRootState(dir);
+      expect(finalState.head).toBe("0001");
+      expect(finalState.snapshotIds).toEqual(["0001"]);
+    }, 15000);
+  }
 });
 
 // ═════════════════════════════════════════════════════════════════════════

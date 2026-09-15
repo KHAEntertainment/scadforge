@@ -9,12 +9,10 @@
 // specifically, against a hand-built project skeleton (mirrors
 // `transaction.test.ts`'s own isolation convention).
 //
-// SnapshotOrigin interim (Tech Lead ruling): the frozen protocol's
-// `SnapshotOrigin` does not yet include "editor" -- a separate contract-fix
-// PR is landing that on `feat/s3-b-recoverable-store` (same flow as #93/
-// #94). Until this branch rebases onto it, editor commits stage with
-// EDITOR_SNAPSHOT_ORIGIN ("manual") instead; flip this constant to "editor"
-// once the contract fix merges.
+// SnapshotOrigin (Tech Lead ruling, PR #105, merged): the frozen protocol's
+// SnapshotOrigin now includes "editor" -- editor commits stage with that
+// literal, named here for the same reason apps/server's scad-core-impl.ts
+// names its own copy.
 
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -40,8 +38,7 @@ import type { LockedProject } from "./recovered.js";
 import { createSnapshotLocked } from "./store.js";
 import { __setFaultActionForTests } from "./transaction.js";
 
-// TODO(#<SnapshotOrigin contract-fix issue>): "editor" once that PR merges.
-const EDITOR_SNAPSHOT_ORIGIN: SnapshotOrigin = "manual";
+const EDITOR_SNAPSHOT_ORIGIN: SnapshotOrigin = "editor";
 
 const PROVIDER = { provider: "claude-agent-sdk", model: null, max_passes: 2 };
 const PROJECT_ID = "hinged-box";
