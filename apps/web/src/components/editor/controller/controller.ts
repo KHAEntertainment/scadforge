@@ -121,7 +121,7 @@ export class TransactionController {
     // resolving the server's own revision check governs instead (a stale
     // commit comes back as a definite CONFLICT), so leave those alone.
     if (inputs.externalWriteUnsettled && isActiveGesture(this.current)) {
-      this.abortActiveGesture();
+      this.abortForExternalWrite();
     }
     this.recomputeIdleDisabled();
   }
@@ -173,8 +173,14 @@ export class TransactionController {
   private recomputeIdleDisabled(): void {
     if (this.current.kind !== "idle" && this.current.kind !== "disabled") return;
     const reason = this.computeDisabledReason();
-    if (reason) this.setState({ kind: "disabled", reason });
-    else this.setState({ kind: "idle" });
+    if (reason) {
+      // Semantically unchanged — no fresh object, no notify.
+      if (this.current.kind === "disabled" && this.current.reason === reason) return;
+      this.setState({ kind: "disabled", reason });
+    } else {
+      if (this.current.kind === "idle") return;
+      this.setState({ kind: "idle" });
+    }
   }
 
   // ── begin / propose / cancel (spec §3.1–§3.5) ────────────────────────────
@@ -188,7 +194,11 @@ export class TransactionController {
     if (eligibility?.state === "unsupported") return { ok: false, reason: "feature-unsupported" };
     if (eligibility?.state === "requires-proof") {
       const proof = input.freshProof;
-      if (!proof || this.deps.clock() >= Date.parse(proof.expiresAt)) {
+      // An `expiresAt` that fails to parse (NaN) must count as EXPIRED, not
+      // valid — `clock() >= NaN` is always false, which would otherwise let
+      // an unparseable proof through as though it never expires.
+      const expiresAtMs = proof ? Date.parse(proof.expiresAt) : NaN;
+      if (!proof || !Number.isFinite(expiresAtMs) || this.deps.clock() >= expiresAtMs) {
         return { ok: false, reason: "proof-required" };
       }
     }
@@ -203,6 +213,14 @@ export class TransactionController {
     if (this.current.kind !== "gesture" && this.current.kind !== "preview-pending" && this.current.kind !== "preview-ok") {
       return { ok: false, reason: "not-in-gesture" };
     }
+    // A non-finite candidate would also defeat the no-op guard below
+    // (`NaN === base` is always false), letting NaN/±Infinity reach
+    // preview-pending and eventually verify/commit.
+    if (!Number.isFinite(candidate)) return { ok: false, reason: "non-finite-candidate" };
+    // A finalize/submitVerified call already captured a candidate value and
+    // is waiting on the port for it; changing the candidate underneath that
+    // wait could let a later confirmation commit a stale value.
+    if (this.pendingCommit) return { ok: false, reason: "finalize-pending" };
     const begin = this.current.begin;
 
     // No-op short-circuit (§3.5): zero port writes beyond realignment, zero
@@ -232,7 +250,7 @@ export class TransactionController {
       case "preview-pending":
       case "preview-ok":
       case "preview-failed":
-        this.abortActiveGesture();
+        this.abortViaCancel(reason);
         return;
       case "committing":
       case "resolving":
@@ -245,8 +263,26 @@ export class TransactionController {
     }
   }
 
-  /** Shared by the six `cancel` reasons and R4's external-write invalidation: zero network, no log entry. */
-  private abortActiveGesture(): void {
+  /**
+   * The six `cancel` reasons (spec §3.4): every one converges on
+   * `cancelling → idle`, both transitions observable to subscribers, with
+   * zero network request and zero log entry.
+   */
+  private abortViaCancel(reason: CancelReason): void {
+    const pending = this.pendingCommit;
+    this.pendingCommit = null;
+    this.port.reset(this.freshPortGeneration());
+    this.setState({ kind: "cancelling", reason });
+    this.setState({ kind: "idle" });
+    pending?.resolve({ kind: "cancelled" });
+  }
+
+  /**
+   * R4's external-write invalidation: NOT a seventh `CancelReason` and NOT
+   * routed through `cancelling` — the spec's cancel-reason convergence is
+   * for the six typed reasons only. Same zero-network/zero-log guarantee.
+   */
+  private abortForExternalWrite(): void {
     const pending = this.pendingCommit;
     this.pendingCommit = null;
     this.port.reset(this.freshPortGeneration());
@@ -306,6 +342,14 @@ export class TransactionController {
         this.pendingCommit = {
           resolve,
           proceed: () => {
+            // Guard (spec §3.3): "candidate equals the latest port value".
+            // `propose` now refuses while a pendingCommit exists, so this
+            // should be unreachable in practice — kept as a defensive
+            // invariant check rather than committing a stale value.
+            if (this.current.kind !== "preview-ok" || this.current.candidate.value !== candidateValue) {
+              resolve({ kind: "cancelled" });
+              return;
+            }
             this.sendCommit(this.buildSetValueCommand(begin, candidateValue), proof, "edit", null).then(resolve);
           }
         };
@@ -336,6 +380,13 @@ export class TransactionController {
         this.pendingCommit = {
           resolve,
           proceed: () => {
+            // Same defensive invariant as `finalize` — unreachable in
+            // practice now that `propose` refuses while a pendingCommit
+            // exists, but never send on an unexpected state.
+            if (this.current.kind !== "preview-ok") {
+              resolve({ kind: "cancelled" });
+              return;
+            }
             this.sendCommit(command, proof, intent, traversal).then(resolve);
           }
         };
@@ -435,8 +486,21 @@ export class TransactionController {
    * `submitVerified` with `{ kind: "detached" }` so C3 can record a pending
    * navigation receipt. Returns the operation ID that was in flight, or
    * `null` if nothing was.
+   *
+   * Also settles a `finalize`/`submitVerified` still waiting on the port
+   * (`preview-pending`, no operation minted yet) with `{ kind: "cancelled" }`
+   * — never a hung promise.
    */
   detach(): string | null {
+    const pending = this.pendingCommit;
+    if (pending) {
+      this.pendingCommit = null;
+      this.port.reset(this.freshPortGeneration());
+      this.setState({ kind: "idle" });
+      this.recomputeIdleDisabled();
+      pending.resolve({ kind: "cancelled" });
+    }
+
     const record = this.activeCommit;
     if (!record) return null;
     record.aborted = true;

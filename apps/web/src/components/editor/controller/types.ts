@@ -134,9 +134,16 @@ export type BeginRefusalReason =
 
 export type BeginResult = { ok: true } | { ok: false; reason: BeginRefusalReason };
 
+export type ProposeRefusalReason =
+  | "not-in-gesture"
+  /** `Number.isFinite(candidate)` is false — NaN/±Infinity would also defeat the no-op guard (`NaN === base` is always false). */
+  | "non-finite-candidate"
+  /** A `finalize`/`submitVerified` call is already waiting on the port; changing the candidate underneath it could commit a stale value (spec §3.3's "candidate equals the latest port value" guard). */
+  | "finalize-pending";
+
 export type ProposeResult =
   | { ok: true; state: ControllerState }
-  | { ok: false; reason: "not-in-gesture" }
+  | { ok: false; reason: ProposeRefusalReason }
   /** No-op short-circuit (spec §3.5): candidate equals the authoritative value. Zero side effects. */
   | { ok: true; noOp: true };
 

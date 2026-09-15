@@ -162,6 +162,24 @@ describe("TransactionController", () => {
     expect(client.lookups).toHaveLength(0);
   });
 
+  it.each([
+    ["NaN", NaN],
+    ["Infinity", Infinity],
+    ["-Infinity", -Infinity]
+  ])("propose refuses a non-finite candidate (%s) with no state change", (_label, candidate) => {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+    controller.begin(makeBeginInput({ baseValue: 40 }));
+
+    // NaN would also defeat the no-op guard above (`NaN === 40` is false),
+    // so without this refusal a NaN candidate would reach preview-pending.
+    const result = controller.propose(candidate, "typed");
+
+    expect(result).toEqual({ ok: false, reason: "non-finite-candidate" });
+    expect(controller.state()).toEqual({ kind: "gesture", begin: makeBeginInput({ baseValue: 40 }) });
+    expect(client.commits).toHaveLength(0);
+  });
+
   // ── begin guards (spec §3.3; AC 1, 4, 6) ──────────────────────────────────
 
   it("controller_begin_refuses_when_params_pending", () => {
@@ -202,6 +220,23 @@ describe("TransactionController", () => {
       makeBeginInput({
         eligibility: { featureId: "feature-1", state: "requires-proof", reason: "changed" },
         freshProof: makeProof({ expiresAt: "2025-01-01T00:00:00.000Z" })
+      })
+    );
+
+    expect(result).toEqual({ ok: false, reason: "proof-required" });
+  });
+
+  it("begin fails closed when the proof's expiresAt does not parse (GLM Q1)", () => {
+    const { deps } = makeDeps();
+    const controller = new TransactionController(deps);
+
+    // `Date.parse` returns NaN for garbage input; `clock() >= NaN` is always
+    // false, which would otherwise let an unparseable proof through as
+    // though it never expires.
+    const result = controller.begin(
+      makeBeginInput({
+        eligibility: { featureId: "feature-1", state: "requires-proof", reason: "changed" },
+        freshProof: makeProof({ expiresAt: "not-a-date" })
       })
     );
 
@@ -328,6 +363,44 @@ describe("TransactionController", () => {
     expect(controller.state()).toEqual({ kind: "idle" });
   });
 
+  it("cancel observably transitions through cancelling before idle", () => {
+    const { deps } = makeDeps();
+    const controller = new TransactionController(deps);
+    controller.begin(makeBeginInput());
+    controller.propose(43, "drag");
+
+    const observed: string[] = [];
+    controller.subscribe(() => observed.push(controller.state().kind));
+
+    controller.cancel("escape");
+
+    expect(observed).toEqual(["cancelling", "idle"]);
+    expect(controller.state()).toEqual({ kind: "idle" });
+  });
+
+  it("propose refuses while a finalize/submitVerified call is already waiting on the port", async () => {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+    controller.begin(makeBeginInput());
+    controller.propose(43, "typed");
+    const state = controller.state();
+    if (state.kind !== "preview-pending") throw new Error("expected preview-pending");
+
+    client.queueCommitOutcome(definiteCommitted(makeReceipt()));
+    const finalizePromise = controller.finalize(makeProof());
+
+    // A later propose must not be allowed to swap the candidate out from
+    // under the waiting finalize (spec §3.3: "candidate equals the latest
+    // port value").
+    const result = controller.propose(44, "typed");
+
+    expect(result).toEqual({ ok: false, reason: "finalize-pending" });
+
+    controller.portWriter.write({ value: 43, generation: state.portGeneration });
+    const outcome = await finalizePromise;
+    expect(outcome.kind).toBe("committed");
+  });
+
   // ── commit (spec §5–§6.3, Tech-Lead R1–R2 rulings) ───────────────────────
 
   it("controller_commit_sends_exactly_one_post_per_accepted_receipt", async () => {
@@ -379,6 +452,30 @@ describe("TransactionController", () => {
     expect(result).toEqual({ kind: "detached", operationId });
   });
 
+  it("detach settles a finalize still waiting on the port (preview-pending) as cancelled", async () => {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+    controller.begin(makeBeginInput());
+    controller.propose(43, "typed");
+    const state = controller.state();
+    if (state.kind !== "preview-pending") throw new Error("expected preview-pending");
+
+    const finalizePromise = controller.finalize(makeProof());
+
+    const operationId = controller.detach();
+
+    // No operation was ever minted — the wait was abandoned before any POST.
+    expect(operationId).toBeNull();
+    expect(controller.state()).toEqual({ kind: "idle" });
+    const result = await finalizePromise;
+    expect(result).toEqual({ kind: "cancelled" });
+    expect(client.commits).toHaveLength(0);
+
+    // A later port write for the abandoned wait must not resurrect it.
+    controller.portWriter.write({ value: 43, generation: state.portGeneration });
+    expect(controller.state()).toEqual({ kind: "idle" });
+  });
+
   describe("resolving backoff (fake timers)", () => {
     beforeEach(() => {
       vi.useFakeTimers();
@@ -389,6 +486,12 @@ describe("TransactionController", () => {
     });
 
     it("controller_commit_idempotent_replay_returns_original_receipt", async () => {
+      // Controller-side meaning of "idempotent replay": the controller never
+      // sends a second POST for the same attempt. When the first commit()
+      // is transport-ambiguous, the controller's own "retry" IS the
+      // resolving poll — GET .../operations/:operationId under the SAME
+      // operation ID — and the server's replay guarantee means that poll
+      // can return the ORIGINAL receipt for a commit that actually landed.
       const { deps, client } = makeDeps();
       const controller = new TransactionController(deps);
       controller.begin(makeBeginInput());
@@ -403,7 +506,40 @@ describe("TransactionController", () => {
       const result = await resultPromise;
 
       expect(result).toEqual({ kind: "committed", receipt });
+      // Exactly one POST was ever sent; the poll is not a second POST.
+      expect(client.commits).toHaveLength(1);
+      expect(client.lookups).toHaveLength(1);
       expect(client.lookups[0].operationId).toBe(client.commits[0].request.operationId);
+      expect(receipt.operationId).toBe(client.commits[0].request.operationId);
+    });
+
+    it("R3 poll path: a committed answer arriving via a resolving poll also stays committing until coherent", async () => {
+      const { deps, client } = makeDeps();
+      const controller = new TransactionController(deps);
+      controller.begin(makeBeginInput());
+      reachPreviewOk(controller, 43);
+      const receipt = makeReceipt({ editorRevision: "9".repeat(64) });
+      client.queueCommitOutcome(ambiguous("network-error"));
+      client.queueLookupOutcome(definiteCommitted(receipt));
+
+      const resultPromise = controller.finalize(makeProof());
+      await flushMicrotasks();
+      expect(controller.state().kind).toBe("resolving");
+
+      await vi.advanceTimersByTimeAsync(500);
+      const result = await resultPromise;
+
+      expect(result).toEqual({ kind: "committed", receipt });
+      // The receipt arrived through a POLL, not the initial response, but
+      // R3's coherence wait applies identically: stay committing until the
+      // host confirms this exact editorRevision.
+      expect(controller.state()).toMatchObject({ kind: "committing", receipt });
+
+      controller.notifyDocumentRevision("stale".padEnd(64, "0"));
+      expect(controller.state().kind).toBe("committing");
+
+      controller.notifyDocumentRevision(receipt.editorRevision);
+      expect(controller.state()).toEqual({ kind: "idle" });
     });
 
     it("controller_commit_ambiguous_transition_to_resolving_then_idle", async () => {
@@ -627,6 +763,23 @@ describe("TransactionController", () => {
     controller.setGuardInputs(idleGuardInputs(patch));
 
     expect(controller.state()).toEqual({ kind: "disabled", reason });
+  });
+
+  it("does not notify subscribers when a guard-input push leaves the disabled reason unchanged (GLM A5)", () => {
+    const { deps } = makeDeps();
+    const controller = new TransactionController(deps);
+    controller.setGuardInputs(idleGuardInputs({ paramsDirty: true }));
+    expect(controller.state()).toEqual({ kind: "disabled", reason: "params-pending" });
+
+    const listener = vi.fn();
+    controller.subscribe(listener);
+
+    // A second, semantically-identical push (e.g. an unrelated re-render
+    // upstream) must not produce a fresh object or a notification.
+    controller.setGuardInputs(idleGuardInputs({ paramsDirty: true }));
+
+    expect(listener).not.toHaveBeenCalled();
+    expect(controller.state()).toEqual({ kind: "disabled", reason: "params-pending" });
   });
 
   // ── Q4 second-tab detection ──────────────────────────────────────────────
