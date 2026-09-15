@@ -964,6 +964,15 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
       // the commit can never be force-overwritten (Tech Lead correction:
       // "never hold the lock across the compile" -- two sequential entries,
       // never one held across the engine work, same pattern as `build`).
+      //
+      // NOTE: every throw inside this callback MUST be a `ScadForgeError`,
+      // never `apps/server`'s `RouteError` -- same convention as
+      // `submitEditorCommand` above (see its NOTE comment for why): a
+      // `RouteError` thrown here would be flattened by scad-core's own
+      // `withTypedError` to a generic `INTERNAL_ERROR`, silently losing this
+      // CONFLICT (Issue #109). `asRouteResult`/`toRouteError` still convert
+      // the `ScadForgeError` back into the equivalent `RouteError` once it
+      // propagates past this boundary.
       await asRouteResult(
         () =>
           withRecoveredProject(dir, async (ctx) => {
@@ -971,7 +980,7 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
             const currentScad = await readScadLocked(ctx);
             const currentParams = await readParamsLocked(ctx);
             if (computeSourceRevision(current.head, currentScad, currentParams) !== request.base_revision) {
-              throw new RouteError("CONFLICT", "Source changed while saving; refresh and retry.");
+              throw new ScadForgeError("CONFLICT", "Source changed while saving; refresh and retry.");
             }
             await createSnapshotLocked(ctx, {
               content: scad,

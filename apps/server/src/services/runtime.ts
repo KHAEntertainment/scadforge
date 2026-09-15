@@ -112,13 +112,27 @@ export async function readScad(dir: string): Promise<string> {
   return asRouteResult(() => withRecoveredProject(dir, (ctx) => readScadLocked(ctx)), "failed to read model.scad");
 }
 
-/** `ctx`-taking sibling of {@link readScad}, for a caller composing this read with other locked reads under one boundary entry. */
+/**
+ * `ctx`-taking sibling of {@link readScad}, for a caller composing this read
+ * with other locked reads under one boundary entry. Every throw here MUST be
+ * a `ScadForgeError`, never a `RouteError` — this runs inside
+ * `withRecoveredProject`'s callback (directly, or transitively through
+ * another `*Locked` helper), which wraps the whole callback in scad-core's
+ * own `withTypedError`. That wrapper only preserves the code of an
+ * already-`ScadForgeError`; a `RouteError` (a class scad-core has never heard
+ * of) would be flattened to a fresh, re-wrapped `INTERNAL_ERROR` instead of
+ * propagating cleanly. `asRouteResult`/`toRouteError` still convert the
+ * `ScadForgeError` back into the equivalent `RouteError` once it reaches a
+ * caller OUTSIDE the lock (`readScad` below), so the wire-visible status is
+ * unaffected either way -- only the class thrown FROM INSIDE the lock
+ * matters (same convention as `scad-core-impl.ts`'s `submitEditorCommand`).
+ */
 export async function readScadLocked(ctx: LockedProject): Promise<string> {
   try {
     return await readFile(rootModelPath(ctx.projectDir), "utf8");
   } catch (err) {
     if (isEnoent(err)) return "";
-    throw toRouteError(err, "failed to read model.scad");
+    throw ScadForgeError.normalize(err, "INTERNAL_ERROR", "failed to read model.scad");
   }
 }
 
@@ -135,20 +149,20 @@ export async function readParams(dir: string): Promise<ParamValues> {
   return asRouteResult(() => withRecoveredProject(dir, (ctx) => readParamsLocked(ctx)), "failed to read params.json");
 }
 
-/** `ctx`-taking sibling of {@link readParams}. */
+/** `ctx`-taking sibling of {@link readParams}. Same "throw `ScadForgeError`, never `RouteError`, inside the lock" convention as {@link readScadLocked} -- see its doc comment. */
 export async function readParamsLocked(ctx: LockedProject): Promise<ParamValues> {
   let raw: string;
   try {
     raw = await readFile(rootParamsPath(ctx.projectDir), "utf8");
   } catch (err) {
     if (isEnoent(err)) return {};
-    throw toRouteError(err, "failed to read params.json");
+    throw ScadForgeError.normalize(err, "INTERNAL_ERROR", "failed to read params.json");
   }
   try {
     const parsed = JSON.parse(raw) as ParamsFile;
     return (parsed.parameterSets?.[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
   } catch (err) {
-    throw toRouteError(err, "params.json is corrupt");
+    throw ScadForgeError.normalize(err, "INTERNAL_ERROR", "params.json is corrupt");
   }
 }
 
