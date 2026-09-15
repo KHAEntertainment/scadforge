@@ -94,5 +94,5 @@ describe("recoverPendingClaimsLocked proportionality (S3-B ticket B6, carried B4
 
       expect(await lookupClaimLocked(ctx, "orphan-op")).toMatchObject({ kind: "definitely_not_committed", reason: "aborted" });
     });
-  });
+  }, 20000); // 200 sequential reserve+reject fs round trips genuinely exceed vitest's 5s default under real parallel-suite CPU contention (observed flake under `pnpm -r test`'s default parallelism) -- same reason several store.test.ts/fault-matrix.test.ts cases already carry an explicit timeout, not a routed-around flake.
 });
