@@ -18,6 +18,8 @@ import {
   historyDir,
   metaDir,
   operationPath,
+  pendingClaimMarkerPath,
+  pendingClaimsDir,
   projectFilePath,
   quarantineDir,
   rootModelPath,
@@ -359,6 +361,63 @@ describe("recovery: staging without commit.json (crash-table row 1)", () => {
       });
       const stillCommitted = await lookupClaimLocked(ctx, "already-committed-op");
       expect(stillCommitted.kind).toBe("committed"); // never downgraded
+    });
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// pending-claim marker set (S3-B ticket B6, carried B4 delta QA, PR #96 review)
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("pending-claim marker set (S3-B ticket B6, carried B4 delta QA)", () => {
+  // The call-count proof ("zero terminal-claim reads") needs a full-module
+  // `readFile` mock -- Node's `fs/promises` builtin exports are not
+  // configurable, so a plain `vi.spyOn` here throws "Cannot redefine
+  // property". That test lives in its own file
+  // (`transaction-pending-sweep.test.ts`), scoped so the mock never touches
+  // this file's other 30+ tests.
+
+  it("a stray marker with no backing claim file (crash between marker write and claim write) is removed by recovery, not treated as an aborted claim", async () => {
+    await withCtx(async (ctx) => {
+      await mkdir(pendingClaimsDir(projectDir), { recursive: true });
+      await writeFile(pendingClaimMarkerPath(projectDir, "stray-marker-op"), "", "utf8");
+
+      await recoverPendingClaimsLocked(ctx);
+
+      expect(await lookupClaimLocked(ctx, "stray-marker-op")).toEqual({
+        kind: "definitely_not_committed",
+        requestDigest: null,
+        reason: "unclaimed",
+        error: null
+      });
+      expect(await pathExists(pendingClaimMarkerPath(projectDir, "stray-marker-op"))).toBe(false);
+    });
+  });
+
+  it("a marker left over a claim resolved directly (bypassing writeClaimLocked's own marker cleanup) is removed without downgrading the claim", async () => {
+    await withCtx(async (ctx) => {
+      await reserveClaimLocked(ctx, "bypassed-op", "digest-bypassed", {});
+      const raw = JSON.parse(await readFile(operationPath(projectDir, "bypassed-op"), "utf8"));
+      raw.terminal = { kind: "committed", receipt: fakeReceipt("bypassed-op"), transactionId: "tx-bypassed" };
+      await writeFile(operationPath(projectDir, "bypassed-op"), JSON.stringify(raw, null, 2), "utf8");
+      expect(await pathExists(pendingClaimMarkerPath(projectDir, "bypassed-op"))).toBe(true); // marker survives the bypass
+
+      await recoverPendingClaimsLocked(ctx);
+
+      expect(await pathExists(pendingClaimMarkerPath(projectDir, "bypassed-op"))).toBe(false);
+      const looked = await lookupClaimLocked(ctx, "bypassed-op");
+      expect(looked.kind).toBe("committed"); // never downgraded
+    });
+  });
+
+  it("an orphaned pending claim (reserved, crashed before any transaction ever started) is still aborted on the next recovery entry", async () => {
+    await withCtx(async (ctx) => {
+      await reserveClaimLocked(ctx, "young-orphan-op", "digest-young", {});
+      // No transaction, no staging directory at all -- exactly "a crash right
+      // after the reserve write landed". An age gate alone would not catch
+      // this on the very next entry; the marker-based sweep does.
+      await recoverPendingClaimsLocked(ctx);
+      expect(await lookupClaimLocked(ctx, "young-orphan-op")).toMatchObject({ kind: "definitely_not_committed", reason: "aborted" });
     });
   });
 });

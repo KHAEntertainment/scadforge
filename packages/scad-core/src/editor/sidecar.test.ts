@@ -339,7 +339,7 @@ describe("captureSidecarForSnapshotLocked (#87 B3): the store.ts writeSnapshotFi
     });
   });
 
-  it("on a legacy-empty project, establishes the root canonical empty sidecar and reports legacyMarkerFlip: true", async () => {
+  it("on a legacy-empty project, returns the canonical empty sidecar bytes to stage and reports legacyMarkerFlip: true, without writing", async () => {
     await seedProjectManifest(); // no marker
 
     const capture = await withCtx((ctx) => captureSidecarForSnapshotLocked(ctx));
@@ -347,7 +347,16 @@ describe("captureSidecarForSnapshotLocked (#87 B3): the store.ts writeSnapshotFi
     expect(capture.legacyMarkerFlip).toBe(true);
     expect(capture.descriptor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(EMPTY_SIDECAR) });
     expect(capture.bytes).toBe(canonicalJson(EMPTY_SIDECAR));
-    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(canonicalJson(EMPTY_SIDECAR));
+    // A PURE READ (S3-B ticket B6, Issue #98 F1 fix, PR #103): this function
+    // no longer establishes the root sidecar itself -- the caller
+    // (`store.ts`'s `buildSnapshotIntent`) stages the RETURNED bytes as part
+    // of its OWN transaction. The root file must still be completely absent
+    // here; the end-to-end "the root sidecar exists after the first
+    // snapshot" guarantee is covered at the store level instead
+    // (`store-editor-extension.test.ts`'s legacy-marker-flip case, and
+    // `store.test.ts`'s "a brand-new project is S3-modern from its very
+    // first snapshot").
+    await expect(readFile(sidecarPath(projectDir), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("on a ready project, captures the CURRENT root sidecar unchanged and reports legacyMarkerFlip: false", async () => {

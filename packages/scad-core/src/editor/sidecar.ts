@@ -442,13 +442,20 @@ export interface SnapshotSidecarCapture {
  * approved 2026-09-14: this blocks ALL snapshot creation, including ordinary
  * `write_scad`/`set_params`, until the root sidecar is repaired).
  *
- * For a `legacy-empty` root, this is the project's first S3-aware mutation
- * (wire-and-recovery: "New projects are modern with explicit empty
- * sidecar"): it establishes the root `.scadforge/editor.json` (canonical
- * empty bytes, via {@link writeSidecarBytesLocked}) BEFORE returning, and
- * sets `legacyMarkerFlip: true` so the caller flips the project manifest's
- * marker in the SAME `project.json` write it already performs for
- * `head`/`updated` — never a second, separate write.
+ * A PURE READ — never writes (S3-B ticket B6, Issue #98 F1 fix, PR #103).
+ * Before this fix, a `legacy-empty` root's "first S3-aware mutation" was
+ * established via its OWN separate `writeSidecarBytesLocked` stage → decide
+ * → publish, run BEFORE the caller's own snapshot transaction — so a crash
+ * between the two left the root sidecar durably changed with NO
+ * corresponding snapshot (B8's fault-matrix finding). The caller
+ * (`store.ts`'s `buildSnapshotIntent`) now stages the RETURNED bytes as
+ * `root.sidecar` itself, as part of the SAME transaction as the snapshot —
+ * for a `legacy-empty` root this is the canonical empty sidecar, with
+ * `legacyMarkerFlip: true` so the caller flips `project.editor_store_version`
+ * in that SAME `project.json` write it already performs for `head`/
+ * `updated`. `writeSidecarLocked` (the STANDALONE, single-purpose sidecar
+ * write) keeps its own transaction — that stays correct precisely because it
+ * is the ONLY change in it, never composed with a snapshot.
  */
 export async function captureSidecarForSnapshotLocked(ctx: LockedProject): Promise<SnapshotSidecarCapture> {
   const read = await readSidecarLocked(ctx);
@@ -463,19 +470,10 @@ export async function captureSidecarForSnapshotLocked(ctx: LockedProject): Promi
     );
   }
   // `read.status` is now narrowed to "ready" | "legacy-empty" -- `sidecar`/`digest` are non-null.
-  let sidecar = read.sidecar;
-  let digest = read.digest;
-  let legacyMarkerFlip = false;
-  if (read.status === "legacy-empty") {
-    const established = await writeSidecarBytesLocked(ctx, read.sidecar);
-    sidecar = established.sidecar;
-    digest = established.digest;
-    legacyMarkerFlip = true;
-  }
   return {
-    descriptor: { version: 1, file: "editor.json", sha256: digest },
-    bytes: canonicalJson(sidecar),
-    legacyMarkerFlip
+    descriptor: { version: 1, file: "editor.json", sha256: read.digest },
+    bytes: canonicalJson(read.sidecar),
+    legacyMarkerFlip: read.status === "legacy-empty"
   };
 }
 

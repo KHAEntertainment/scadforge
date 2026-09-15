@@ -789,6 +789,38 @@ describe("project store (filesystem, temp dir)", () => {
     const manifest = JSON.parse(await readFile(join(torn, PROJECT_LAYOUT.snapshot.manifestFile), "utf8"));
     expect(manifest.id).toBe("0002");
   }, 20000);
+
+  it("reclaims an EMPTY orphaned claim directory immediately, no age wait (Issue #98 F2)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    // Simulate a kill right after claimNextSnapshotId's exclusive mkdir,
+    // BEFORE any staging content ever reached the directory: history/0002
+    // exists, completely empty, no manifest.json, project.json.head never
+    // advanced past 0001. Deliberately NOT backdated (unlike the hard-kill
+    // test above) -- the fix must not need ORPHANED_CLAIM_MIN_AGE_MS to
+    // elapse for an empty directory.
+    const orphan = snapshotDir(projectDir, "0002");
+    await mkdir(orphan, { recursive: true });
+
+    const startedAt = Date.now();
+    const recovered = await createSnapshot(projectDir, {
+      content: "cube(3);\n",
+      params: {},
+      message: "recovered after empty orphaned claim",
+      origin: "manual",
+      pass: null
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(recovered.id).toBe("0002"); // reclaimed immediately, id reused -- sequence stays gapless
+    // Well within SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS's retry budget and nowhere
+    // near the old 60s age wait this fix removes for the empty case.
+    expect(elapsedMs).toBeLessThan(2000);
+
+    // The committed 0001 snapshot was never touched.
+    const first = await readSnapshotManifest(projectDir, "0001");
+    expect(first.origin).toBe("initial");
+  }, 20000);
 });
 
 // ── corruption vs. legacy absence (Issue #73 / S3-B ticket B2) ──────────────

@@ -205,7 +205,14 @@ export {
   recordClaimRejectedLocked,
   reserveClaimLocked
 } from "./store/claims.js";
-export type { ClaimLookupResult, ClaimTerminalState, OperationClaim, ReplayDecision, ReserveClaimResult } from "./store/claims.js";
+export type {
+  AcceptedOperationRecord,
+  ClaimLookupResult,
+  ClaimTerminalState,
+  OperationClaim,
+  ReplayDecision,
+  ReserveClaimResult
+} from "./store/claims.js";
 
 // ── proof service and eligibility (Issue #91 / S3-B ticket B5) ─────────────
 //
@@ -230,3 +237,18 @@ export type {
   ProbeResult,
   RunProbeInput
 } from "./editor/proof.js";
+
+// ── editor command application (Issue #98 / S3-B ticket B6) ────────────────
+//
+// Kept as its own block for the same merge-friendliness reason as B1/B2/B3/B5
+// above. Pure, I/O-free — `apps/server/src/services/scad-core-impl.ts` is the
+// only caller, composing this with B4's stage/decide/publish and B5's
+// `lookupProofLocked` under one `withRecoveredProject` boundary entry.
+export { applyEditorCommand, applyEditorTraversal } from "./editor/commands.js";
+export type {
+  ApplyEditorCommandInput,
+  ApplyEditorTraversalInput,
+  EditorCommandAccepted,
+  EditorCommandRefusal,
+  EditorCommandResult
+} from "./editor/commands.js";

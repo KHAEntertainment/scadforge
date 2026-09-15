@@ -58,7 +58,7 @@ import { ScadForgeError, withTypedError } from "../errors.js";
 import { canonicalSidecar, editorRevision as computeEditorRevision, sidecarDigest as computeSidecarDigest } from "../editor/canonical.js";
 import { EMPTY_SIDECAR } from "../editor/sidecar-empty.js";
 import {
-  operationsDir,
+  pendingClaimsDir,
   projectFilePath,
   quarantineDir,
   rootModelPath,
@@ -70,7 +70,13 @@ import {
 } from "./paths.js";
 import { computeSourceRevision } from "./revision.js";
 import type { LockedProject } from "./recovered.js";
-import { ABORTED_REPLAY_MESSAGE, recordClaimAbortedLocked, recordClaimCommittedLocked, reserveClaimLocked } from "./claims.js";
+import {
+  ABORTED_REPLAY_MESSAGE,
+  recordClaimAbortedLocked,
+  recordClaimCommittedLocked,
+  reserveClaimLocked
+} from "./claims.js";
+import type { AcceptedOperationRecord } from "./claims.js";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Fault points (Issue #90 AC8) — inert without SCADFORGE_FAULT_POINT
@@ -221,8 +227,15 @@ export interface TransactionIntent {
   transactionId: string;
   root: TransactionRootFiles;
   snapshot?: TransactionSnapshotFiles;
-  /** Present only for a future editor-command commit (B6). */
+  /** Present only for an editor-command commit (B6). */
   receipt?: EditorReceipt;
+  /**
+   * The undo/redo before/after record for this operation (B6). Staged and
+   * decided alongside everything else, so it becomes durable exactly when
+   * the commit does — never a separate, unsynchronized write after the
+   * fact (Tech Lead correction on Issue #98).
+   */
+  accepted?: AcceptedOperationRecord;
   claim?: TransactionClaimLink;
 }
 
@@ -244,6 +257,8 @@ export interface CommitDecision {
   editorRevision: string | null;
   receipt: EditorReceipt | null;
   operationId: string | null;
+  /** The undo/redo before/after record (B6), folded in here so recovery — which reads `commit.json` alone, never the original intent — can materialize it on the claim exactly like a fresh commit does. Null when not applicable to this transaction. */
+  accepted: AcceptedOperationRecord | null;
 }
 
 export interface DecidedTransaction {
@@ -279,6 +294,7 @@ function stagedFileEntries(intent: TransactionIntent): StagedFileEntry[] {
     for (const r of s.renders) entries.push({ relPath: `${base}/views/${r.view}.png` });
   }
   if (intent.receipt !== undefined) entries.push({ relPath: "receipt.json" });
+  if (intent.accepted !== undefined) entries.push({ relPath: "accepted.json" });
   return entries;
 }
 
@@ -354,6 +370,9 @@ export async function stageTransactionLocked(ctx: LockedProject, intent: Transac
 
   if (intent.receipt !== undefined) {
     await writeFlushed(join(dir, "receipt.json"), JSON.stringify(intent.receipt, null, 2));
+  }
+  if (intent.accepted !== undefined) {
+    await writeFlushed(join(dir, "accepted.json"), JSON.stringify(intent.accepted, null, 2));
   }
 
   await flushDir(dir);
@@ -456,7 +475,8 @@ export async function decideLocked(ctx: LockedProject, staged: StagedTransaction
     sourceRevision,
     editorRevision,
     receipt: intent.receipt ?? null,
-    operationId: intent.claim?.operationId ?? null
+    operationId: intent.claim?.operationId ?? null,
+    accepted: intent.accepted ?? null
   };
 
   const commitPath = join(dir, "commit.json");
@@ -545,7 +565,8 @@ export async function publishLocked(ctx: LockedProject, staged: DecidedTransacti
   if (decision.operationId !== null && decision.receipt !== null) {
     await recordClaimCommittedLocked(ctx, decision.operationId, {
       receipt: decision.receipt,
-      transactionId: decision.transactionId
+      transactionId: decision.transactionId,
+      accepted: decision.accepted ?? undefined
     });
     await faultPoint("after-publish-record");
   }
@@ -738,15 +759,25 @@ export async function recoverTransactionsLocked(ctx: LockedProject): Promise<voi
  * a no-op for a claim that reached a DIFFERENT terminal state via its own
  * transaction's recovery, so this safely only ever touches genuinely
  * orphaned claims.
+ *
+ * S3-B ticket B6 (carried B4 delta QA, PR #96 review): this reads ONLY
+ * `claims.ts`'s pending-marker set (`editor-operations/pending/`), never the
+ * full `editor-operations/` listing — a project's lifetime terminal-claim
+ * count (which is never trimmed; S3 has no claim retention) no longer costs
+ * anything here. `recordClaimAbortedLocked` itself clears a marker whose
+ * claim turns out to already be terminal (self-heal for the crash-ordering
+ * window between a terminal write and its own marker removal — see that
+ * function's doc comment), so a stale marker cannot accumulate indefinitely
+ * either.
  */
 export async function recoverPendingClaimsLocked(ctx: LockedProject): Promise<void> {
   let entries: string[];
   try {
-    entries = (await readdir(operationsDir(ctx.projectDir), { withFileTypes: true }))
+    entries = (await readdir(pendingClaimsDir(ctx.projectDir), { withFileTypes: true }))
       .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
       .map((e) => e.name.slice(0, -".json".length));
   } catch {
-    return; // no editor-operations/ directory at all
+    return; // no pending-marker directory at all
   }
   for (const operationId of entries) {
     await withTypedError(
