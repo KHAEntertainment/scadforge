@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { TOOL_NAMES as PROTOCOL_TOOL_NAMES } from "@scadforge/protocol";
+import { TOOL_NAMES as PROTOCOL_TOOL_NAMES, safeParseAgentEditorContext } from "@scadforge/protocol";
 import type { ToolName as ProtocolToolName } from "@scadforge/protocol";
 import {
   DEFAULT_MAX_PASSES,
@@ -917,6 +917,56 @@ describe("zod mirror strictness parity (S3-A NIT 1 / NIT 3 / NIT 4)", () => {
     });
     expect(result.success).toBe(false);
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S3-A contract fix (Issue #93) — editor `projectId` accepts real project
+// slugs, not only UUIDs. Mirrors the accept/reject table in
+// `@scadforge/protocol`'s `editor.test.ts`, plus a parity check that the
+// protocol parser and this zod mirror agree on every id in the table.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VALID_PROJECT_IDS = [
+  "hinged-box",
+  "my-bracket-2",
+  "Project.v1_2",
+  "11111111-2222-4333-8444-555555555555"
+];
+const INVALID_PROJECT_IDS = ["", ".", "..", "a..b", "a/b", "a\\b", "a".repeat(129), "a b", "é"];
+
+describe("editor projectId: safe-id rule, not UUID (Issue #93)", () => {
+  it.each(VALID_PROJECT_IDS)("agentEditorContextSchema accepts project id %j", (id) => {
+    expect(agentEditorContextSchema.safeParse({ ...editorBlock, projectId: id }).success).toBe(
+      true
+    );
+  });
+
+  it.each(INVALID_PROJECT_IDS)("agentEditorContextSchema rejects project id %j", (id) => {
+    expect(agentEditorContextSchema.safeParse({ ...editorBlock, projectId: id }).success).toBe(
+      false
+    );
+  });
+
+  it.each(VALID_PROJECT_IDS)("editorFeatureSchema accepts project id %j", (id) => {
+    expect(
+      editorFeatureSchema.safeParse({ ...editorBlock.features[0], projectId: id }).success
+    ).toBe(true);
+  });
+
+  it.each(INVALID_PROJECT_IDS)("editorFeatureSchema rejects project id %j", (id) => {
+    expect(
+      editorFeatureSchema.safeParse({ ...editorBlock.features[0], projectId: id }).success
+    ).toBe(false);
+  });
+
+  it.each([...VALID_PROJECT_IDS, ...INVALID_PROJECT_IDS])(
+    "parity: @scadforge/protocol's safeParseAgentEditorContext agrees with the zod mirror on %j",
+    (id) => {
+      const protocolResult = safeParseAgentEditorContext({ ...editorBlock, projectId: id });
+      const mirrorResult = agentEditorContextSchema.safeParse({ ...editorBlock, projectId: id });
+      expect(mirrorResult.success).toBe(protocolResult.ok);
+    }
+  );
 });
 
 describe("image-bearing tool results (Spike 3 §3 / §7.2)", () => {

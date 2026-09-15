@@ -262,6 +262,18 @@ export const validationReportSchema = z.object({
 /** UUID v4 string. Matches `@scadforge/protocol`'s editor-sidecar validator. */
 const editorUuidSchema = z.string().uuid();
 
+/**
+ * Safe project-id slug (`hinged-box`, `my-bracket-2`) — not a UUID. Mirrors
+ * `isEditorProjectId`/`expectProjectId` in `@scadforge/protocol`'s
+ * `editor.ts`, which in turn mirrors `isSafeId` in
+ * `apps/server/src/services/validation.ts` (contract-change Issue #93). Keep
+ * the three in sync.
+ */
+const editorProjectIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9._-]{1,128}$/, "must be a safe project id")
+  .refine((s) => s !== "." && s !== ".." && !s.includes(".."), "must not be a path traversal segment");
+
 /** Lowercase 64-hex digest. SHA-256 family — canonical JSON encoding. */
 const editorHex64Schema = z.string().regex(/^[0-9a-f]{64}$/, "must be lowercase 64-hex");
 
@@ -291,7 +303,7 @@ export const editorFeatureSchema = z
         (s) => [...s].length <= EDITOR_LABEL_MAX_CODE_POINTS,
         `label must be at most ${EDITOR_LABEL_MAX_CODE_POINTS} Unicode code points`
       ),
-    projectId: editorUuidSchema,
+    projectId: editorProjectIdSchema,
     createdAtRevision: editorHex64Schema,
     sourceFingerprint: editorHex64Schema,
     bindingVersion: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
@@ -355,7 +367,7 @@ export const editorEligibilitySchema = z
 export const agentEditorContextSchema = z
   .object({
     version: z.literal(1),
-    projectId: editorUuidSchema,
+    projectId: editorProjectIdSchema,
     editorRevision: editorHex64Schema,
     sourceRevision: editorHex64Schema,
     sourceFingerprint: editorHex64Schema,

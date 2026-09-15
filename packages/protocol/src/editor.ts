@@ -35,8 +35,9 @@
 //   - Reject wrong discriminants and duplicate feature IDs.
 //   - Reject invalid IDs, invalid timestamps, non-finite numbers, malformed
 //     hashes; never coerce strings into numbers.
-//   - IDs are UUIDs; SHA-256 digests are lowercase 64-hex; `bindingVersion` is
-//     a positive safe integer.
+//   - `featureId`, `operationId`, and `proofId` are UUIDs; `projectId` is a
+//     safe id (see `expectProjectId` below — contract-change Issue #93); SHA-256
+//     digests are lowercase 64-hex; `bindingVersion` is a positive safe integer.
 //   - Radial axes must be finite normalized Vec3 (norm within 1e-9 of one);
 //     wire parsing preserves signed direction and does not normalize arbitrary
 //     input.
@@ -461,6 +462,29 @@ function expectUuid(value: unknown, path: string): string {
   return value;
 }
 
+/**
+ * Real ScadForge project ids are slugs (`hinged-box`, `my-bracket-2`), not
+ * UUIDs — the studio mints them, the editor protocol only carries them. This
+ * mirrors `isSafeId` in `apps/server/src/services/validation.ts`, which the
+ * server enforces on every route; `@scadforge/protocol` cannot import from
+ * `apps/server`, so the rule is duplicated here (contract-change Issue #93).
+ * Keep the two in sync.
+ */
+const PROJECT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
+function isEditorProjectId(value: string): boolean {
+  if (value === "." || value === "..") return false;
+  if (value.includes("..")) return false;
+  return PROJECT_ID_RE.test(value);
+}
+
+function expectProjectId(value: unknown, path: string): string {
+  if (typeof value !== "string" || !isEditorProjectId(value)) {
+    fail(path, `expected a safe project id, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 function expectSha256Hex(value: unknown, path: string): string {
   if (typeof value !== "string" || !isSha256Hex(value)) {
     fail(path, `expected lowercase 64-hex SHA-256, got ${JSON.stringify(value)}`);
@@ -687,7 +711,7 @@ function parseEditorFeature(input: unknown, path: string): EditorFeature {
   const feature: EditorFeature = {
     featureId: expectUuid(obj.featureId, `${path}.featureId`),
     label: expectLabel(obj.label, `${path}.label`),
-    projectId: expectUuid(obj.projectId, `${path}.projectId`),
+    projectId: expectProjectId(obj.projectId, `${path}.projectId`),
     createdAtRevision: expectHex64(obj.createdAtRevision, `${path}.createdAtRevision`),
     sourceFingerprint: expectHex64(obj.sourceFingerprint, `${path}.sourceFingerprint`),
     bindingVersion: expectPositiveSafeInteger(obj.bindingVersion, `${path}.bindingVersion`),
@@ -774,7 +798,7 @@ export function parseEditorDocument(input: unknown): EditorDocument {
   const headRaw = obj.head;
   const document: EditorDocument = {
     version: 1,
-    projectId: expectUuid(obj.projectId, "EditorDocument.projectId"),
+    projectId: expectProjectId(obj.projectId, "EditorDocument.projectId"),
     head:
       headRaw === null
         ? null
@@ -1010,7 +1034,7 @@ export function parseEditorReceipt(input: unknown): EditorReceipt {
   );
   return {
     version: 1,
-    projectId: expectUuid(obj.projectId, "EditorReceipt.projectId"),
+    projectId: expectProjectId(obj.projectId, "EditorReceipt.projectId"),
     operationId: expectUuid(obj.operationId, "EditorReceipt.operationId"),
     requestDigest: expectSha256Hex(obj.requestDigest, "EditorReceipt.requestDigest"),
     baseEditorRevision: expectHex64(obj.baseEditorRevision, "EditorReceipt.baseEditorRevision"),
@@ -1133,7 +1157,7 @@ export function parseAgentEditorContext(input: unknown): AgentEditorContext {
   );
   return {
     version: 1,
-    projectId: expectUuid(obj.projectId, "AgentEditorContext.projectId"),
+    projectId: expectProjectId(obj.projectId, "AgentEditorContext.projectId"),
     editorRevision: expectHex64(obj.editorRevision, "AgentEditorContext.editorRevision"),
     sourceRevision: expectHex64(obj.sourceRevision, "AgentEditorContext.sourceRevision"),
     sourceFingerprint: expectHex64(obj.sourceFingerprint, "AgentEditorContext.sourceFingerprint"),
