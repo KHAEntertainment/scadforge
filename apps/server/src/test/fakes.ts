@@ -6,9 +6,12 @@
 // `AppDeps` (see app.ts). Kept intentionally small: just enough behavior for
 // route tests to exercise real request/response/error-mapping paths.
 
+import { randomUUID } from "node:crypto";
 import { PROJECT_LAYOUT, SNAPSHOT_ID_PAD_WIDTH } from "@scadforge/protocol";
 import type {
   CreateProjectRequest,
+  EditorProofResponse,
+  EditorVerifyRequest,
   ExportRequest,
   ExportResponse,
   ListProjectsResponse,
@@ -320,11 +323,55 @@ export function createFakeScadCoreApi(): ScadCoreApi & { _projects: Map<string, 
       if (file !== "fake.3mf" && !file.startsWith("fake.")) return null;
       const data = new TextEncoder().encode(`fake-export:${projectId}:${file}`);
       return { data, contentType: "model/3mf", bytes: data.byteLength };
+    },
+
+    // ── editor (S3-B B5, Issue #91) ───────────────────────────────────────
+    //
+    // `EditorVerifyRequest.baseEditorRevision` and `command.featureId` are
+    // strictly validated (64-hex / UUID) by `parseEditorVerifyRequest`
+    // before this fake ever sees them, so the `"__stale__"`-style string
+    // sentinels the other fakes above use would never reach here (the route
+    // would already have rejected them as INVALID_REQUEST). Route tests
+    // that want a specific error code instead pick it via a reserved
+    // `set-value` sentinel `value` — still an ordinary finite number, so it
+    // survives the real parser.
+    async verifyEditorCommand(projectId: string, request: EditorVerifyRequest): Promise<EditorProofResponse> {
+      requireProject(projectId);
+
+      if (request.baseEditorRevision === FAKE_STALE_REVISION) {
+        throw new RouteError("CONFLICT", "The base editor revision is stale (fake: forced conflict).");
+      }
+
+      if (request.command.kind === "set-value") {
+        if (request.command.value === FAKE_VALIDATION_FAILED_VALUE) {
+          throw new RouteError("VALIDATION_FAILED", "The declared binding does not hold for this candidate (fake: forced refusal).");
+        }
+        if (request.command.value === FAKE_RENDER_FAILED_VALUE) {
+          throw new RouteError("RENDER_FAILED", "The OpenSCAD engine failed to render the sample (fake: forced failure).");
+        }
+        if (request.command.value === FAKE_TIMEOUT_VALUE) {
+          throw new RouteError("TIMEOUT", "The render timed out (fake: forced timeout).");
+        }
+      }
+
+      return {
+        version: 1,
+        proofId: randomUUID(),
+        commandDigest: "a".repeat(64),
+        baseEditorRevision: request.baseEditorRevision,
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString()
+      };
     }
   };
 
   return api;
 }
+
+/** Reserved sentinel values `verifyEditorCommand`'s fake checks for, exported so route tests can build requests that trigger each error code deliberately (see that method's own comment for why these are numbers/hex, not the `"__stale__"`-style string sentinels used elsewhere in this file). */
+export const FAKE_STALE_REVISION = "0".repeat(64);
+export const FAKE_VALIDATION_FAILED_VALUE = -9999;
+export const FAKE_RENDER_FAILED_VALUE = -9998;
+export const FAKE_TIMEOUT_VALUE = -9997;
 
 /** A single scripted step of a fake agent turn. */
 export type ScriptedEvent = (turnId: string) => Parameters<AgentEventSink>[0];
