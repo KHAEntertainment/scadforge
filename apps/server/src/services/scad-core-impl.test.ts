@@ -12,6 +12,8 @@ import {
   createSnapshotLocked,
   editorRevision,
   initProject,
+  listSnapshots,
+  lookupClaimLocked,
   mergeParamsAtomic,
   persistProofRecord,
   sidecarDigest,
@@ -541,5 +543,111 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
 
     const stateAfter = await coherentSourceState(dir);
     expect(stateAfter.head).toBe(a.snapshotId);
+  });
+
+  // R1 regression (QA finding on PR #108, Medium, made a merge requirement by
+  // the Tech Lead): the claim's `accepted` before/after record is captured at
+  // COMMIT TIME from the live root state -- never derived later by diffing
+  // the accepted snapshot against its parent. A `snapshot:false` params write
+  // (the PUT /params path) between the parent snapshot and an editor commit
+  // is exactly the case a diff-based derivation would get wrong: the parent
+  // snapshot's own params never see that intervening write, so undo would
+  // wrongly restore the PARENT SNAPSHOT'S value instead of the TRUE
+  // pre-edit live value.
+  it("undo after an intervening snapshot:false params write restores the TRUE pre-edit value, not the parent snapshot's", async () => {
+    const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
+    const dir = runtime.dirFor("p6");
+    // Parent (and only) snapshot 0001 captures wall = 1 (v1).
+    await initProject(dir, { id: "p6", name: "n", provider: providerConfig, content: "cube(1);\n", params: { wall: 1 } });
+    const feature = fixtureFeature({ projectId: "p6" });
+    await withRecoveredProject(dir, (ctx) => writeSidecarLocked(ctx, { version: 1, features: [feature] }));
+    const api = createScadCoreApi(runtime);
+
+    // A snapshot-free write (PUT /params, snapshot:false) sets wall = 2 (v2)
+    // WITHOUT creating a new snapshot -- 0001 still says wall = 1.
+    await api.updateParams("p6", { values: { wall: 2 }, snapshot: false });
+    const stateAfterExternalWrite = await coherentSourceState(dir);
+    expect(stateAfterExternalWrite.params.wall).toBe(2);
+    expect(await listSnapshots(dir)).toHaveLength(1); // still just the initial snapshot
+
+    // Edit: wall 2 -> 9 (v2 -> v3).
+    const editOperationId = randomUUID();
+    const editCommand: EditorCommand = { kind: "set-value", featureId: feature.featureId, bindingVersion: 1, value: 9 };
+    const editProof = await persistFakeProof(dir, {
+      projectId: "p6",
+      baseEditorRevision: stateAfterExternalWrite.editorRevision!,
+      command: editCommand,
+      intent: "edit",
+      traversal: null,
+      authoritativeParams: stateAfterExternalWrite.params,
+      candidateParams: { ...stateAfterExternalWrite.params, wall: 9 }
+    });
+    const editReceipt = await api.submitEditorCommand("p6", {
+      version: 1,
+      baseEditorRevision: stateAfterExternalWrite.editorRevision!,
+      command: editCommand,
+      intent: "edit",
+      traversal: null,
+      operationId: editOperationId,
+      proofId: editProof
+    });
+    expect(editReceipt.values).toEqual({ wall: 9 });
+
+    // The committed claim's own before/after record holds the TRUE live
+    // before-value (2), not the parent snapshot's (1).
+    const editClaim = await withRecoveredProject(dir, (ctx) => lookupClaimLocked(ctx, editOperationId));
+    expect(editClaim).toMatchObject({
+      kind: "committed",
+      accepted: { kind: "set-value", featureId: feature.featureId, bindingVersion: 1, parameter: "wall", beforeValue: 2, afterValue: 9 }
+    });
+
+    // Undo must restore wall = 2 (the TRUE pre-edit value) -- a diff against
+    // the parent snapshot would wrongly give wall = 1.
+    const stateAfterEdit = await coherentSourceState(dir);
+    const undoCommand: EditorCommand = { kind: "set-value", featureId: feature.featureId, bindingVersion: 1, value: 2 };
+    const undoTraversal: EditorTraversal = { operationId: editOperationId, direction: "undo" };
+    const undoProof = await persistFakeProof(dir, {
+      projectId: "p6",
+      baseEditorRevision: stateAfterEdit.editorRevision!,
+      command: undoCommand,
+      intent: "undo",
+      traversal: undoTraversal,
+      authoritativeParams: stateAfterEdit.params,
+      candidateParams: { ...stateAfterEdit.params, wall: 2 }
+    });
+    const undoReceipt = await api.submitEditorCommand("p6", {
+      version: 1,
+      baseEditorRevision: stateAfterEdit.editorRevision!,
+      command: undoCommand,
+      intent: "undo",
+      traversal: undoTraversal,
+      operationId: randomUUID(),
+      proofId: undoProof
+    });
+    expect(undoReceipt.values).toEqual({ wall: 2 }); // NOT { wall: 1 }
+
+    // Redo returns to wall = 9.
+    const stateAfterUndo = await coherentSourceState(dir);
+    const redoCommand: EditorCommand = { kind: "set-value", featureId: feature.featureId, bindingVersion: 1, value: 9 };
+    const redoTraversal: EditorTraversal = { operationId: editOperationId, direction: "redo" };
+    const redoProof = await persistFakeProof(dir, {
+      projectId: "p6",
+      baseEditorRevision: stateAfterUndo.editorRevision!,
+      command: redoCommand,
+      intent: "redo",
+      traversal: redoTraversal,
+      authoritativeParams: stateAfterUndo.params,
+      candidateParams: { ...stateAfterUndo.params, wall: 9 }
+    });
+    const redoReceipt = await api.submitEditorCommand("p6", {
+      version: 1,
+      baseEditorRevision: stateAfterUndo.editorRevision!,
+      command: redoCommand,
+      intent: "redo",
+      traversal: redoTraversal,
+      operationId: randomUUID(),
+      proofId: redoProof
+    });
+    expect(redoReceipt.values).toEqual({ wall: 9 });
   });
 });
