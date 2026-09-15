@@ -26,8 +26,12 @@ import type {
   BuildRequest,
   BuildResponse,
   CreateProjectRequest,
+  EditorCommitRequest,
+  EditorDocument,
   EditorFeature,
+  EditorOperationResponse,
   EditorProofResponse,
+  EditorReceipt,
   EditorSidecarStatus,
   ExportRecord,
   ExportRequest,
@@ -44,6 +48,7 @@ import type {
   SnapshotDiffResponse,
   SnapshotId,
   SnapshotManifest,
+  SnapshotOrigin,
   SnapshotResponse,
   SourcePreflightRequest,
   SourcePreflightResponse,
@@ -52,17 +57,24 @@ import type {
   ViewName
 } from "@scadforge/protocol";
 import {
+  ABORTED_REPLAY_MESSAGE,
   DEFAULT_VIEWS,
   analyzeSourceParams,
+  applyEditorCommand,
+  applyEditorTraversal,
   attachRendersToSnapshotLocked,
   attachValidationToSnapshotLocked,
+  commandDigest,
   computeSourceRevision,
   createSnapshotLocked,
+  editorEligibility,
   editorRevision,
   exportRunWithValidation,
   exportsDir,
   initProject,
   listSnapshots,
+  lookupClaimLocked,
+  lookupProofLocked,
   mergeParamsAtomic,
   normalizeLineEndings,
   persistProofRecord,
@@ -70,8 +82,11 @@ import {
   readSidecarLocked,
   readSnapshotManifest,
   readSnapshotManifestLocked,
+  recordClaimRejectedLocked,
   recordExport,
   renderViews as runRenderViews,
+  requestDigest,
+  reserveClaimLocked,
   resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   revertToSnapshot,
@@ -82,11 +97,12 @@ import {
   snapshotDir,
   snapshotMeshPath,
   snapshotRenderPath,
+  sourceFingerprint,
   updateRootParamsLocked,
   validateModel,
   withRecoveredProject
 } from "@scadforge/scad-core";
-import type { LockedProject, ParamSchema, ParamValues, RenderAttachment, RenderedView } from "@scadforge/scad-core";
+import type { ClaimLookupResult, LockedProject, ParamSchema, ParamValues, RenderAttachment, RenderedView } from "@scadforge/scad-core";
 import { RouteError } from "./errors.js";
 import { allocateProjectId, listProjectIds } from "./project-paths.js";
 import type { RenderFile, ScadCoreApi } from "./scad-core-api.js";
@@ -104,6 +120,9 @@ import { exportFileUrl, renderFileUrl } from "./urls.js";
 
 /** The `.scad` a project starts from when the caller supplies none. */
 const EMPTY_MODEL_SCAD = "// New ScadForge project.\n";
+
+/** Every editor-command commit's snapshot origin (S3-B ticket B6, Issue #98; `SnapshotOrigin` contract fix PR #105). */
+const EDITOR_SNAPSHOT_ORIGIN: SnapshotOrigin = "editor";
 
 /** MIME types for the two kinds of file this API serves verbatim. */
 const CONTENT_TYPES: Record<string, string> = {
@@ -265,24 +284,33 @@ export interface SourceState {
  * the fields it already used.
  */
 export async function coherentSourceState(dir: string): Promise<SourceState> {
-  return withRecoveredProject(dir, async (ctx) => {
-    const project = await readProjectManifestLocked(ctx);
-    const scad = await readScadLocked(ctx);
-    const params = await readParamsLocked(ctx);
-    const sidecarRead = await readSidecarLocked(ctx);
-    const revision = computeSourceRevision(project.head, scad, params);
-    return {
-      project,
-      head: project.head,
-      scad,
-      params,
-      revision,
-      sidecarStatus: sidecarRead.status,
-      sidecarFeatures: sidecarRead.sidecar?.features ?? [],
-      sidecarDigest: sidecarRead.digest,
-      editorRevision: sidecarRead.digest !== null ? editorRevision(revision, sidecarRead.digest) : null
-    };
-  });
+  return withRecoveredProject(dir, (ctx) => coherentSourceStateLocked(ctx));
+}
+
+/**
+ * `ctx`-taking sibling of {@link coherentSourceState}, for a caller (S3-B
+ * ticket B6's `submitEditorCommand`) that already holds the boundary and
+ * must read this SAME coherent tuple without reacquiring the lock (Issue
+ * #73's non-reentrancy guard would throw immediately on a nested
+ * `withRecoveredProject` call).
+ */
+async function coherentSourceStateLocked(ctx: LockedProject): Promise<SourceState> {
+  const project = await readProjectManifestLocked(ctx);
+  const scad = await readScadLocked(ctx);
+  const params = await readParamsLocked(ctx);
+  const sidecarRead = await readSidecarLocked(ctx);
+  const revision = computeSourceRevision(project.head, scad, params);
+  return {
+    project,
+    head: project.head,
+    scad,
+    params,
+    revision,
+    sidecarStatus: sidecarRead.status,
+    sidecarFeatures: sidecarRead.sidecar?.features ?? [],
+    sidecarDigest: sidecarRead.digest,
+    editorRevision: sidecarRead.digest !== null ? editorRevision(revision, sidecarRead.digest) : null
+  };
 }
 
 /** Stages a raw source string into a throwaway `.scad` file for OpenSCAD to read. */
@@ -423,6 +451,238 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
     // own entry has already closed by the time this runs.
     const head = state.head ? await headSnapshot(dir, state.head) : null;
     return { project: state.project, scad: state.scad, params: state.params, head, revision: state.revision };
+  }
+
+  // ── editor (S3-B B6, Issue #98) ───────────────────────────────────────────
+
+  /**
+   * `GET .../editor`'s coherent document read. Pins the source/params/sidecar
+   * tuple under ONE boundary entry (`coherentSourceState`), then compiles the
+   * pinned source and computes eligibility entirely OUTSIDE it -- same split
+   * `compileProposedSource` already documents on itself, and the same
+   * failure mode `verifyEditorCommand` uses for an unparseable committed
+   * source (`RENDER_FAILED`, never a partial/fabricated document).
+   *
+   * Story seam ("Source fingerprint and unreadable-sidecar revision"): for a
+   * `corrupt`/`missing`/`unsupported-version` sidecar, `coherentSourceState`
+   * already reports `sidecarFeatures: []` and `editorRevision: null` -- this
+   * substitutes `sourceRevision` for the document's `editorRevision` in
+   * exactly that case, per the story's explicit rule ("editorRevision equals
+   * sourceRevision for those three statuses"). `legacy-empty` is read-only
+   * here, same as every other status -- nothing mutates on a GET.
+   */
+  async function editorDocumentResponse(projectId: string): Promise<EditorDocument> {
+    const dir = runtime.dirFor(projectId);
+    const state = await asRouteResult(() => coherentSourceState(dir), "failed to read the editor document");
+    const compiled = await asRouteResult(
+      () => compileProposedSource(runtime, state.scad),
+      "failed to read the parameter schema"
+    );
+    if (!compiled.syntax_ok) {
+      throw new RouteError("RENDER_FAILED", "The project's committed source failed to syntax-check.");
+    }
+    return {
+      version: 1,
+      projectId,
+      head: state.head,
+      sourceRevision: state.revision,
+      sourceFingerprint: sourceFingerprint(state.scad),
+      editorRevision: state.editorRevision ?? state.revision,
+      scad: state.scad,
+      parameters: compiled.schema.parameters as EditorDocument["parameters"],
+      values: state.params,
+      sidecar: { version: 1, features: state.sidecarFeatures },
+      sidecarStatus: state.sidecarStatus,
+      eligibility: editorEligibility(state.sidecarFeatures, compiled.schema)
+    };
+  }
+
+  /** Maps B4's internal `ClaimLookupResult` onto the frozen `EditorOperationResponse` wire shape -- `accepted` is deliberately never forwarded (internal-only, not part of the wire). */
+  function toEditorOperationResponse(looked: ClaimLookupResult): EditorOperationResponse {
+    if (looked.kind === "committed") {
+      return { version: 1, state: "committed", receipt: looked.receipt };
+    }
+    if (looked.kind === "definitely_not_committed") {
+      return {
+        version: 1,
+        state: "definitely_not_committed",
+        requestDigest: looked.requestDigest,
+        reason: looked.reason,
+        error: looked.error
+      };
+    }
+    return { version: 1, state: "unknown", requestDigest: looked.requestDigest };
+  }
+
+  /**
+   * `POST .../editor/commands` — the idempotent command handler (S3-B ticket
+   * B6). Runs the ticket's ordered steps 2–7 inside ONE boundary entry
+   * (step 1, parse + `requestDigest`, already happened in the route before
+   * this is ever called — parsing needs no lock). No engine work happens
+   * anywhere in this function: the proof this trusts was already rendered
+   * by an earlier `verifyEditorCommand` call, entirely outside any lock — see
+   * `commands.ts`'s module header for exactly which spec checks rest on that
+   * proof versus which are always re-run here.
+   */
+  async function submitEditorCommand(projectId: string, request: EditorCommitRequest): Promise<EditorReceipt> {
+    const dir = runtime.dirFor(projectId);
+    const digest = requestDigest({ ...request, projectId });
+
+    return asRouteResult(
+      () =>
+        withRecoveredProject(dir, async (ctx) => {
+          // Steps 2+3: claim lookup and reserve, as one durable operation --
+          // "malformed requests that cannot be canonicalized reserve
+          // nothing" is already satisfied by the route's own parse step
+          // running before this is ever called.
+          const reserved = await reserveClaimLocked(ctx, request.operationId, digest, request);
+
+          if (reserved.kind === "conflict") {
+            throw new RouteError("CONFLICT", "A different request already used this operation id; refresh and submit a new operation.");
+          }
+          if (reserved.kind === "same-request") {
+            const terminal = reserved.terminal;
+            if (terminal === null) {
+              // Still pending. `recover(ctx)` (which just ran, above this
+              // callback) resolves every genuinely orphaned pending claim to
+              // `aborted` before any caller's own work -- claim-plus-commit
+              // work only ever runs under this SAME exclusive lock, so a
+              // claim still pending here cannot belong to a caller genuinely
+              // in flight (it would still hold the lock). Unreachable in
+              // practice; kept as a typed response rather than an assertion.
+              throw new RouteError("CONFLICT", "This operation is still being processed; check its status and retry.");
+            }
+            if (terminal.kind === "committed") {
+              return terminal.receipt; // idempotent replay: identical receipt.
+            }
+            if (terminal.kind === "rejected") {
+              throw new RouteError(terminal.error.error_code, terminal.error.message); // original status, verbatim.
+            }
+            throw new RouteError("CONFLICT", ABORTED_REPLAY_MESSAGE); // aborted
+          }
+
+          // reserved.kind === "reserved" -- a genuinely fresh claim. Returns
+          // (never throws) the error to construct -- an explicit `throw` at
+          // each call site is what TypeScript's control-flow analysis
+          // reliably narrows on; a `never`-returning helper thrown FROM
+          // INSIDE itself does not narrow a caller's later reads the same
+          // way when only awaited, not thrown, at the call site.
+          const rejectionError = async (code: "VALIDATION_FAILED" | "CONFLICT", message: string): Promise<RouteError> => {
+            await recordClaimRejectedLocked(ctx, request.operationId, { error_code: code, message });
+            return new RouteError(code, message);
+          };
+
+          const state = await coherentSourceStateLocked(ctx);
+
+          // Step 4a: sidecar status must support editor commands at all,
+          // whatever revision the client sent (story seam: "B6 must refuse
+          // every command when the status is not ready or legacy-empty").
+          if (state.sidecarStatus !== "ready" && state.sidecarStatus !== "legacy-empty") {
+            throw await rejectionError("CONFLICT", `Editor commands are unsupported while the sidecar status is "${state.sidecarStatus}".`);
+          }
+          // Step 4b: authority.
+          if (state.editorRevision !== request.baseEditorRevision) {
+            throw await rejectionError("CONFLICT", "The base editor revision is stale; refresh and retry.");
+          }
+
+          // Step 4c: proof. `lookupProofLocked` already re-checks TTL and the
+          // proof record's OWN internal digest consistency; this ADDITIONALLY
+          // checks that the SUBMITTED request is what that proof actually
+          // covers (a digest match here is a preimage guarantee that
+          // request.command/intent/traversal/baseEditorRevision are exactly
+          // what was proven).
+          const proofLookup = await lookupProofLocked(ctx, request.proofId);
+          if (proofLookup.status === "not-found" || proofLookup.status === "digest-mismatch") {
+            throw await rejectionError("VALIDATION_FAILED", "The proof for this command is missing or does not match; re-verify and retry.");
+          }
+          if (proofLookup.status === "expired") {
+            throw await rejectionError("CONFLICT", "The proof for this command has expired; re-verify and retry.");
+          }
+          // proofLookup.status === "valid"
+          const proof = proofLookup.proof;
+          const submittedCommandDigest = commandDigest({
+            version: 1,
+            projectId,
+            baseEditorRevision: request.baseEditorRevision,
+            command: request.command,
+            intent: request.intent,
+            traversal: request.traversal
+          });
+          if (submittedCommandDigest !== proof.commandDigest) {
+            throw await rejectionError("VALIDATION_FAILED", "The proof for this command does not match the submitted command.");
+          }
+
+          // Steps 5/6: apply the command (edit/setup) or its traversal
+          // (undo/redo) -- pure, no I/O (packages/scad-core/src/editor/commands.ts).
+          const applied =
+            request.intent === "undo" || request.intent === "redo"
+              ? await (async () => {
+                  const traversal = request.traversal!; // parser guarantees non-null for undo/redo
+                  const originalLookup = await lookupClaimLocked(ctx, traversal.operationId);
+                  const originalAccepted = originalLookup.kind === "committed" ? (originalLookup.accepted ?? null) : null;
+                  return applyEditorTraversal({
+                    intent: request.intent,
+                    traversal,
+                    submittedCommand: request.command,
+                    currentFeatures: state.sidecarFeatures,
+                    currentParams: state.params,
+                    originalAccepted
+                  });
+                })()
+              : applyEditorCommand({
+                  projectId,
+                  baseEditorRevision: request.baseEditorRevision,
+                  sourceFingerprint: sourceFingerprint(state.scad),
+                  command: request.command,
+                  currentFeatures: state.sidecarFeatures,
+                  currentParams: state.params,
+                  provenCandidateParams: proof.candidateParams
+                });
+
+          if (applied.status === "refused") {
+            throw await rejectionError(applied.code, applied.message);
+          }
+
+          // Step 7: stage, decide and publish through B4, in ONE transaction
+          // with the new sidecar, params, snapshot (origin "editor") and
+          // receipt.
+          let receipt: EditorReceipt | undefined;
+          await createSnapshotLocked(
+            ctx,
+            {
+              content: state.scad,
+              params: applied.nextParams,
+              message: applied.message,
+              origin: EDITOR_SNAPSHOT_ORIGIN,
+              pass: null
+            },
+            {
+              sidecar: { version: 1, features: applied.nextFeatures },
+              markerFlip: state.sidecarStatus === "legacy-empty",
+              editor: {
+                claim: { operationId: request.operationId },
+                accepted: applied.accepted ?? undefined,
+                buildReceipt: (facts) => {
+                  receipt = {
+                    version: 1,
+                    projectId,
+                    operationId: request.operationId,
+                    requestDigest: digest,
+                    baseEditorRevision: request.baseEditorRevision,
+                    editorRevision: facts.editorRevision,
+                    snapshotId: facts.snapshotId,
+                    values: applied.nextParams,
+                    sidecarDigest: facts.sidecarDigest
+                  };
+                  return receipt;
+                }
+              }
+            }
+          );
+          return receipt!;
+        }),
+      "failed to process the editor command"
+    );
   }
 
   return {
@@ -958,6 +1218,18 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
         baseEditorRevision: probeResult.record.baseEditorRevision,
         expiresAt: probeResult.record.expiresAt
       };
+    },
+
+    getEditorDocument: (projectId) => editorDocumentResponse(projectId),
+
+    submitEditorCommand,
+
+    async getEditorOperation(projectId, operationId): Promise<EditorOperationResponse> {
+      const dir = runtime.dirFor(projectId);
+      return asRouteResult(
+        () => withRecoveredProject(dir, async (ctx) => toEditorOperationResponse(await lookupClaimLocked(ctx, operationId))),
+        "failed to read the operation"
+      );
     }
   };
 }
