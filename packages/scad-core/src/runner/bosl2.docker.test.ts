@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @docker -- BOSL2 library mounting. `renderViews`/`runSyntaxCheck`/etc.
 // accept an explicit `libraryPaths` parameter (Issue #14: "accept a library
 // path parameter -- packages/libs supplies it later"). Issue #19 has since

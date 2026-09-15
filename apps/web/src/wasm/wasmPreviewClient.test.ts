@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// GPL ZONE — Issue #31.
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WasmPreviewClient } from "./wasmPreviewClient.js";
 import type { WasmWorkerMessage } from "./protocol.js";

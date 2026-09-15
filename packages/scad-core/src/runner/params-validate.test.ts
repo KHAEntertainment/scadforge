@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @scadforge/scad-core — unit tests for `validateParamValues` (Issue #32).
 // No Docker needed: pure function over hand-built `ParamSchema`s.
 import { describe, expect, it } from "vitest";

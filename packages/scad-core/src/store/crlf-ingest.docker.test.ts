@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 // @scadforge/scad-core — Issue #40 regression: the systemic CRLF fix.
 //
 // CRLF-authored source enters a project → the store's write boundary
