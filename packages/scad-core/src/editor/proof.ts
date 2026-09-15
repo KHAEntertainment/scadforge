@@ -67,6 +67,7 @@ import { weldTriangleSoup } from "../validate/mesh-utils.js";
 import { buildTopology } from "../geometry/topology.js";
 import { findRadialMatches } from "../geometry/radialMatch.js";
 import { principalAxisOf } from "../geometry/regionGrowth.js";
+import { PROOF_THRESHOLDS } from "../geometry/thresholds.js";
 import type { Axis, Vec3 } from "../geometry/vec.js";
 import type { WeldedMesh } from "../geometry/mesh.js";
 import type { CylinderInspection } from "../geometry/inspectionTypes.js";
@@ -79,21 +80,6 @@ export const RECOGNIZER_VERSION = "s3-b-b5.1";
 
 /** Proof TTL (wire-and-recovery spec, "Proof record and value domain"). */
 export const PROOF_TTL_MS = 10 * 60 * 1000;
-
-// Starting thresholds for the linear/radial probe checks (distinct from
-// `../geometry/thresholds.ts`'s S2 recognizer thresholds, which govern
-// recognition itself, not this probe's tolerance for comparing a rendered
-// measurement against the declared relation). Calibrate on the clamp/hinge
-// `@docker` fixtures; a test needing a different value is a signal to
-// bring back for review, not to retune silently, same as S2's own table.
-const PROOF_THRESHOLDS = {
-  /** Max |rendered extent − (scale·param + offset)| in mm before a linear check refuses. */
-  linearExtentToleranceMm: 0.05,
-  /** Max drift in the anchored face's absolute position (mm) across samples before a linear check refuses. */
-  linearAnchorToleranceMm: 0.05,
-  /** Max drift (mm) in a matched region's axial center position across samples before it is treated as a DIFFERENT region for the cross-sample identity comparison (module header's ruling). A genuinely unchanged physical feature's axial position is numerically identical run to run; this only needs to absorb float noise, not tolerate real movement. */
-  radialIdentityAxialToleranceMm: 0.05
-} as const;
 
 export interface ProofSample {
   kind: "baseline" | "candidate" | "perturbation";
@@ -119,6 +105,18 @@ export interface ProofRecord {
   traversal: EditorTraversal | null;
   /** Exact resulting candidate params; `null` for `remove-feature` (no rendering). */
   candidateParams: ParamValues | null;
+  /**
+   * Audit field (review Q1/A3): `true` for `put-feature` (baseline ==
+   * candidate by construction — the command itself changes no value, only
+   * up to two perturbations differ, correction C4), `false` for
+   * `set-value` (baseline and candidate are the command's proposed
+   * change, ordinarily distinct — see `planSetValueSamples`'s doc comment
+   * for the rare numerically-equal edge case, still recorded `false`
+   * since the COMMAND kind is what this field reports), `null` for
+   * `remove-feature` (no candidate at all). Computed from the command
+   * kind already in hand; no extra render.
+   */
+  candidateEqualsBaseline: boolean | null;
   samples: ProofSample[];
   recognizerVersion: string;
   /** Pinned OpenSCAD engine image digest (`resolveOpenscadImage`). */
@@ -352,6 +350,18 @@ function checkRadialSample(mesh: WeldedMesh, binding: Extract<Binding, { kind: "
 
 // ── main entry ────────────────────────────────────────────────────────────
 
+/** `null` for `remove-feature` (no candidate at all); `true`/`false` for the other two command kinds — see `ProofRecord.candidateEqualsBaseline`'s doc comment. */
+function candidateEqualsBaselineFor(command: EditorCommand): boolean | null {
+  switch (command.kind) {
+    case "put-feature":
+      return true;
+    case "set-value":
+      return false;
+    case "remove-feature":
+      return null;
+  }
+}
+
 function buildRecord(input: RunProbeInput, candidateParams: ParamValues | null, samples: ProofSample[], sourceFingerprint: string, engineImage: string): ProofRecord {
   const issuedAt = new Date();
   const expiresAt = new Date(issuedAt.getTime() + PROOF_TTL_MS);
@@ -368,6 +378,7 @@ function buildRecord(input: RunProbeInput, candidateParams: ParamValues | null, 
     intent: input.intent,
     traversal: input.traversal,
     candidateParams,
+    candidateEqualsBaseline: candidateEqualsBaselineFor(input.command),
     samples,
     recognizerVersion: RECOGNIZER_VERSION,
     engineImage,

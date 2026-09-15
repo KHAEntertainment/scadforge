@@ -51,3 +51,41 @@ export const INSPECTION_THRESHOLDS = {
 } as const;
 
 export type InspectionThresholds = typeof INSPECTION_THRESHOLDS;
+
+/**
+ * Starting thresholds for `../editor/proof.ts`'s linear/radial probe checks
+ * (Issue #91, S3-B ticket B5 review A1/A2: "thresholds live in one file" —
+ * moved here from `proof.ts` so no threshold constant used anywhere under
+ * this package lives outside this module). Distinct from
+ * `INSPECTION_THRESHOLDS` above, which governs RECOGNITION itself (does a
+ * region fit a circle at all); these govern the probe's own comparison of a
+ * rendered measurement against the binding's DECLARED relation, once a
+ * region has already been recognized.
+ *
+ * All three are `INSPECTION_THRESHOLDS.maxDeviationMm` (0.01 mm — the S2
+ * single-sample circle-fit precision, used unchanged and directly by
+ * `radialMatch.ts`'s own per-sample radial-position and diameter-match
+ * criteria) widened ×5, not a separately invented precision tier — each
+ * measures something coarser than one circle fit:
+ *   - `linearExtentToleranceMm`/`linearAnchorToleranceMm` compare a bounding
+ *     -box EXTREME-VERTEX measurement (two data points: the mesh's min and
+ *     max along an axis) against an analytically-computed expected value,
+ *     not a many-point circle-fit residual.
+ *   - `radialIdentityAxialToleranceMm` compares a region's fitted axial
+ *     CENTER (itself derived from a min/max range, like the linear
+ *     measurements) across TWO INDEPENDENT renders (cross-sample region
+ *     identity — module header's match-criteria ruling in `proof.ts`), not
+ *     within one.
+ * A genuinely unchanged measurement is numerically near-identical run to
+ * run; the ×5 widening absorbs these compounded effects, not real movement
+ * — see `proof.docker.test.ts`'s calibration assertions, which measure the
+ * actual drift on real fixtures and require it stay well under this bound.
+ */
+export const PROOF_THRESHOLDS = {
+  /** Max |rendered extent − (scale·param + offset)| in mm before a linear check refuses. */
+  linearExtentToleranceMm: 0.05,
+  /** Max drift in the anchored face's absolute position (mm) across samples before a linear check refuses. */
+  linearAnchorToleranceMm: 0.05,
+  /** Max drift (mm) in a matched region's axial center position across samples before it is treated as a DIFFERENT region for the cross-sample identity comparison. */
+  radialIdentityAxialToleranceMm: 0.05
+} as const;

@@ -133,6 +133,7 @@ describe("runProbe — linear bindings", () => {
     if (result.status === "proved") {
       expect(result.record.samples.length).toBe(3); // baseline(10), candidate(15), one perturbation
       expect(result.record.candidateParams).toEqual({ wallThickness: 15 });
+      expect(result.record.candidateEqualsBaseline).toBe(false); // set-value (review Q1/A3)
       for (const sample of result.record.samples) {
         expect(sample.geometry.kind).toBe("linear");
         if (sample.geometry.kind === "linear") {
@@ -332,6 +333,7 @@ describe("runProbe — degenerate cases", () => {
     if (result.status === "proved") {
       expect(result.record.samples.length).toBe(2);
       expect(result.record.candidateParams).toEqual({ wallThickness: 50 });
+      expect(result.record.candidateEqualsBaseline).toBe(true); // put-feature (review Q1/A3)
     }
   });
 
@@ -345,6 +347,7 @@ describe("runProbe — degenerate cases", () => {
     expect(result.status).toBe("proved");
     if (result.status === "proved") {
       expect(result.record.samples.length).toBe(3);
+      expect(result.record.candidateEqualsBaseline).toBe(true); // put-feature (review Q1/A3)
     }
   });
 });
@@ -358,6 +361,7 @@ describe("runProbe — remove-feature", () => {
     if (result.status === "proved") {
       expect(result.record.samples).toEqual([]);
       expect(result.record.candidateParams).toBeNull();
+      expect(result.record.candidateEqualsBaseline).toBeNull(); // remove-feature (review Q1/A3)
     }
     expect(render).not.toHaveBeenCalled();
   });
@@ -386,6 +390,7 @@ describe("persistProofRecord + lookupProofLocked", () => {
       intent: digestInput.intent,
       traversal: digestInput.traversal,
       candidateParams: null,
+      candidateEqualsBaseline: null, // remove-feature
       samples: [],
       recognizerVersion: "test",
       engineImage: "openscad/openscad@sha256:test",

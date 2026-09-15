@@ -11,7 +11,28 @@ import { describe, expect, it } from "vitest";
 import type { EditorFeature } from "@scadforge/protocol";
 import { runParamExport } from "../runner/param-export.js";
 import { dockerAvailable } from "../test-support/docker-available.js";
+import { PROOF_THRESHOLDS } from "../geometry/thresholds.js";
+import type { ProofRecord } from "./proof.js";
 import { runProbe, type RunProbeInput } from "./proof.js";
+
+/**
+ * Review Q2 calibration evidence: the real cross-sample axial-center drift
+ * of a matched radial region's representative center, on an actual render
+ * -- not the 0.05mm safety margin `PROOF_THRESHOLDS.radialIdentityAxialToleranceMm`
+ * enforces, but what a genuinely unchanged physical feature's axial
+ * position actually measures as, run to run. `axisIndex` is 0/1/2 for the
+ * declared binding's x/y/z axis (the index into `ProofSample["geometry"]`'s
+ * `centerMm` tuple).
+ */
+function maxAxialDrift(record: ProofRecord, axisIndex: 0 | 1 | 2): number {
+  const axialValues = record.samples.map((sample) => {
+    if (sample.geometry.kind !== "radial" || sample.geometry.centerMm === null) {
+      throw new Error("maxAxialDrift: expected every sample to be a matched radial sample");
+    }
+    return sample.geometry.centerMm[axisIndex];
+  });
+  return Math.max(...axialValues) - Math.min(...axialValues);
+}
 
 const REPO_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 const CLAMP_SCAD = `${REPO_ROOT}evals/scenario-a2/fixture/clamp.scad`;
@@ -249,6 +270,14 @@ describe.skipIf(!dockerAvailable())("@docker proof.ts against the repository cla
             expect(sample.geometry.diameterMm).toBeCloseTo(sample.paramValues.bore_d as number, 3);
           }
         }
+
+        // Review Q2 calibration evidence: the declared axis is X (axisIndex 0).
+        // console.log so the measured value is visible in the gate output
+        // regardless of pass/fail (a passing expect's message is not
+        // printed by default).
+        const drift = maxAxialDrift(result.record, 0);
+        console.log(`[calibration] segmented-bores axial-center drift: ${drift.toFixed(6)}mm (target < 0.01mm, enforced bound ${PROOF_THRESHOLDS.radialIdentityAxialToleranceMm}mm)`);
+        expect(drift, `measured cross-sample axial-center drift: ${drift.toFixed(6)}mm (target < 0.01mm, enforced bound ${PROOF_THRESHOLDS.radialIdentityAxialToleranceMm}mm)`).toBeLessThan(0.01);
       }
     }, 60_000);
   });
@@ -292,6 +321,14 @@ describe.skipIf(!dockerAvailable())("@docker proof.ts against the repository cla
             expect(sample.geometry.diameterMm).toBeCloseTo(sample.paramValues.pipe_dia as number, 3);
           }
         }
+
+        // Review Q2 calibration evidence: the declared axis is Z (axisIndex 2).
+        // console.log so the measured value is visible in the gate output
+        // regardless of pass/fail (a passing expect's message is not
+        // printed by default).
+        const drift = maxAxialDrift(result.record, 2);
+        console.log(`[calibration] clamp pipe-bore axial-center drift: ${drift.toFixed(6)}mm (target < 0.01mm, enforced bound ${PROOF_THRESHOLDS.radialIdentityAxialToleranceMm}mm)`);
+        expect(drift, `measured cross-sample axial-center drift: ${drift.toFixed(6)}mm (target < 0.01mm, enforced bound ${PROOF_THRESHOLDS.radialIdentityAxialToleranceMm}mm)`).toBeLessThan(0.01);
       }
     }, 60_000);
 
