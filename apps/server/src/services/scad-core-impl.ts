@@ -59,6 +59,7 @@ import type {
 import {
   ABORTED_REPLAY_MESSAGE,
   DEFAULT_VIEWS,
+  ScadForgeError,
   analyzeSourceParams,
   applyEditorCommand,
   applyEditorTraversal,
@@ -537,8 +538,21 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
           // running before this is ever called.
           const reserved = await reserveClaimLocked(ctx, request.operationId, digest, request);
 
+          // NOTE: every throw inside this callback MUST be a `ScadForgeError`
+          // (scad-core's own typed error), never `apps/server`'s `RouteError`.
+          // `withRecoveredProject` wraps this whole callback in scad-core's
+          // own `withTypedError`, which only preserves the code of an error
+          // that is ALREADY a `ScadForgeError` (`ScadForgeError.normalize`);
+          // anything else -- including a `RouteError`, a class scad-core has
+          // never heard of -- gets flattened to a generic `INTERNAL_ERROR`
+          // ("failed to acquire the recovery boundary for '<dir>': <message>"),
+          // silently losing the intended CONFLICT/VALIDATION_FAILED code. The
+          // outer `asRouteResult`/`toRouteError` (runtime.ts) converts a
+          // `ScadForgeError` back into the equivalent `RouteError` once it
+          // propagates past this boundary, so the wire-visible status is
+          // unaffected -- only the class thrown FROM INSIDE the lock matters.
           if (reserved.kind === "conflict") {
-            throw new RouteError("CONFLICT", "A different request already used this operation id; refresh and submit a new operation.");
+            throw new ScadForgeError("CONFLICT", "A different request already used this operation id; refresh and submit a new operation.");
           }
           if (reserved.kind === "same-request") {
             const terminal = reserved.terminal;
@@ -550,15 +564,15 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
               // claim still pending here cannot belong to a caller genuinely
               // in flight (it would still hold the lock). Unreachable in
               // practice; kept as a typed response rather than an assertion.
-              throw new RouteError("CONFLICT", "This operation is still being processed; check its status and retry.");
+              throw new ScadForgeError("CONFLICT", "This operation is still being processed; check its status and retry.");
             }
             if (terminal.kind === "committed") {
               return terminal.receipt; // idempotent replay: identical receipt.
             }
             if (terminal.kind === "rejected") {
-              throw new RouteError(terminal.error.error_code, terminal.error.message); // original status, verbatim.
+              throw new ScadForgeError(terminal.error.error_code, terminal.error.message); // original status, verbatim.
             }
-            throw new RouteError("CONFLICT", ABORTED_REPLAY_MESSAGE); // aborted
+            throw new ScadForgeError("CONFLICT", ABORTED_REPLAY_MESSAGE); // aborted
           }
 
           // reserved.kind === "reserved" -- a genuinely fresh claim. Returns
@@ -567,9 +581,9 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
           // reliably narrows on; a `never`-returning helper thrown FROM
           // INSIDE itself does not narrow a caller's later reads the same
           // way when only awaited, not thrown, at the call site.
-          const rejectionError = async (code: "VALIDATION_FAILED" | "CONFLICT", message: string): Promise<RouteError> => {
+          const rejectionError = async (code: "VALIDATION_FAILED" | "CONFLICT", message: string): Promise<ScadForgeError> => {
             await recordClaimRejectedLocked(ctx, request.operationId, { error_code: code, message });
-            return new RouteError(code, message);
+            return new ScadForgeError(code, message);
           };
 
           const state = await coherentSourceStateLocked(ctx);
