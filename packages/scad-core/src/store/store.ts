@@ -58,6 +58,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createTwoFilesPatch } from "diff";
@@ -83,7 +84,6 @@ import {
   metaDir,
   nextSnapshotId,
   projectFilePath,
-  rootModelPath,
   rootParamsPath,
   snapshotDir
 } from "./paths.js";
@@ -102,6 +102,13 @@ import {
   resolveSnapshotValidationPath,
   snapshotMeshPath
 } from "./attachments.js";
+import {
+  decideLocked,
+  publishLocked,
+  reconcileTransactionLocked,
+  stageTransactionLocked,
+  type TransactionIntent
+} from "./transaction.js";
 
 // ── ProjectManifest (project.json) ──────────────────────────────────────────
 
@@ -364,22 +371,50 @@ export async function createSnapshot(projectDir: string, input: CreateSnapshotIn
   return withRecoveredProject(projectDir, (ctx) => createSnapshotLocked(ctx, input));
 }
 
-/** `ctx`-taking sibling of {@link createSnapshot} for a caller that already holds the boundary (`initProjectLocked`, `revertToSnapshotLocked`, `mergeParamsAtomic`'s `persist`, `apps/server`'s composed writers). Never reacquires the lock. */
+/**
+ * `ctx`-taking sibling of {@link createSnapshot} for a caller that already
+ * holds the boundary (`initProjectLocked`, `revertToSnapshotLocked`,
+ * `mergeParamsAtomic`'s `persist`, `apps/server`'s composed writers). Never
+ * reacquires the lock.
+ *
+ * S3-B ticket B4: publishes through the staged roll-forward transaction
+ * mechanism (`stageTransactionLocked` → `decideLocked` → `publishLocked`,
+ * `transaction.ts`) instead of a bare write sequence. Nothing authoritative
+ * changes before `decideLocked`'s `commit.json` is durable. If anything
+ * throws before that point, {@link reconcileTransactionLocked} is called
+ * synchronously (not merely left for the next boundary entry) so the
+ * claimed-but-unstaged/unpublished `history/<id>` directory never lingers as
+ * a visible partial entry — this is what keeps `claimNextSnapshotId`'s
+ * "the id claim stays the id reservation; an abandoned reservation leaves a
+ * gap, never a partial entry" true even for an ordinary in-process failure,
+ * not only a real crash.
+ */
 export async function createSnapshotLocked(ctx: LockedProject, input: CreateSnapshotInput): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
       const { id, parent } = await claimNextSnapshotId(ctx);
-      const dir = snapshotDir(ctx.projectDir, id);
+      const transactionId = randomUUID();
       try {
-        return await writeSnapshotFiles(ctx, dir, id, parent, input);
+        const intent = await buildSnapshotIntent(ctx, transactionId, id, parent, input);
+        const staged = await stageTransactionLocked(ctx, intent);
+        const decided = await decideLocked(ctx, staged);
+        await publishLocked(ctx, decided);
+        // The manifest we just staged & published, verbatim -- matches the
+        // pre-B4 behavior of returning the in-memory object rather than
+        // re-reading it (no DERIVED enrichment exists yet for a snapshot
+        // this call just created).
+        return intent.snapshot!.manifest;
       } catch (err) {
-        // The id was claimed but the write didn't complete -- clean up the
-        // partial directory so it never lingers as a corrupt/unlistable
-        // snapshot (best-effort; the real error below is what's reported).
-        // This is also what satisfies AC6 if `project.json` corruption is
-        // instead observed by writeSnapshotFiles's OWN later re-read of it
-        // (updating head) rather than by claimNextSnapshotId's earlier one.
-        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        // Best-effort, synchronous self-heal: if `commit.json` was never
+        // written, this aborts the transaction (quarantining any staged
+        // bytes) and removes the claimed `history/<id>` directory -- but
+        // ONLY if it is still empty, and NEVER if a commit.json exists (see
+        // `transaction.ts`'s `reconcileTransactionLocked`). If publication
+        // was already durable and merely partial, this instead FINISHES it
+        // idempotently. Swallowed here because the ORIGINAL error below is
+        // what the caller needs to see; a real crash gets the same
+        // reconciliation from the next boundary entry's `recover()` either way.
+        await reconcileTransactionLocked(ctx, transactionId, id).catch(() => {});
         throw err;
       }
     },
@@ -388,65 +423,53 @@ export async function createSnapshotLocked(ctx: LockedProject, input: CreateSnap
   );
 }
 
-async function writeSnapshotFiles(
+/**
+ * Builds the COMPLETE `TransactionIntent` for a new snapshot: every root and
+ * history byte this operation will publish, computed from reads only —
+ * nothing here touches the real `history/<id>` directory or any root file.
+ * Throws (before any staging begins) exactly where `writeSnapshotFiles` used
+ * to throw: a corrupt `project.json`, or a root editor sidecar that is
+ * missing/corrupt/unsupported-version (`captureSidecarForSnapshotLocked`).
+ */
+async function buildSnapshotIntent(
   ctx: LockedProject,
-  dir: string,
+  transactionId: string,
   id: SnapshotId,
   parent: SnapshotId | null,
   input: CreateSnapshotInput
-): Promise<SnapshotManifest> {
+): Promise<TransactionIntent> {
   const projectRead = await readProjectManifestOrNullLocked(ctx);
   if (projectRead.kind === "corrupt") throw projectRead.error;
   const project = projectRead.kind === "present" ? projectRead.value : null;
-  const viewsDirPath = join(dir, PROJECT_LAYOUT.snapshot.viewsDir);
-  await mkdir(viewsDirPath, { recursive: true });
 
-  // Normalize to LF-only (Issue #40) BEFORE writing, so the snapshot, root
+  // Normalize to LF-only (Issue #40) BEFORE staging, so the snapshot, root
   // `model.scad`, and the `diff.patch` against the parent all carry identical
   // bytes -- the CLI runner and `--export-format=param` parser then never see
   // a CRLF file the store did not intend.
   const content = normalizeLineEndings(input.content);
-
-  // model.scad
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), content, "utf8");
 
   // params.json (Customizer preset format, matching the project root convention)
   const paramsFile: ParamsFile = {
     fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
     parameterSets: { [PARAMS_ACTIVE_PRESET]: input.params }
   };
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.paramsFile), JSON.stringify(paramsFile, null, 2), "utf8");
 
-  // message.md
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.messageFile), input.message ?? "", "utf8");
-
-  // diff.patch vs parent (null for the first snapshot)
-  let diffPatchRel: string | null = null;
+  // diff.patch vs parent (null for the first snapshot) -- a READ of the
+  // parent's own already-committed, immutable bytes; never touches staging.
+  let diffPatch: string | null = null;
   if (parent !== null) {
     const parentContent = await readFile(
       join(snapshotDir(ctx.projectDir, parent), PROJECT_LAYOUT.snapshot.modelFile),
       "utf8"
     ).catch(() => "");
-    const patch = createTwoFilesPatch(
-      `${parent}/model.scad`,
-      `${id}/model.scad`,
-      parentContent,
-      content
-    );
-    await writeFile(join(dir, PROJECT_LAYOUT.snapshot.diffFile), patch, "utf8");
-    diffPatchRel = PROJECT_LAYOUT.snapshot.diffFile;
+    diffPatch = createTwoFilesPatch(`${parent}/model.scad`, `${id}/model.scad`, parentContent, content);
   }
 
   // validation.json (verbatim ValidationReport) + the manifest's lightweight summary
-  let validationJsonRel: string | null = null;
+  let validationJson: string | null = null;
   let validationSummary: ValidationSummary | null = null;
   if (input.validation) {
-    await writeFile(
-      join(dir, PROJECT_LAYOUT.snapshot.validationFile),
-      JSON.stringify(input.validation.report, null, 2),
-      "utf8"
-    );
-    validationJsonRel = PROJECT_LAYOUT.snapshot.validationFile;
+    validationJson = JSON.stringify(input.validation.report, null, 2);
     validationSummary = {
       badge: input.validation.gate.badge,
       manifold: input.validation.report.manifold,
@@ -456,17 +479,18 @@ async function writeSnapshotFiles(
     };
   }
 
-  // renders
+  // renders -- staged by copying the caller's source PNG bytes; no live
+  // caller passes these through `CreateSnapshotInput` today (renders attach
+  // AFTER creation via `attachments.ts`), but the shape is preserved.
   const renders: RenderRef[] = [];
+  const renderEntries: { view: string; sourcePath: string }[] = [];
   for (const r of input.renders ?? []) {
     const file = `${PROJECT_LAYOUT.snapshot.viewsDir}/${r.view}.png`;
-    const dest = join(dir, file);
-    await copyFile(r.sourcePath, dest);
-    const { size } = await stat(dest);
-    // width/height are not re-derived here (the frozen camera contract
-    // fixes them per DEFAULT_IMAGE_SIZE / the request's imgsize override);
-    // callers that need exact per-file dimensions read them from the
-    // RenderResult that produced r.sourcePath.
+    const { size } = await stat(r.sourcePath);
+    // width/height are not re-derived here (the frozen camera contract fixes
+    // them per DEFAULT_IMAGE_SIZE / the request's imgsize override); callers
+    // that need exact per-file dimensions read them from the RenderResult
+    // that produced r.sourcePath.
     renders.push({
       view: r.view,
       file,
@@ -476,6 +500,7 @@ async function writeSnapshotFiles(
       bytes: size,
       render_ms: r.render_ms
     });
+    renderEntries.push({ view: r.view, sourcePath: r.sourcePath });
   }
 
   // editor.json (S3-B B3, Issue #87): every new snapshot -- including
@@ -483,12 +508,11 @@ async function writeSnapshotFiles(
   // the CURRENT root editor sidecar verbatim. Refuses (never silently drops
   // or fabricates) when the current root sidecar is missing/corrupt/
   // unsupported-version; a legacy project's sidecar-naive first snapshot
-  // establishes the root sidecar and reports `legacyMarkerFlip`, which is
-  // applied to the SAME in-memory `project` object below so the marker flip
-  // and the head/updated bump publish in ONE `project.json` write (sidecar
-  // bytes are written before this point, satisfying "sidecar then manifest").
+  // establishes the root sidecar (its OWN small transaction,
+  // `sidecar.ts`'s `writeSidecarBytesLocked`) and reports `legacyMarkerFlip`,
+  // which this transaction folds into the SAME `project.json` write it
+  // already stages for `head`/`updated`.
   const sidecarCapture = await captureSidecarForSnapshotLocked(ctx);
-  await writeFile(join(dir, "editor.json"), sidecarCapture.bytes, "utf8");
 
   const manifest: SnapshotManifest = {
     id,
@@ -501,8 +525,8 @@ async function writeSnapshotFiles(
       model_scad: PROJECT_LAYOUT.snapshot.modelFile,
       params_json: PROJECT_LAYOUT.snapshot.paramsFile,
       message_md: PROJECT_LAYOUT.snapshot.messageFile,
-      validation_json: validationJsonRel,
-      diff_patch: diffPatchRel
+      validation_json: validationJson !== null ? PROJECT_LAYOUT.snapshot.validationFile : null,
+      diff_patch: diffPatch !== null ? PROJECT_LAYOUT.snapshot.diffFile : null
     },
     params: input.params,
     renders,
@@ -510,22 +534,35 @@ async function writeSnapshotFiles(
     annotations: [],
     editor: sidecarCapture.descriptor
   };
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(manifest, null, 2), "utf8");
 
-  // Update root model.scad / params.json to the current state.
-  await writeFile(rootModelPath(ctx.projectDir), content, "utf8");
-  await writeFile(rootParamsPath(ctx.projectDir), JSON.stringify(paramsFile, null, 2), "utf8");
+  const updatedProject: ProjectManifest | undefined = project
+    ? {
+        ...project,
+        head: id,
+        updated: manifest.timestamp,
+        ...(sidecarCapture.legacyMarkerFlip ? { editor_store_version: 1 as const } : {})
+      }
+    : undefined;
 
-  // Update project.json head (and, if this snapshot flipped a legacy
-  // project's editor marker above, editor_store_version too -- ONE write).
-  if (project) {
-    project.head = id;
-    project.updated = manifest.timestamp;
-    if (sidecarCapture.legacyMarkerFlip) project.editor_store_version = 1;
-    await writeProjectManifest(ctx.projectDir, project);
-  }
-
-  return manifest;
+  return {
+    transactionId,
+    root: {
+      model: content,
+      params: paramsFile,
+      ...(updatedProject ? { project: updatedProject } : {})
+    },
+    snapshot: {
+      id,
+      manifest,
+      model: content,
+      params: paramsFile,
+      message: input.message ?? "",
+      diff: diffPatch,
+      validation: validationJson,
+      sidecar: sidecarCapture.bytes,
+      renders: renderEntries
+    }
+  };
 }
 
 /**
@@ -595,11 +632,17 @@ export async function readSnapshotManifestLocked(ctx: LockedProject, id: Snapsho
 }
 
 /**
- * Lists every snapshot manifest, oldest first. An unreadable snapshot
- * directory fails the WHOLE listing, naming the offending id — never a
- * silent skip (Issue #73 AC8): a caller that got a shorter-than-expected
- * list before had no way to know a snapshot was missing versus simply
- * created later.
+ * Lists every snapshot manifest, oldest first. A directory with NO
+ * `manifest.json` at all is not (yet) a snapshot — an abandoned
+ * `claimNextSnapshotId` reservation a crash left behind before any staging
+ * transaction started, which `recover()` cannot discover on its own (no
+ * transaction is linked to it — Issue #90 correction C2) — and is skipped
+ * rather than failing the listing; the NEXT writer either reclaims the same
+ * id (Issue #28) or moves past it. A directory whose `manifest.json` EXISTS
+ * but is unparseable is genuine corruption and still fails the WHOLE
+ * listing, naming the offending id — never a silent skip (Issue #73 AC8): a
+ * caller that got a shorter-than-expected list before had no way to know a
+ * snapshot was missing versus simply created later.
  */
 export async function listSnapshots(projectDir: string): Promise<SnapshotManifest[]> {
   return withRecoveredProject(projectDir, (ctx) => listSnapshotsLocked(ctx));
@@ -624,6 +667,11 @@ export async function listSnapshotsLocked(ctx: LockedProject): Promise<SnapshotM
         try {
           manifests.push(await readSnapshotManifestLocked(ctx, id));
         } catch (err) {
+          // See this function's own doc comment (Issue #90 correction C2):
+          // no manifest.json at all -> not yet a snapshot, skip; anything
+          // else (a manifest.json that exists but fails to parse) is
+          // genuine corruption and still fails the whole listing.
+          if (ScadForgeError.is(err) && err.error_code === "SNAPSHOT_NOT_FOUND") continue;
           throw new ScadForgeError(
             "INTERNAL_ERROR",
             `failed to list snapshots in '${ctx.projectDir}': snapshot '${id}' is unreadable (${
@@ -885,4 +933,44 @@ export async function mergeParamsAtomic<T>(
     const merged = { ...current, ...accepted };
     return persist(merged, ctx);
   });
+}
+
+// ── snapshot-free root params write (S3-B ticket B4) ────────────────────────
+
+/**
+ * Writes the project's root `params.json` WITHOUT creating a snapshot — the
+ * `snapshot: false` path of `PUT /api/projects/:id/params`, staged through
+ * its own transaction (stage → decide → publish, `transaction.ts`) so a
+ * crash mid-write is recoverable exactly like every other root writer.
+ * Replaces `apps/server`'s former bare `writeRootParamsLocked` (Issue #90:
+ * "a snapshot-free params write stages the affected root document[] ...
+ * never reconstructing from the old head" — this stages ONLY `params.json`,
+ * touching root `model.scad`/`editor.json`/`project.json` not at all).
+ *
+ * Takes `ctx` (Issue #73): this is a root-state write, so it must run inside
+ * an active recovery boundary — its only caller (`scad-core-impl.ts`'s
+ * `updateParams`) already holds one via `mergeParamsAtomic`'s `persist`
+ * callback.
+ */
+export async function updateRootParamsLocked(ctx: LockedProject, params: ParamValues): Promise<void> {
+  return withTypedError(
+    async () => {
+      const transactionId = randomUUID();
+      try {
+        const paramsFile: ParamsFile = {
+          fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
+          parameterSets: { [PARAMS_ACTIVE_PRESET]: params }
+        };
+        const intent: TransactionIntent = { transactionId, root: { params: paramsFile } };
+        const staged = await stageTransactionLocked(ctx, intent);
+        const decided = await decideLocked(ctx, staged);
+        await publishLocked(ctx, decided);
+      } catch (err) {
+        await reconcileTransactionLocked(ctx, transactionId).catch(() => {});
+        throw err;
+      }
+    },
+    "INTERNAL_ERROR",
+    "failed to update params"
+  );
 }

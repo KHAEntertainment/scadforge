@@ -92,7 +92,8 @@ export {
   readSnapshotManifestLocked,
   recordExport,
   revertToSnapshot,
-  revertToSnapshotLocked
+  revertToSnapshotLocked,
+  updateRootParamsLocked
 } from "./store/store.js";
 export type { CreateSnapshotInput, InitProjectInput, RevertToSnapshotOptions } from "./store/store.js";
 export { PARAMS_LOCK_MAX_ATTEMPTS, withParamsLock } from "./store/params-lock.js";
@@ -161,3 +162,44 @@ export type { SidecarReadResult } from "./editor/sidecar.js";
 // document consume alongside B7's agent context -- see canonical.ts's
 // `sourceFingerprint` doc comment.
 export { sourceFingerprint } from "./editor/canonical.js";
+
+// ── staged roll-forward transactions and durable operation claims
+// (Issue #90 / S3-B ticket B4) ──────────────────────────────────────────────
+//
+// Kept as its OWN block, separate from B5's (which adds a parallel export
+// block to this same file — see the S3-B ticket story's "Shared seams"
+// note), so a concurrent merge of both tickets' export lists stays a
+// trivial textual merge. `stageTransactionLocked`/`decideLocked`/
+// `publishLocked`/`reconcileTransactionLocked` are consumed by `store.ts`
+// and `editor/sidecar.ts` internally via relative imports; exported here so
+// B6 (editor commands) and B8 (fault qualification) can drive the same
+// mechanism without reaching into `store/` by a relative path.
+export {
+  abortTransactionLocked,
+  decideLocked,
+  faultPoint,
+  publishLocked,
+  reconcileTransactionLocked,
+  recoverTransactionsLocked,
+  stageTransactionLocked
+} from "./store/transaction.js";
+export type {
+  CommitDecision,
+  DecidedTransaction,
+  FaultPointName,
+  StagedTransaction,
+  TransactionClaimLink,
+  TransactionIntent,
+  TransactionRootFiles,
+  TransactionSnapshotFiles
+} from "./store/transaction.js";
+export {
+  ABORTED_REPLAY_MESSAGE,
+  decideReplay,
+  lookupClaimLocked,
+  recordClaimAbortedLocked,
+  recordClaimCommittedLocked,
+  recordClaimRejectedLocked,
+  reserveClaimLocked
+} from "./store/claims.js";
+export type { ClaimLookupResult, ClaimTerminalState, OperationClaim, ReplayDecision, ReserveClaimResult } from "./store/claims.js";

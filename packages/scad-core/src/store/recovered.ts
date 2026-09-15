@@ -7,10 +7,9 @@
 // `project.json`, and — from B4 — staged transactions). It:
 //   1. Acquires the params lock (`params-lock.ts`, itself `file-lock.ts`'s
 //      cross-process mkdir mutex with stale-owner reclaim).
-//   2. Runs `recover(ctx)` — a STUB here; B4 fills it with staged-transaction
-//      roll-forward recovery. Today it is a documented no-op, so every
-//      caller already built against this exact shape needs no further
-//      change once B4 lands.
+//   2. Runs `recover(ctx)` — reconciles any staged roll-forward transaction
+//      left incomplete by a prior crash (`transaction.ts`'s
+//      `recoverTransactionsLocked`, S3-B ticket B4) before `fn` ever runs.
 //   3. Hands `fn` an opaque `LockedProject` context.
 //
 // Every writer and coherent reader migrated for this ticket (`store.ts`,
@@ -51,6 +50,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { ScadForgeError, withTypedError } from "../errors.js";
 import { withParamsLock } from "./params-lock.js";
+import { recoverTransactionsLocked } from "./transaction.js";
 
 declare const LOCK_BRAND: unique symbol;
 
@@ -79,14 +79,19 @@ export type ReadResult<T> = { kind: "absent" } | { kind: "present"; value: T } |
 
 /**
  * Recovers any incomplete staged transaction for `ctx.projectDir` before the
- * caller's `fn` runs. STUB in this ticket — B4 (staged roll-forward
- * transactions) implements staged-transaction recovery here. Today it is a
- * documented no-op, so `withRecoveredProject`'s call shape (acquire lock,
- * recover, hand out `ctx`) is already exactly what every later ticket
- * builds against; landing B4 changes only this function's body.
+ * caller's `fn` runs (Issue #90, S3-B ticket B4): reconciles every directory
+ * under `.scadforge/editor-transactions/` against the crash-boundary table
+ * (`transaction.ts`'s `recoverTransactionsLocked`) — a staging directory with
+ * no durable `commit.json` is aborted (its linked claim, if any, marked
+ * `aborted`; the staging bytes quarantined, never deleted); one WITH a
+ * `commit.json` is either finished (idempotent publish resumption) or, if
+ * its staged bytes no longer match their recorded digests, refused with
+ * `INTERNAL_ERROR` naming the transaction, preserving everything for
+ * inspection. A project with no `editor-transactions/` directory at all
+ * (the overwhelming common case) returns immediately.
  */
-async function recover(_ctx: LockedProject): Promise<void> {
-  // no-op — B4 fills this in.
+async function recover(ctx: LockedProject): Promise<void> {
+  await recoverTransactionsLocked(ctx);
 }
 
 /**

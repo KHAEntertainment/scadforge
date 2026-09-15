@@ -58,37 +58,44 @@
 // capture the current sidecar into every new snapshot and to copy a target
 // snapshot's sidecar forward on revert.
 //
+// S3-B ticket B4 adds a SECOND one-way dependency, `sidecar.ts → store/
+// transaction.ts`: every root sidecar write below now goes through the
+// staged roll-forward mechanism (stage → decide → publish) instead of a bare
+// temp-file rename, so a crash mid-write is recoverable exactly like every
+// other root/history writer (Issue #90's "route B3's root and history
+// sidecar writes through staging rather than duplicating the canonicalization
+// math"). `store/transaction.ts` itself never imports this module (it takes
+// `sidecarPath` from `store/paths.ts` and `EMPTY_SIDECAR` from
+// `./sidecar-empty.js` instead), so no cycle results. Status derivation
+// (`readSidecarLocked`) and the canonical math (`canonicalSidecar`,
+// `serializeCanonicalSidecar`, `sidecarDigest`) are UNTOUCHED by this —
+// only the WRITE mechanics changed.
+//
 // SPDX-License-Identifier: Apache-2.0
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename } from "node:fs/promises";
 import { PROJECT_LAYOUT, parseEditorSidecar } from "@scadforge/protocol";
 import type { EditorSidecar, EditorSnapshotRef, ProjectManifest, SnapshotId } from "@scadforge/protocol";
 import { ScadForgeError } from "../errors.js";
 import { canonicalJson, canonicalSidecar, sidecarDigest as computeSidecarDigest } from "./canonical.js";
-import { metaDir, projectFilePath, snapshotDir } from "../store/paths.js";
+import { projectFilePath, quarantineDir, sidecarPath, snapshotDir, snapshotSidecarPath } from "../store/paths.js";
 import type { LockedProject, ReadResult } from "../store/recovered.js";
+import { decideLocked, publishLocked, stageTransactionLocked, type TransactionIntent } from "../store/transaction.js";
+import { EMPTY_SIDECAR } from "./sidecar-empty.js";
 
-/** File name of the sidecar, both at the project root and inside a snapshot directory — comes from `EditorSnapshotRef.file`, not the frozen `PROJECT_LAYOUT` (which has no entry for it; see the ticket's Architecture Constraint Reference). */
-const SIDECAR_FILE_NAME = "editor.json";
+// `sidecarPath`/`snapshotSidecarPath` now live in `store/paths.ts` (S3-B ticket
+// B4) so `store/transaction.ts`'s publish step can reference the root path
+// without an import cycle back through this module. Re-exported here so
+// every existing import of `./sidecar.js` (sidecar.test.ts included) keeps
+// working unchanged.
+export { sidecarPath, snapshotSidecarPath } from "../store/paths.js";
 
-/** `.scadforge/editor.json` — the root canonical `EditorSidecar`. */
-export function sidecarPath(projectDir: string): string {
-  return join(metaDir(projectDir), SIDECAR_FILE_NAME);
-}
-
-/** `history/<id>/editor.json` — one snapshot's captured sidecar copy. */
-export function snapshotSidecarPath(projectDir: string, id: SnapshotId): string {
-  return join(snapshotDir(projectDir, id), SIDECAR_FILE_NAME);
-}
-
-/** `.scadforge/quarantine/` — corrupt bytes preserved, never deleted. */
-function quarantineDir(projectDir: string): string {
-  return join(metaDir(projectDir), "quarantine");
-}
-
-/** The canonical empty sidecar — a NEW project's explicit starting state, and what a `legacy-empty` read reports. Never used as a placeholder for `missing`/`corrupt`/`unsupported-version` (see the header note). */
-export const EMPTY_SIDECAR: EditorSidecar = { version: 1, features: [] };
+// `EMPTY_SIDECAR` similarly moved to `./sidecar-empty.js` so `store/
+// transaction.ts` can reference it without importing this module. Re-exported
+// here for the same reason.
+export { EMPTY_SIDECAR } from "./sidecar-empty.js";
 
 /**
  * Result of {@link readSidecarLocked} / {@link readSnapshotSidecarLocked}. A
@@ -163,13 +170,6 @@ async function readRawSnapshotEditorDescriptor(projectDir: string, id: SnapshotI
 export function serializeCanonicalSidecar(sidecar: EditorSidecar): { canonical: EditorSidecar; bytes: string; digest: string } {
   const canonical = canonicalSidecar(sidecar);
   return { canonical, bytes: canonicalJson(canonical), digest: computeSidecarDigest(canonical) };
-}
-
-/** Atomic write via a sibling temp file + rename within the same directory (matches `store.ts`'s `recordExport` / `runner/validate-model.ts`'s own convention). */
-async function writeCanonicalBytesToFile(path: string, bytes: string): Promise<void> {
-  const tmpPath = `${path}.tmp`;
-  await writeFile(tmpPath, bytes, "utf8");
-  await rename(tmpPath, path);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -247,25 +247,16 @@ export async function readSidecarLocked(ctx: LockedProject): Promise<SidecarRead
 // ═════════════════════════════════════════════════════════════════════════════
 
 /**
- * Writes ONLY the root `.scadforge/editor.json` bytes (canonical form) via
- * temp-file + rename. Does NOT touch `project.json`'s marker — callers that
- * need to flip it do so themselves ({@link writeSidecarLocked} for an
- * explicit sidecar write; `store.ts`'s `writeSnapshotFiles` for a legacy
- * project's first ordinary snapshot, which flips the marker as part of the
- * SAME `project.json` write it already performs for `head`/`updated`).
- *
- * Refuses to overwrite `corrupt` or `unsupported-version` root bytes (Tech
- * Lead correction C2): silently replacing them would be exactly the kind of
- * data loss this ticket exists to prevent. The only way past them is an
+ * Throws when the CURRENT root sidecar is `corrupt` or `unsupported-version`
+ * (Tech Lead correction C2): silently replacing it would be exactly the kind
+ * of data loss this ticket exists to prevent. The only way past it is an
  * explicit {@link quarantine} call, after which the status reads `missing`
- * and this write proceeds normally. Writing over `missing` (nothing to
+ * and a write proceeds normally. Writing over `missing` (nothing to
  * preserve) or `legacy-empty`/`ready` (the normal path) is always allowed.
+ * Shared by {@link writeSidecarBytesLocked} and {@link writeSidecarLocked} —
+ * both must refuse BEFORE staging a single byte.
  */
-export async function writeSidecarBytesLocked(
-  ctx: LockedProject,
-  sidecar: EditorSidecar
-): Promise<{ sidecar: EditorSidecar; digest: string }> {
-  const current = await readSidecarLocked(ctx);
+async function refuseIfRootUntrustworthy(ctx: LockedProject, current: SidecarReadResult): Promise<void> {
   if (current.status === "corrupt" || current.status === "unsupported-version") {
     throw new ScadForgeError(
       "INTERNAL_ERROR",
@@ -274,31 +265,67 @@ export async function writeSidecarBytesLocked(
         "; quarantine the file first, then retry"
     );
   }
+}
+
+/**
+ * Writes ONLY the root `.scadforge/editor.json` bytes (canonical form),
+ * staged through its own snapshot-free transaction (S3-B ticket B4: stage →
+ * decide → publish) so a crash mid-write is recoverable exactly like every
+ * other root writer. Does NOT touch `project.json`'s marker — callers that
+ * need to flip it do so themselves ({@link writeSidecarLocked} for an
+ * explicit sidecar write; `store.ts`'s snapshot-creation transaction for a
+ * legacy project's first ordinary snapshot, which flips the marker in the
+ * SAME transaction as the new snapshot's own `head`/`updated`).
+ */
+export async function writeSidecarBytesLocked(
+  ctx: LockedProject,
+  sidecar: EditorSidecar
+): Promise<{ sidecar: EditorSidecar; digest: string }> {
+  const current = await readSidecarLocked(ctx);
+  await refuseIfRootUntrustworthy(ctx, current);
   const { canonical, bytes, digest } = serializeCanonicalSidecar(sidecar);
-  await writeCanonicalBytesToFile(sidecarPath(ctx.projectDir), bytes);
+  const intent: TransactionIntent = { transactionId: randomUUID(), root: { sidecar: bytes } };
+  const staged = await stageTransactionLocked(ctx, intent);
+  const decided = await decideLocked(ctx, staged);
+  await publishLocked(ctx, decided);
   return { sidecar: canonical, digest };
 }
 
 /**
  * Writes `sidecar` as the project's canonical root `.scadforge/editor.json`
- * (sidecar bytes first — see {@link writeSidecarBytesLocked}), then, if this
- * is a legacy project's first S3-aware mutation, sets `editor_store_version:
- * 1` on the manifest in the SAME publication, never before it (wire-and-
- * recovery §"Disk declarations"). Never downgrades an already-set marker; a
- * second call on an already-modern project only rewrites the sidecar bytes.
+ * and, if this is a legacy project's first S3-aware mutation, sets
+ * `editor_store_version: 1` on the manifest — as ONE staged transaction (S3-B
+ * ticket B4), so a crash between the two writes is no longer observable: a
+ * recovering reader sees either neither write or both (wire-and-recovery
+ * §"Disk declarations"). Never downgrades an already-set marker; a second
+ * call on an already-modern project stages/publishes ONLY the sidecar bytes,
+ * touching `project.json` not at all.
  */
 export async function writeSidecarLocked(
   ctx: LockedProject,
   sidecar: EditorSidecar
 ): Promise<{ sidecar: EditorSidecar; digest: string }> {
-  const written = await writeSidecarBytesLocked(ctx, sidecar); // sidecar bytes first — throws before any manifest write if the CURRENT root is corrupt/unsupported.
+  const current = await readSidecarLocked(ctx);
+  await refuseIfRootUntrustworthy(ctx, current);
+  const { canonical, bytes, digest } = serializeCanonicalSidecar(sidecar);
+
   const projectRead = await readProjectManifestForSidecar(ctx);
   if (projectRead.kind === "corrupt") throw projectRead.error;
-  if (projectRead.kind === "present" && projectRead.value.editor_store_version !== 1) {
-    const updated: ProjectManifest = { ...projectRead.value, editor_store_version: 1 }; // manifest second
-    await writeFile(projectFilePath(ctx.projectDir), JSON.stringify(updated, null, 2), "utf8");
-  }
-  return written;
+  const needsMarkerFlip = projectRead.kind === "present" && projectRead.value.editor_store_version !== 1;
+
+  const intent: TransactionIntent = {
+    transactionId: randomUUID(),
+    root: {
+      sidecar: bytes,
+      ...(needsMarkerFlip && projectRead.kind === "present"
+        ? { project: { ...projectRead.value, editor_store_version: 1 } as ProjectManifest }
+        : {})
+    }
+  };
+  const staged = await stageTransactionLocked(ctx, intent);
+  const decided = await decideLocked(ctx, staged);
+  await publishLocked(ctx, decided);
+  return { sidecar: canonical, digest };
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
