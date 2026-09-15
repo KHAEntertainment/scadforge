@@ -90,7 +90,7 @@
 
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -518,10 +518,18 @@ describe("editor remove-feature crash matrix", () => {
     expect(opBody.state).toBe("definitely_not_committed");
     if (opBody.state === "definitely_not_committed") expect(opBody.reason).toBe("aborted");
     expect(after).toEqual(before); // old state intact
-    // "no staging dir": after-claim fires before any staging call, so recovery has nothing to reconcile.
+    // "no staging dir": after-claim fires before any staging call, so
+    // recovery has nothing to reconcile FOR THIS OPERATION. The PARENT
+    // `editor-transactions/` directory itself is not a signal either way --
+    // `stageTransactionLocked` creates it once (`mkdir(dir, {recursive:
+    // true})` on a per-transaction subdirectory) and nothing ever removes
+    // the now-permanently-empty parent again, so seeding this fixture's own
+    // transaction (`writeSidecarLocked`) already leaves it existing but
+    // EMPTY (confirmed empirically before writing this assertion) -- the
+    // real check is that it holds no entries, not that the path is absent.
     const transactionsDir = join(seeded.dir, ".scadforge", "editor-transactions");
-    const stillStaged = await pathExists(transactionsDir);
-    expect(stillStaged).toBe(false);
+    const entries = await readdir(transactionsDir).catch(() => []);
+    expect(entries).toEqual([]);
   }, 15000);
 });
 
