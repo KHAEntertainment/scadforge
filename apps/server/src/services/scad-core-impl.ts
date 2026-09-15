@@ -79,6 +79,7 @@ import {
   snapshotDir,
   snapshotMeshPath,
   snapshotRenderPath,
+  updateRootParamsLocked,
   validateModel,
   withRecoveredProject
 } from "@scadforge/scad-core";
@@ -94,7 +95,6 @@ import {
   readProject,
   readScadLocked,
   stageSnapshotModel,
-  writeRootParamsLocked,
   type ServerRuntime
 } from "./runtime.js";
 import { exportFileUrl, renderFileUrl } from "./urls.js";
@@ -584,7 +584,14 @@ export function createScadCoreApi(runtime: ServerRuntime): ScadCoreApi {
               const content = await readScadLocked(ctx);
               await createSnapshotLocked(ctx, { content, params: merged, message, origin: "manual", pass: null });
             } else {
-              await writeRootParamsLocked(ctx, merged);
+              // S3-B ticket B4 (declared deviation, Tech Lead-approved): this
+              // used to be a bare `writeFile` (`runtime.ts`'s
+              // `writeRootParamsLocked`) -- exactly the "snapshot-free params
+              // write" the staged roll-forward transaction mechanism now
+              // owns. `updateRootParamsLocked` stages/decides/publishes ONLY
+              // `params.json`, so a crash mid-write is recoverable like every
+              // other root writer.
+              await updateRootParamsLocked(ctx, merged);
             }
           }),
         "failed to persist the parameter update"
