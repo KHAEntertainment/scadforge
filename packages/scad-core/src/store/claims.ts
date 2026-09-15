@@ -121,16 +121,22 @@ export async function recordClaimCommittedLocked(
   });
 }
 
+/**
+ * Mirrors the spec's `EditorOperationResponse` shape exactly (wire-and-
+ * recovery §"Canonical identity and durable operation claims"): an unclaimed
+ * lookup is `definitely_not_committed` with `reason: "unclaimed"`, NOT its
+ * own top-level kind — Tech Lead correction on Issue #90 AC6. `committed`
+ * and `unknown` are the only other two states.
+ */
 export type ClaimLookupResult =
-  | { kind: "unclaimed" }
   | { kind: "committed"; receipt: EditorReceipt }
-  | { kind: "definitely_not_committed"; requestDigest: string | null; reason: "rejected" | "aborted"; error: ApiError | null }
+  | { kind: "definitely_not_committed"; requestDigest: string | null; reason: "unclaimed" | "rejected" | "aborted"; error: ApiError | null }
   | { kind: "unknown"; requestDigest: string | null };
 
 /** The read side of a `GET .../editor/operations/:id` (B6's future route calls this). */
 export async function lookupClaimLocked(ctx: LockedProject, operationId: string): Promise<ClaimLookupResult> {
   const claim = await readClaimLocked(ctx, operationId);
-  if (!claim) return { kind: "unclaimed" };
+  if (!claim) return { kind: "definitely_not_committed", requestDigest: null, reason: "unclaimed", error: null };
   if (claim.terminal === null) return { kind: "unknown", requestDigest: claim.requestDigest };
   if (claim.terminal.kind === "committed") return { kind: "committed", receipt: claim.terminal.receipt };
   if (claim.terminal.kind === "rejected") {

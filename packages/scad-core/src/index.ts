@@ -176,15 +176,18 @@ export { sourceFingerprint } from "./editor/canonical.js";
 // mechanism without reaching into `store/` by a relative path.
 export {
   abortTransactionLocked,
+  commitWithClaimLocked,
   decideLocked,
   faultPoint,
   publishLocked,
   reconcileTransactionLocked,
+  recoverPendingClaimsLocked,
   recoverTransactionsLocked,
   stageTransactionLocked
 } from "./store/transaction.js";
 export type {
   CommitDecision,
+  CommitWithClaimResult,
   DecidedTransaction,
   FaultPointName,
   StagedTransaction,

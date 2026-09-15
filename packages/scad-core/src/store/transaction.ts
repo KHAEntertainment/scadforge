@@ -49,6 +49,7 @@
 
 import { createHash } from "node:crypto";
 import { open as fsOpen, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { EditorReceipt, ProjectManifest, SnapshotId, SnapshotManifest } from "@scadforge/protocol";
 import { PARAMS_ACTIVE_PRESET } from "../types.js";
@@ -57,6 +58,7 @@ import { ScadForgeError, withTypedError } from "../errors.js";
 import { canonicalSidecar, editorRevision as computeEditorRevision, sidecarDigest as computeSidecarDigest } from "../editor/canonical.js";
 import { EMPTY_SIDECAR } from "../editor/sidecar-empty.js";
 import {
+  operationsDir,
   projectFilePath,
   quarantineDir,
   rootModelPath,
@@ -68,7 +70,7 @@ import {
 } from "./paths.js";
 import { computeSourceRevision } from "./revision.js";
 import type { LockedProject } from "./recovered.js";
-import { recordClaimAbortedLocked, recordClaimCommittedLocked } from "./claims.js";
+import { ABORTED_REPLAY_MESSAGE, recordClaimAbortedLocked, recordClaimCommittedLocked, reserveClaimLocked } from "./claims.js";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Fault points (Issue #90 AC8) — inert without SCADFORGE_FAULT_POINT
@@ -125,6 +127,24 @@ export async function faultPoint(name: FaultPointName): Promise<void> {
 // 2. Flush primitives — process-restart durability only (see header)
 // ═════════════════════════════════════════════════════════════════════════════
 
+type SyncImpl = (handle: FileHandle) => Promise<void>;
+
+/** The real flush primitive: `FileHandle.sync()` (fsync). Overridable ONLY by the test-only seam below. */
+const realSync: SyncImpl = (handle) => handle.sync();
+
+let syncImpl: SyncImpl = realSync;
+
+/**
+ * TEST-ONLY escape hatch, same contract as {@link __setFaultActionForTests}:
+ * NOT exported from `index.ts`, so no production code path can reach it —
+ * only a test importing this module's relative source path can simulate a
+ * flush primitive that is unavailable on the host (e.g. `ENOSYS`) without
+ * needing an actually-broken filesystem.
+ */
+export function __setSyncImplForTests(fn: SyncImpl | null): void {
+  syncImpl = fn ?? realSync;
+}
+
 /**
  * Flushes a file's contents to durable storage. Fails LOUDLY (never silently
  * skips) when the host has no working flush primitive — wire-and-recovery:
@@ -134,7 +154,7 @@ export async function faultPoint(name: FaultPointName): Promise<void> {
 async function flushFile(path: string): Promise<void> {
   const handle = await fsOpen(path, "r+");
   try {
-    await handle.sync();
+    await syncImpl(handle);
   } finally {
     await handle.close();
   }
@@ -148,7 +168,7 @@ async function flushFile(path: string): Promise<void> {
 async function flushDir(path: string): Promise<void> {
   const handle = await fsOpen(path, "r");
   try {
-    await handle.sync();
+    await syncImpl(handle);
   } finally {
     await handle.close();
   }
@@ -700,4 +720,87 @@ export async function recoverTransactionsLocked(ctx: LockedProject): Promise<voi
   for (const transactionId of entries) {
     await withTypedError(() => reconcileTransactionLocked(ctx, transactionId), "INTERNAL_ERROR", `failed to recover transaction '${transactionId}'`);
   }
+}
+
+/**
+ * Sweeps any operation claim still `terminal: null` (pending) after
+ * {@link recoverTransactionsLocked} has already run and resolved every
+ * transaction it could find — crash-table row 1 ("Claim, ... no durable
+ * commit decision" → aborted tombstone) also covers a crash between
+ * `reserveClaimLocked` becoming durable and any staging transaction ever
+ * starting (the "after-claim" fault point), which leaves a claim with NO
+ * linked transaction directory at all for `recoverTransactionsLocked` to
+ * find. Since claim-plus-commit work only ever runs while holding the
+ * project's exclusive params lock (the SAME lock `recover()` itself runs
+ * under), any claim still pending by the time this runs cannot belong to a
+ * caller genuinely still in flight — that caller would still hold the lock,
+ * and this code could not be running. `recordClaimAbortedLocked` is already
+ * a no-op for a claim that reached a DIFFERENT terminal state via its own
+ * transaction's recovery, so this safely only ever touches genuinely
+ * orphaned claims.
+ */
+export async function recoverPendingClaimsLocked(ctx: LockedProject): Promise<void> {
+  let entries: string[];
+  try {
+    entries = (await readdir(operationsDir(ctx.projectDir), { withFileTypes: true }))
+      .filter((e) => e.isFile() && e.name.endsWith(".json") && !e.name.endsWith(".tmp"))
+      .map((e) => e.name.slice(0, -".json".length));
+  } catch {
+    return; // no editor-operations/ directory at all
+  }
+  for (const operationId of entries) {
+    await withTypedError(
+      () => recordClaimAbortedLocked(ctx, operationId),
+      "INTERNAL_ERROR",
+      `failed to recover operation claim '${operationId}'`
+    );
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. commitWithClaimLocked — the claim-plus-commit driver (B6's future seam)
+// ═════════════════════════════════════════════════════════════════════════════
+
+export type CommitWithClaimResult =
+  | { kind: "committed"; receipt: EditorReceipt }
+  | { kind: "conflict"; message: string | null }
+  /** Same id+digest, not yet terminal — another submission of the identical request is still being processed (or crashed mid-flight; the caller should poll/retry the lookup, never re-run `produce`). */
+  | { kind: "pending" };
+
+/**
+ * Ties a durable operation claim (`claims.ts`) to its staged transaction:
+ * reserves the claim, fires the `"after-claim"` fault point the instant that
+ * reservation is durable (Issue #90 lists this crash boundary explicitly for
+ * B8 to drive — it is real, exercised code here, not dead code), then either
+ * replays an already-terminal claim (same id+digest never re-runs `produce`
+ * — never a second snapshot) or runs `produce` to completion. `produce` is
+ * responsible for building a `TransactionIntent` whose `claim.operationId`
+ * matches `request.operationId` and whose `receipt` is set, so
+ * {@link publishLocked} materializes the claim's `committed` terminal state
+ * as part of the SAME publish it already performs.
+ *
+ * B6 (the real `EditorCommand` producer) is out of scope for this ticket;
+ * this driver exists so the claim lifecycle and its fault point are real,
+ * B8-drivable code rather than inert scaffolding — B6 will call this
+ * directly once it exists.
+ */
+export async function commitWithClaimLocked(
+  ctx: LockedProject,
+  request: { operationId: string; requestDigest: string; payload: unknown },
+  produce: (ctx: LockedProject) => Promise<EditorReceipt>
+): Promise<CommitWithClaimResult> {
+  const reserved = await reserveClaimLocked(ctx, request.operationId, request.requestDigest, request.payload);
+  await faultPoint("after-claim");
+
+  if (reserved.kind === "conflict") return { kind: "conflict", message: null };
+  if (reserved.kind === "same-request") {
+    if (reserved.terminal === null) return { kind: "pending" };
+    if (reserved.terminal.kind === "committed") return { kind: "committed", receipt: reserved.terminal.receipt };
+    if (reserved.terminal.kind === "aborted") return { kind: "conflict", message: ABORTED_REPLAY_MESSAGE };
+    return { kind: "conflict", message: null }; // rejected -- the caller reads its ApiError from the claim record itself
+  }
+
+  // reserved.kind === "reserved" -- a fresh claim; run the actual work.
+  const receipt = await produce(ctx);
+  return { kind: "committed", receipt };
 }

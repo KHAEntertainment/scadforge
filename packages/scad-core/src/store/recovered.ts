@@ -50,7 +50,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { ScadForgeError, withTypedError } from "../errors.js";
 import { withParamsLock } from "./params-lock.js";
-import { recoverTransactionsLocked } from "./transaction.js";
+import { recoverPendingClaimsLocked, recoverTransactionsLocked } from "./transaction.js";
 
 declare const LOCK_BRAND: unique symbol;
 
@@ -89,9 +89,19 @@ export type ReadResult<T> = { kind: "absent" } | { kind: "present"; value: T } |
  * `INTERNAL_ERROR` naming the transaction, preserving everything for
  * inspection. A project with no `editor-transactions/` directory at all
  * (the overwhelming common case) returns immediately.
+ *
+ * `recoverPendingClaimsLocked` then sweeps any operation claim still
+ * pending — the crash boundary right after a claim reservation becomes
+ * durable but before any staging transaction ever starts (the `"after-claim"`
+ * fault point) leaves a claim with no transaction directory for the pass
+ * above to find at all; this closes that gap. Must run AFTER
+ * `recoverTransactionsLocked`, so a claim genuinely tied to a resolvable
+ * transaction is resolved (committed/aborted) through its own transaction's
+ * recovery first.
  */
 async function recover(ctx: LockedProject): Promise<void> {
   await recoverTransactionsLocked(ctx);
+  await recoverPendingClaimsLocked(ctx);
 }
 
 /**
