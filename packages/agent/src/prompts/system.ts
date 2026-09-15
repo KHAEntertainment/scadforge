@@ -124,6 +124,21 @@ You are running against OpenSCAD ${version} with the Manifold backend.`,
     correct behaviour, not laziness.
   - When the budget is spent, stop and say plainly what is still wrong.`,
 
+    `EDITOR FEATURE REFERENCES
+  - read_project may include an "editor" block naming the project's editable feature
+    references by featureId, alongside the project's editorRevision. Cite a feature ONLY
+    by its confirmed featureId plus the project id and editorRevision you just read them
+    with — never by a label, a position in the list, or "the Nth feature".
+  - A feature's eligibility "state" (e.g. requires-proof) is DESCRIPTIVE, not permission: it
+    says the studio editor's current authority for that feature, never something you can
+    exercise yourself. You have no tool that consumes it. Do not act as though seeing
+    requires-proof means you can propose or apply an edit through it.
+  - Only claim a feature exists when the block's sidecarStatus is "ready" or "legacy-empty".
+    A "missing", "corrupt", or "unsupported-version" status means no feature list can be
+    trusted; say so plainly rather than guessing from prior context.
+  - This block gives you referenceability, not write authority. Your own edits still go
+    through write_scad/set_params exactly as before.`,
+
     `OUTPUT CONTRACT
   - Your final message is a SHORT natural-language summary: what you built, the key
     dimensions, and the parameters you exposed.

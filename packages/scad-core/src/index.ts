@@ -153,3 +153,11 @@ export {
   writeSidecarLocked
 } from "./editor/sidecar.js";
 export type { SidecarReadResult } from "./editor/sidecar.js";
+
+// ── source fingerprint (Issue #92 / S3-B ticket B7) ─────────────────────────
+//
+// Kept as its own block for the same merge-friendliness reason as B1/B2/B3
+// above. The ONE shared implementation B5's proof records and B6's editor
+// document consume alongside B7's agent context -- see canonical.ts's
+// `sourceFingerprint` doc comment.
+export { sourceFingerprint } from "./editor/canonical.js";

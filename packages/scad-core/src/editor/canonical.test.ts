@@ -12,7 +12,8 @@ import {
   digest,
   editorRevision,
   requestDigest,
-  sidecarDigest
+  sidecarDigest,
+  sourceFingerprint
 } from "./canonical.js";
 import fixtures from "./canonical.fixtures.json" with { type: "json" };
 
@@ -245,6 +246,32 @@ describe("editorRevision (#72)", () => {
 
   it("produces a lowercase 64-hex digest", () => {
     expect(editorRevision(sourceRevision, sidecarA)).toMatch(HEX64_RE);
+  });
+});
+
+describe("sourceFingerprint (#92 / S3-B B7)", () => {
+  it("produces a lowercase 64-hex digest", () => {
+    expect(sourceFingerprint("cube(1);\n")).toMatch(HEX64_RE);
+  });
+
+  // Golden vector: sha256(utf8("scadforge-source-fingerprint/1\n" +
+  // canonicalJson({ scad: normalizeLineEndings("cube(1);\n") }))). A change to
+  // the domain prefix, the object wrapper, or the LF-normalization step would
+  // all silently break B5's proof records and B6's editor document, which
+  // must hash the identical bytes B7 computes here -- this literal pins the
+  // exact algorithm, not just "a digest changed" behavior.
+  it("matches a golden vector for a fixed LF input", () => {
+    expect(sourceFingerprint("cube(1);\n")).toBe(
+      "fa211dbbd8225374616efd6949d92f368fe279400f348053eb3b3f07206aa75b"
+    );
+  });
+
+  it("is identical for the same source under CRLF and LF line endings", () => {
+    expect(sourceFingerprint("cube(1);\r\n")).toBe(sourceFingerprint("cube(1);\n"));
+  });
+
+  it("differs for a genuinely changed source", () => {
+    expect(sourceFingerprint("cube(1);\n")).not.toBe(sourceFingerprint("sphere(2);\n"));
   });
 });
 

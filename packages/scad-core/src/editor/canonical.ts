@@ -51,6 +51,7 @@ import type {
   EditorSidecar,
   EditorTraversal
 } from "@scadforge/protocol";
+import { normalizeLineEndings } from "../lf.js";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Digest domains
@@ -63,13 +64,18 @@ import type {
  * one. `scadforge-editor-transaction/1` is reserved for B4 (staged roll-forward
  * transactions); this ticket does not produce one, but the union is the
  * shared seam frozen in the S3-B ticket story and must stay closed here.
+ * `scadforge-source-fingerprint/1` (S3-B B7) is the one shared source
+ * fingerprint domain — B5's proof records and B6's editor document consume
+ * the same {@link sourceFingerprint} value B7 computes, so it lives here
+ * rather than as a private per-caller hash.
  */
 export type DigestDomain =
   | "scadforge-editor-sidecar/1"
   | "scadforge-editor-revision/1"
   | "scadforge-editor-command/1"
   | "scadforge-editor-request/1"
-  | "scadforge-editor-transaction/1";
+  | "scadforge-editor-transaction/1"
+  | "scadforge-source-fingerprint/1";
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 2. Canonical JSON error
@@ -388,6 +394,25 @@ export function sidecarDigest(sidecar: EditorSidecar): string {
  */
 export function editorRevision(sourceRevision: string, sidecarDigest: string): string {
   return digest("scadforge-editor-revision/1", { sourceRevision, sidecarDigest });
+}
+
+/**
+ * The source fingerprint (S3-B B7): a digest of the project's `.scad` source
+ * alone, LF-normalized first (existing `normalizeLineEndings`, Issue #40) so
+ * a source that differs only by line-ending convention fingerprints
+ * identically — matching how the store already treats CRLF/LF as the same
+ * source everywhere else. The ONE shared implementation: B7's agent context,
+ * B5's proof records and B6's editor document all consume this exact value,
+ * never a private per-caller hash, so the three surfaces can never disagree
+ * about whether a feature's binding still describes the current source.
+ *
+ * Wrapped in an object (`{ scad: ... }`) rather than passed as a bare string
+ * to `digest`/`canonicalJson` — a top-level string argument to
+ * `canonicalJson` is treated as raw JSON TEXT to canonicalize (see that
+ * module's header), which is not what a `.scad` source string is.
+ */
+export function sourceFingerprint(scad: string): string {
+  return digest("scadforge-source-fingerprint/1", { scad: normalizeLineEndings(scad) });
 }
 
 /** The exact shape `commandDigest` hashes — nothing else, regardless of what extra fields a caller's object may carry. */
