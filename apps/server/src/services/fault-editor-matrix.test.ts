@@ -255,7 +255,7 @@ function isCommittedAt(fp: FaultPointName): boolean {
   return FAULT_POINT_ORDER.indexOf(fp) >= FAULT_POINT_ORDER.indexOf("after-commit");
 }
 
-/** Every point a `remove-feature` editor commit's OWN `createSnapshotLocked` call reaches -- confirmed by reading `submitEditorCommand`: it always stages `sidecar`+`model`+`params`+`project`, and sets `editor.claim`+`receipt`, so `after-publish-record` fires too (new for Phase 2). Everything except `after-claim` (F3). */
+/** Every point a `remove-feature` editor commit's OWN `createSnapshotLocked` call reaches -- confirmed by reading `submitEditorCommand`: it always stages `sidecar`+`model`+`params`+`project`, and sets `editor.claim`+`receipt`, so `after-publish-record` fires too (new for Phase 2). `after-claim` is excluded from this array not because it is unreachable (fixed by #111 -- it fires on this same path, right after the claim reservation, before any of this) but because it has its own dedicated cell below, which needs a different classifier than the plain `.rejects.toThrow()` this array's loop uses. */
 const REMOVE_FEATURE_POINTS: readonly FaultPointName[] = [
   "after-partial-staging",
   "after-full-staging",
