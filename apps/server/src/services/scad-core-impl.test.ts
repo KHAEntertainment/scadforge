@@ -386,6 +386,24 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
     expect(recomputedDigest).toBe(receipt.sidecarDigest);
   });
 
+  // Issue #118 audit round 2 (item 3, Tech Lead ruling): this test takes NO
+  // docker path -- `initProject` is the pure store function
+  // (packages/scad-core/src/store/store.ts), `coherentSourceState` is
+  // fs-only, `persistFakeProof` renders nothing, and `submitEditorCommand`
+  // does no engine work ("No engine work happens anywhere in this
+  // function", scad-core-impl.ts:523). Its load sensitivity is filesystem
+  // and file-lock contention, not container startup -- do NOT "correct"
+  // this to the repo's 15_000ms docker-shelling floor; that floor does not
+  // apply here.
+  //
+  // Measured basis: this worker's own controlled load (`pnpm -r build` loop
+  // + 2 extra concurrent vitest processes) gave 15/15 passed, median
+  // 841.2ms, max 1175.2ms -- 3x that stays under the 5000ms default. QA's
+  // heavier three-loop recipe (a tight `pnpm -r build` loop with no pause,
+  // PLUS a 20x server-test loop, PLUS a 20x web-test loop, all concurrent)
+  // measured this same test at max 2509ms (median 1293ms) -- genuinely more
+  // pressure than this worker generated. The Tech Lead ruled on the heavier
+  // number: 3 x 2509 = 7527, rounded up to 8000.
   it("undo then redo of a set-value edit produces two more snapshots and ends at the post-edit values", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p3");
@@ -471,7 +489,7 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
     expect(redoReceipt.values).toEqual({ wall: 9 });
     expect(redoReceipt.snapshotId).not.toBe(undoReceipt.snapshotId);
     expect(redoReceipt.snapshotId).not.toBe(editReceipt.snapshotId);
-  });
+  }, 8000);
 
   // Issue #118: `api.updateParams` ends in `paramsResponse()` ->
   // `runParamExport()` -> `runOpenscad()`, a real `docker run` -- inherent to
