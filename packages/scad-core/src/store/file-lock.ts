@@ -67,6 +67,13 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { ScadForgeError } from "../errors.js";
 
+// Deliberately NOT `import { performance } from "node:perf_hooks"`: that
+// captures a stable module-scope binding to the real Performance object,
+// which vitest's fake timers (Issue #115's own tests) cannot retarget --
+// they replace `globalThis.performance`, not `perf_hooks`'s own export. The
+// bare global identifier below re-reads `globalThis.performance` on every
+// call, so it sees whichever object (real or faked) is current.
+
 /**
  * Wall-clock deadline (ms) to keep retrying acquisition before failing with
  * `CONFLICT` -- the real governing budget (Issue #115). A fixed ATTEMPT
@@ -121,6 +128,18 @@ function errorCode(err: unknown): string | undefined {
 function backoffDelay(attempt: number): Promise<void> {
   const ms = Math.min(5 + attempt * 5, 100) + Math.floor(Math.random() * 10);
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
+}
+
+/**
+ * Reduces a non-finite `maxWaitMs` (`NaN`, `Infinity`, `-Infinity`) to the
+ * production default -- a non-finite value would otherwise make the deadline
+ * comparison below never fire, falling through to `FILE_LOCK_MAX_ATTEMPTS`'s
+ * ~19-20.5s count-based cap instead of the intended ~10s wall-clock one
+ * (Issue #115). `0` and a negative value pass through UNCHANGED: both are
+ * meaningful ("one attempt, then `CONFLICT`") the way non-finite is not.
+ */
+function clampMaxWaitMs(maxWaitMs: number): number {
+  return Number.isFinite(maxWaitMs) ? maxWaitMs : FILE_LOCK_MAX_WAIT_MS;
 }
 
 /** Best-effort: records who holds `lockDir`. Never throws -- a failure here only degrades a future contender's ability to reclaim quickly (it falls back to the ownerless-and-stale path), it never affects whether THIS caller actually holds the lock (the exclusive `mkdir` already decided that). */
@@ -207,7 +226,11 @@ async function reclaimStaleLock(lockDir: string): Promise<boolean> {
  * `maxWaitMs` (default {@link FILE_LOCK_MAX_WAIT_MS}) is the wall-clock
  * budget to keep retrying before giving up -- overridable so tests can prove
  * the give-up behavior on a short, fast deadline instead of the real one
- * (Issue #115).
+ * (Issue #115). Non-finite (`NaN`/`Infinity`) is clamped to the default; `0`
+ * or negative means "one attempt, then `CONFLICT`" (see
+ * {@link clampMaxWaitMs}). Elapsed time is measured with `performance.now()`
+ * (monotonic), never `Date.now()` (wall-clock) -- a system clock adjustment
+ * must never extend or shorten how long a caller actually waits.
  */
 export async function withFileLock<T>(
   lockDir: string,
@@ -215,7 +238,8 @@ export async function withFileLock<T>(
   fn: () => Promise<T>,
   maxWaitMs: number = FILE_LOCK_MAX_WAIT_MS
 ): Promise<T> {
-  const startedAt = Date.now();
+  const effectiveMaxWaitMs = clampMaxWaitMs(maxWaitMs);
+  const startedAt = performance.now();
   for (let attempt = 0; attempt < FILE_LOCK_MAX_ATTEMPTS; attempt++) {
     try {
       // Non-recursive, exclusive create: this IS the lock (same trick as
@@ -227,7 +251,7 @@ export async function withFileLock<T>(
           const reclaimed = await reclaimStaleLock(lockDir);
           if (reclaimed) continue; // retry mkdir(lockDir) immediately -- now unoccupied
         }
-        if (Date.now() - startedAt >= maxWaitMs) break; // deadline reached -- fall through to CONFLICT
+        if (performance.now() - startedAt >= effectiveMaxWaitMs) break; // deadline reached -- fall through to CONFLICT
         await backoffDelay(attempt);
         continue; // another writer (this process or another) holds the lock; retry
       }
@@ -242,6 +266,6 @@ export async function withFileLock<T>(
   }
   throw new ScadForgeError(
     "CONFLICT",
-    `could not acquire the ${description} lock at '${lockDir}' after ${Date.now() - startedAt}ms (high write contention, or a lock held by a live owner)`
+    `could not acquire the ${description} lock at '${lockDir}' after ${Math.round(performance.now() - startedAt)}ms (high write contention, or a lock held by a live owner)`
   );
 }
