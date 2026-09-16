@@ -995,8 +995,12 @@ export async function revertToSnapshotLocked(
  * inside or outside an active `withRecoveredProject` call without tripping
  * its non-reentrancy guard (which only watches nested `withRecoveredProject`
  * calls, not this module's own `withFileLock`).
+ *
+ * `maxWaitMs` (default `FILE_LOCK_MAX_WAIT_MS` via `withFileLock`) is an
+ * optional override of the exports lock's wall-clock give-up budget --
+ * additive, for tests only (Issue #115); production callers never pass it.
  */
-export async function recordExport(projectDir: string, record: ExportRecord): Promise<void> {
+export async function recordExport(projectDir: string, record: ExportRecord, maxWaitMs?: number): Promise<void> {
   await withTypedError(
     async () => {
       const exportsDirectory = exportsDir(projectDir);
@@ -1006,34 +1010,39 @@ export async function recordExport(projectDir: string, record: ExportRecord): Pr
       // read the SAME current array, each push only its own record, and
       // whichever `writeFile` lands last wins wholesale -- silently losing
       // the other's entry. Cross-process safe (see file-lock.ts).
-      await withFileLock(join(metaDir(projectDir), "exports.lock"), "exports", async () => {
-        let records: ExportRecord[];
-        try {
-          records = JSON.parse(await readFile(indexPath, "utf8"));
-          if (!Array.isArray(records)) throw new Error("ledger is valid JSON but not an array");
-        } catch (err) {
-          if (typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "ENOENT") {
-            records = []; // no ledger yet -- the normal first-export case
-          } else {
-            // A corrupt or partially-written ledger is DETECTED, never
-            // silently parsed as empty (that would overwrite it with a
-            // one-record array, both losing every prior entry and
-            // destroying the evidence). The bytes on disk are left
-            // untouched for inspection/repair.
-            throw new ScadForgeError(
-              "INTERNAL_ERROR",
-              `exports ledger '${indexPath}' is corrupt (${err instanceof Error ? err.message : String(err)}) -- refusing to append; inspect or repair the file manually`
-            );
+      await withFileLock(
+        join(metaDir(projectDir), "exports.lock"),
+        "exports",
+        async () => {
+          let records: ExportRecord[];
+          try {
+            records = JSON.parse(await readFile(indexPath, "utf8"));
+            if (!Array.isArray(records)) throw new Error("ledger is valid JSON but not an array");
+          } catch (err) {
+            if (typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "ENOENT") {
+              records = []; // no ledger yet -- the normal first-export case
+            } else {
+              // A corrupt or partially-written ledger is DETECTED, never
+              // silently parsed as empty (that would overwrite it with a
+              // one-record array, both losing every prior entry and
+              // destroying the evidence). The bytes on disk are left
+              // untouched for inspection/repair.
+              throw new ScadForgeError(
+                "INTERNAL_ERROR",
+                `exports ledger '${indexPath}' is corrupt (${err instanceof Error ? err.message : String(err)}) -- refusing to append; inspect or repair the file manually`
+              );
+            }
           }
-        }
-        records.push(record);
-        // Atomic replace: a reader never sees a half-written ledger, and a
-        // crash mid-write leaves the previous complete version in place.
-        await mkdir(exportsDirectory, { recursive: true });
-        const tmpPath = `${indexPath}.tmp`;
-        await writeFile(tmpPath, JSON.stringify(records, null, 2), "utf8");
-        await rename(tmpPath, indexPath);
-      });
+          records.push(record);
+          // Atomic replace: a reader never sees a half-written ledger, and a
+          // crash mid-write leaves the previous complete version in place.
+          await mkdir(exportsDirectory, { recursive: true });
+          const tmpPath = `${indexPath}.tmp`;
+          await writeFile(tmpPath, JSON.stringify(records, null, 2), "utf8");
+          await rename(tmpPath, indexPath);
+        },
+        maxWaitMs
+      );
     },
     "INTERNAL_ERROR",
     "failed to record export"
