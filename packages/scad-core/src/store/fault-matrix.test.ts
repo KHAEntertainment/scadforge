@@ -15,10 +15,14 @@
 //
 // `FaultPointName` has 10 members, but only a SUBSET fires for each of this
 // ticket's three writer kinds -- `after-claim` and `after-publish-record`
-// only fire for a claim-linked editor-command commit (`commitWithClaimLocked`,
-// B6/Phase 2). Testing a fault point a writer never reaches would hang the
-// case waiting for a `SIGKILL` that never comes, so each writer kind below is
-// matched against exactly the fault points its own `TransactionIntent`
+// only fire for a claim-linked editor-command commit (B6/Phase 2's
+// `submitEditorCommand`, `apps/server/src/services/scad-core-impl.ts` --
+// `after-claim` was fixed onto that real path by Issue #111; the earlier,
+// never-production-called `commitWithClaimLocked` this comment used to name
+// has since been removed entirely). Testing a fault point a writer never
+// reaches would hang the case waiting for a `SIGKILL` that never comes, so
+// each writer kind below is matched against exactly the fault points its
+// own `TransactionIntent`
 // exercises (verified by reading `buildSnapshotIntent`/`updateRootParamsLocked`
 // in `store.ts`); those two points are recorded as Phase 2 (editor-command)
 // cells in the results artifact, not silently dropped.
@@ -452,9 +456,12 @@ describe("stale lock: dead vs. live holder", () => {
     });
     const elapsedMs = Date.now() - start;
     expect(result.code).toBe(0);
-    // Generously bounded well under exhausting FILE_LOCK_MAX_ATTEMPTS (50
-    // attempts x up to ~100ms+jitter backoff each) -- reclaim happens on the
-    // FIRST EEXIST, matching file-lock.test.ts's own bound.
+    // Generously bounded well under the give-up deadline (Issue #115 fix,
+    // PR #119: `FILE_LOCK_MAX_WAIT_MS` = 10s wall-clock, `FILE_LOCK_MAX_
+    // ATTEMPTS` = 200 as a non-binding safety net only -- the OLD fixed
+    // 50-attempt budget this comment used to cite no longer governs give-up
+    // at all) -- reclaim happens on the FIRST EEXIST, matching
+    // file-lock.test.ts's own bound.
     expect(elapsedMs).toBeLessThan(5000);
 
     const after = await readRootState(dir);
