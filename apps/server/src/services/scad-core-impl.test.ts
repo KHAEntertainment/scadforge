@@ -591,9 +591,13 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
   // `runParamExport` (scad-core-impl.ts:441), both real `docker run`s. The
   // three `api.submitEditorCommand` calls that follow shell out ZERO times
   // each: "No engine work happens anywhere in this function"
-  // (scad-core-impl.ts:523) -- the proof they trust was already rendered by
-  // an earlier `verifyEditorCommand`, outside any lock. Measured under heavy
-  // concurrent load (`pnpm -r build` + 3 extra vitest processes): 9/10
+  // (scad-core-impl.ts:523) -- in PRODUCTION, the proof `submitEditorCommand`
+  // trusts was already rendered by an earlier `verifyEditorCommand` call,
+  // outside any lock; THIS TEST never calls `verifyEditorCommand` at all,
+  // it fakes that proof directly via `persistFakeProof` below, so the
+  // engine never runs on either the production or the test path here.
+  // Measured under heavy concurrent load (`pnpm -r build` + 3 extra vitest
+  // processes): 9/10
   // passed, median 2893.0ms, max 4578.2ms; the 1 failure was `Test timed out
   // in 5000ms`. 15_000ms is 3x that measured max, rounded, and matches the
   // repo's docker-shelling test floor.
