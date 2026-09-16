@@ -29,17 +29,18 @@
 // reason. The one `@docker` case that DOES need the engine end-to-end lives
 // in `fault-editor-setvalue.docker.test.ts`.
 //
-// ── FINDING F3 (Issue #111, confirmed by the Tech Lead) ────────────────────
+// ── FINDING F3, FIXED (Issue #111) ─────────────────────────────────────────
 //
-// `after-claim` is unreachable on the real path: `transaction.ts`'s
+// `after-claim` USED TO BE unreachable on the real path: `transaction.ts`'s
 // `commitWithClaimLocked` (the only call site of `faultPoint("after-claim")`)
-// is never invoked -- `submitEditorCommand` calls `reserveClaimLocked`
-// directly. The crash window it models (a claim durable, no staging
-// transaction started yet) is real risk, so its cell below is NOT skipped
-// outright: it is parametrized to self-detect today's dead-code state (the
-// request completes normally, no kill) and `ctx.skip()` with a reason
-// naming #111, so the SAME case starts asserting for real the moment the
-// fixup lands and B6 wires the route through the fault-armed path.
+// was never invoked -- `submitEditorCommand` called `reserveClaimLocked`
+// directly. Confirmed by the Tech Lead as F3. Fixup Issue #111 (landed
+// before this file's own PR merged) wires `faultPoint("after-claim")` into
+// the REAL `submitEditorCommand` path, firing right after a fresh claim
+// reservation and before any proof lookup or staging, and removes
+// `commitWithClaimLocked` and its export entirely. The `after-claim` case
+// below now fires a real `SIGKILL` and runs its full assertions like every
+// other cell in this matrix -- no special-casing needed for the fixed state.
 //
 // ── WHY THE CLASSIFIER IS ITS OWN FUNCTION, WITH ITS OWN PROOF TEST ────────
 //
@@ -50,16 +51,19 @@
 // `exit` event) collapsed into the SAME resolved value a successful HTTP 200
 // produces, making a real kill indistinguishable from "the route just
 // completed normally" and able to SKIP a case that should have failed --
-// exactly the silent-never-runs failure a fixup-pending cell must not have.
-// `raceEditorCommandAgainstExit` below keeps resolve and reject strictly
-// distinct and only ever reaches `dead-code` on a resolved HTTP 200 carrying
-// THIS operation's own committed receipt while the child is still alive;
-// anything else resolved is `unexpected-response` (fails loudly, never
-// skips); a rejection is always `killed` (a bounded, throwing wait for the
-// exit event -- never a silent skip). Its own dedicated test below proves
-// this against a GUARANTEED, reachable kill (`after-full-staging`, the same
-// `postCommand`/server-child code path) so a regression here cannot silently
-// start skipping the moment #111 lands.
+// exactly the silent-never-runs failure a case testing a just-fixed fault
+// point must not have. `raceEditorCommandAgainstExit` below keeps resolve
+// and reject strictly distinct and only ever reaches `dead-code` on a
+// resolved HTTP 200 carrying THIS operation's own committed receipt while
+// the child is still alive; anything else resolved is `unexpected-response`
+// (fails loudly, never skips); a rejection is always `killed` (a bounded,
+// throwing wait for the exit event -- never a silent skip). Kept as
+// permanent regression-proofing for `after-claim` specifically: reaching
+// `dead-code` there now FAILS the test outright (F3 regressed -- the fault
+// point stopped firing again), never skips -- its own dedicated proof test
+// below still demonstrates the classifier lands on `killed`, never
+// `dead-code`, against a guaranteed, reachable kill (`after-full-staging`,
+// the same `postCommand`/server-child code path).
 //
 // ── FINDING F4 (discovered building this file, empirically verified) ──────
 //
@@ -475,8 +479,8 @@ describe("editor remove-feature crash matrix", () => {
     }, 15000);
   }
 
-  // ── after-claim (F3, Issue #111): parametrized pending-fixup cell ────────
-  it("after-claim -> PENDING FIXUP (Issue #111, F3): self-detects today's dead code, runs for real once the fixup lands", async (ctx) => {
+  // ── after-claim (F3, fixed by Issue #111) ─────────────────────────────────
+  it("after-claim -> aborted, old state intact, no staging dir (F3, fixed by #111)", async () => {
     const projectsDir = await freshProjectsDir();
     const seeded = await seedProject(tracker, projectsDir, [feature(FEATURE_A)]);
     const before = await readRootBytes(seeded.dir);
@@ -496,16 +500,15 @@ describe("editor remove-feature crash matrix", () => {
     }
 
     if (outcome.kind === "dead-code") {
-      // vitest 2.x's `TestContext.skip()` takes no reason argument -- logged
-      // here instead, so it is still visible in the run's own output.
-      console.warn(
-        "[after-claim PENDING FIXUP] after-claim is unreachable on the real editor-command path today " +
-          "(F3, fixup Issue #111): submitEditorCommand never calls commitWithClaimLocked, so the fault " +
-          "point never fires. Re-enable once #111 lands -- this same case will then observe the real SIGKILL."
-      );
+      // #111 fixed this permanently -- reaching `dead-code` here means the
+      // fault point stopped firing again (F3 regressed). A hard failure,
+      // never a skip: the skip-and-wait-for-the-fixup behavior this case
+      // used before #111 landed is retired.
       await killChild(armed.child); // the request completed normally -- the child is still alive, clean it up
-      ctx.skip();
-      return;
+      throw new Error(
+        "fault-editor-matrix: after-claim's commit resolved normally instead of being killed " +
+          "(status=" + outcome.status + ") -- #111's fix appears to have regressed."
+      );
     }
 
     // outcome.kind === "killed"
@@ -513,11 +516,15 @@ describe("editor remove-feature crash matrix", () => {
     const restarted = await startServerChild(tracker, projectsDir);
     const { body: opBody } = await getOperation(restarted.baseUrl, seeded.projectId, operationId);
     const after = await readRootBytes(seeded.dir);
+    // A1: the pending-claim marker must be resolved either way, same as
+    // every other cell in the crash-matrix loop above (:451/455).
+    const markerExists = await pathExists(pendingMarkerPathOf(seeded.dir, operationId));
     await killChild(restarted.child);
 
     expect(opBody.state).toBe("definitely_not_committed");
     if (opBody.state === "definitely_not_committed") expect(opBody.reason).toBe("aborted");
     expect(after).toEqual(before); // old state intact
+    expect(markerExists).toBe(false); // pending marker resolved
     // "no staging dir": after-claim fires before any staging call, so
     // recovery has nothing to reconcile FOR THIS OPERATION. The PARENT
     // `editor-transactions/` directory itself is not a signal either way --
