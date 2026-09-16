@@ -298,10 +298,11 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
   // `writeScad()` calls, each a real `docker run` (`paramSchema()`/
   // `runSyntaxCheck()` -> `runOpenscad()`, no container reuse) -- genuine
   // subprocess latency, not redundant test-file work or a lock-queuing race.
-  // Measured under concurrent CPU load (`pnpm -r build` + 3 extra vitest
-  // processes): 8/10 passed, median 3478.1ms, max 4146.1ms; the 2 failures
-  // were both `Test timed out in 5000ms`. 15_000ms is 3x that measured max,
-  // rounded, and matches the repo's docker-shelling test floor.
+  // This test's real docker calls mean the repo's 15_000ms docker-shelling
+  // floor applies regardless of measured max. Measured under concurrent CPU
+  // load (`pnpm -r build` + 3 extra vitest processes): 8/10 passed, median
+  // 3478.1ms, max 4146.1ms; the 2 failures were both `Test timed out in
+  // 5000ms`. 3x that max is 12438.3ms, comfortably covered by the floor.
   it("a concurrent write_scad while read_project runs never yields a block whose sourceRevision disagrees with the returned scad", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -324,9 +325,11 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
   // Issue #118: two `readProject()` calls (before/after `setParams`), each a
   // real `docker run` via `paramSchema()` -> `runParamExport()` ->
   // `runOpenscad()` -- both load-bearing for the before/after revision
-  // comparison, not redundant. Measured under the same heavy concurrent
-  // load: 10/10 passed, median 2664.8ms, max 4324.9ms. 15_000ms is 3x that
-  // measured max, rounded, and matches the repo's docker-shelling test floor.
+  // comparison, not redundant. This test's real docker calls mean the
+  // repo's 15_000ms docker-shelling floor applies regardless of measured
+  // max. Measured under the same heavy concurrent load: 10/10 passed,
+  // median 2664.8ms, max 4324.9ms; 3x that max is 12974.7ms, comfortably
+  // covered by the floor.
   it("a set_params call changes the editor revision the next read_project reports", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");

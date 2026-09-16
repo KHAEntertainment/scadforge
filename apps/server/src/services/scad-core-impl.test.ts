@@ -494,11 +494,12 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
   // Issue #118: `api.updateParams` ends in `paramsResponse()` ->
   // `runParamExport()` -> `runOpenscad()`, a real `docker run` -- inherent to
   // that (off-limits) product path, not redundant test-file work; the
-  // conflict itself (`submitEditorCommand`) never touches OpenSCAD. Measured
-  // under heavy concurrent load (`pnpm -r build` + 3 extra vitest
-  // processes): 9/10 passed, median 2572.3ms, max 4466.0ms; the 1 failure
-  // was `Test timed out in 5000ms`. 15_000ms is 3x that measured max,
-  // rounded, and matches the repo's docker-shelling test floor.
+  // conflict itself (`submitEditorCommand`) never touches OpenSCAD. This
+  // test's real docker calls mean the repo's 15_000ms docker-shelling floor
+  // applies regardless of measured max. Measured under heavy concurrent
+  // load (`pnpm -r build` + 3 extra vitest processes): 9/10 passed, median
+  // 2572.3ms, max 4466.0ms; the 1 failure was `Test timed out in 5000ms`.
+  // 3x that max is 13398.0ms, comfortably covered by the floor.
   it("an external PUT /params write between proof and commit makes the commit return CONFLICT", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p4");
@@ -595,12 +596,13 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
   // trusts was already rendered by an earlier `verifyEditorCommand` call,
   // outside any lock; THIS TEST never calls `verifyEditorCommand` at all,
   // it fakes that proof directly via `persistFakeProof` below, so the
-  // engine never runs on either the production or the test path here.
+  // engine never runs on either the production or the test path here. This
+  // test's real docker calls (through `api.updateParams`) mean the repo's
+  // 15_000ms docker-shelling floor applies regardless of measured max.
   // Measured under heavy concurrent load (`pnpm -r build` + 3 extra vitest
-  // processes): 9/10
-  // passed, median 2893.0ms, max 4578.2ms; the 1 failure was `Test timed out
-  // in 5000ms`. 15_000ms is 3x that measured max, rounded, and matches the
-  // repo's docker-shelling test floor.
+  // processes): 9/10 passed, median 2893.0ms, max 4578.2ms; the 1 failure
+  // was `Test timed out in 5000ms`. 3x that max is 13734.6ms, comfortably
+  // covered by the floor.
   it("undo after an intervening snapshot:false params write restores the TRUE pre-edit value, not the parent snapshot's", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p6");
