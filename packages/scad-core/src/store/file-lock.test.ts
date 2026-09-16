@@ -8,8 +8,8 @@ import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:f
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { LOCK_OWNER_FILE, STALE_LOCK_MIN_AGE_MS, withFileLock } from "./file-lock.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FILE_LOCK_MAX_WAIT_MS, LOCK_OWNER_FILE, STALE_LOCK_MIN_AGE_MS, withFileLock } from "./file-lock.js";
 
 let workDir: string;
 let lockDir: string;
@@ -35,11 +35,15 @@ async function writeOwner(dir: string, owner: { pid: number; startedAt: string; 
 }
 
 describe("withFileLock stale-owner reclaim (Issue #73)", () => {
-  it("a lock held by a live pid is NOT reclaimed -- the contender exhausts the backoff ceiling and fails CONFLICT", async () => {
+  it("a lock held by a live pid is NOT reclaimed -- the contender exhausts the wait budget and fails CONFLICT", async () => {
     await mkdir(lockDir);
     await writeOwner(lockDir, { pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname() });
 
-    await expect(withFileLock(lockDir, "test", async () => "should never run")).rejects.toMatchObject({
+    // A short custom maxWaitMs -- this test only cares that a live holder is
+    // never reclaimed and the caller eventually fails CONFLICT, not the real
+    // production budget (proven separately below), so it need not spend the
+    // default FILE_LOCK_MAX_WAIT_MS on every run.
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
       error_code: "CONFLICT"
     });
 
@@ -71,7 +75,7 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
   it("a lock with NO owner.json and a FRESH mtime is NOT reclaimed -- it may simply be mid-acquisition", async () => {
     await mkdir(lockDir); // no owner.json written -- simulates the narrow window before writeOwnerFile runs
 
-    await expect(withFileLock(lockDir, "test", async () => "should never run")).rejects.toMatchObject({
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
       error_code: "CONFLICT"
     });
   }, 20000);
@@ -89,7 +93,7 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
     await mkdir(lockDir);
     await writeOwner(lockDir, { pid: deadPid(), startedAt: new Date().toISOString(), hostname: `not-${hostname()}` });
 
-    await expect(withFileLock(lockDir, "test", async () => "should never run")).rejects.toMatchObject({
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
       error_code: "CONFLICT"
     });
   }, 20000);
@@ -106,5 +110,113 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
     await withFileLock(lockDir, "test", async () => "done");
     const exists = await readdir(workDir).then((entries) => entries.includes("some.lock"));
     expect(exists).toBe(false);
+  });
+});
+
+describe("withFileLock wall-clock wait budget (Issue #115)", () => {
+  it("N live, fully-serialized holders whose total real hold time exceeds a fixed attempt-count-equivalent, but stays under maxWaitMs, all succeed", async () => {
+    // Old behavior: a FIXED ATTEMPT COUNT gave up after ~50 attempts
+    // regardless of how many legitimate holders were queued or how long
+    // each one's critical section took -- proven failing pre-fix against
+    // the real default budget (see the PR body for that one-off run). This
+    // proves the fix's direction on a small, fast, injectable deadline: 6
+    // holders x 120ms fully serialize to ~720ms, comfortably under a 2000ms
+    // maxWaitMs, so every caller succeeds even though none of them is the
+    // first to acquire.
+    const N = 6;
+    const holdMs = 120;
+    const results = await Promise.all(
+      Array.from({ length: N }, (_, i) =>
+        withFileLock(
+          lockDir,
+          "test",
+          async () => {
+            await new Promise((r) => setTimeout(r, holdMs));
+            return i;
+          },
+          2000
+        )
+      )
+    );
+    expect(new Set(results).size).toBe(N);
+  }, 10000);
+
+  it("a live holder that outlasts maxWaitMs fails the waiter with CONFLICT at about the deadline, not at attempt exhaustion", async () => {
+    await mkdir(lockDir);
+    await writeOwner(lockDir, { pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname() });
+
+    const start = Date.now();
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+    const elapsedMs = Date.now() - start;
+    // Gives up close to the 300ms deadline -- nowhere near the default
+    // FILE_LOCK_MAX_WAIT_MS (10s), which the old attempt-count mechanism
+    // would have forced regardless of this caller's own maxWaitMs.
+    expect(elapsedMs).toBeGreaterThanOrEqual(300);
+    expect(elapsedMs).toBeLessThan(2000);
+  }, 10000);
+});
+
+describe("withFileLock maxWaitMs clamping (Issue #115)", () => {
+  async function expectFallsBackToDefault(maxWaitMs: number): Promise<void> {
+    await mkdir(lockDir);
+    await writeOwner(lockDir, { pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname() });
+
+    // `withFileLock` measures elapsed time with `performance.now()`
+    // (monotonic, Issue #115) rather than `Date.now()` -- vitest's fake
+    // timers must be told to fake it explicitly, it is not in the default
+    // `toFake` list.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    try {
+      const pending = withFileLock(lockDir, "test", async () => "should never run", maxWaitMs);
+      pending.catch(() => {}); // avoid an unhandled-rejection warning while it's still pending below
+
+      // Just short of the default deadline: must NOT have settled yet -- a
+      // non-finite maxWaitMs must fall back to FILE_LOCK_MAX_WAIT_MS, never
+      // to "wait forever" (Infinity) or "never wait" (NaN falling through to
+      // the 200-attempt count cap instead).
+      await vi.advanceTimersByTimeAsync(FILE_LOCK_MAX_WAIT_MS - 500);
+      let settled = false;
+      pending.then(
+        () => (settled = true),
+        () => (settled = true)
+      );
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await expect(pending).rejects.toMatchObject({ error_code: "CONFLICT" });
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("NaN maxWaitMs falls back to the production default, not the 200-attempt count cap", async () => {
+    await expectFallsBackToDefault(NaN);
+  });
+
+  it("Infinity maxWaitMs falls back to the production default, not an unbounded wait", async () => {
+    await expectFallsBackToDefault(Infinity);
+  });
+
+  it("maxWaitMs=0 gives up after exactly one failed attempt, near-instantly -- passes through unchanged", async () => {
+    await mkdir(lockDir); // no owner.json -- fresh, non-reclaimable, same as the "mid-acquisition" fixture above
+
+    const start = Date.now();
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 0)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it("a negative maxWaitMs behaves the same as 0 -- one attempt, then CONFLICT, passes through unchanged", async () => {
+    await mkdir(lockDir);
+
+    const start = Date.now();
+    await expect(withFileLock(lockDir, "test", async () => "should never run", -50)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+    expect(Date.now() - start).toBeLessThan(500);
   });
 });

@@ -42,7 +42,11 @@ function paramsLockDir(projectDir: string): string {
  * should run BEFORE acquiring the lock, so rapid successive writes (a
  * slider-drag pattern) never degrade into a long lock-held chain, and a
  * crashed holder cannot wedge every other writer for long either.
+ *
+ * `maxWaitMs` (default {@link FILE_LOCK_MAX_WAIT_MS} via `withFileLock`) is
+ * an optional override of the wall-clock give-up budget -- additive, for
+ * tests only (Issue #115); production callers never pass it.
  */
-export async function withParamsLock<T>(projectDir: string, fn: () => Promise<T>): Promise<T> {
-  return withFileLock(paramsLockDir(projectDir), "params", fn);
+export async function withParamsLock<T>(projectDir: string, fn: () => Promise<T>, maxWaitMs?: number): Promise<T> {
+  return withFileLock(paramsLockDir(projectDir), "params", fn, maxWaitMs);
 }

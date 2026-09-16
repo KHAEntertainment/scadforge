@@ -137,7 +137,13 @@ export type { DigestDomain } from "./editor/canonical.js";
 // merge (see the S3-B ticket story's "Shared seams" note).
 export { withRecoveredProject } from "./store/recovered.js";
 export type { LockedProject, ReadResult } from "./store/recovered.js";
-export { FILE_LOCK_MAX_ATTEMPTS, LOCK_OWNER_FILE, STALE_LOCK_MIN_AGE_MS, withFileLock } from "./store/file-lock.js";
+export {
+  FILE_LOCK_MAX_ATTEMPTS,
+  FILE_LOCK_MAX_WAIT_MS,
+  LOCK_OWNER_FILE,
+  STALE_LOCK_MIN_AGE_MS,
+  withFileLock
+} from "./store/file-lock.js";
 
 // ── sidecar storage (Issue #87 / S3-B ticket B3) ────────────────────────────
 //
