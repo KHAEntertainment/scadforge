@@ -110,7 +110,10 @@ describe("mergeParamsAtomic (Issue #44)", () => {
       "utf8"
     );
 
-    vi.useFakeTimers();
+    // withFileLock measures elapsed time with performance.now() (monotonic,
+    // Issue #115) -- vitest's fake timers must fake it explicitly, it is not
+    // in the default toFake list.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
     try {
       const pending = withParamsLock(projectDir, async () => "unreachable");
       // Prove the DEFAULT is really FILE_LOCK_MAX_WAIT_MS: fast-forwarding

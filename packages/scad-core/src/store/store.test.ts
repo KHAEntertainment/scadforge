@@ -553,7 +553,10 @@ describe("project store (filesystem, temp dir)", () => {
     // loop exhausts and fails with the frozen CONFLICT code.
     await mkdir(join(projectDir, PROJECT_LAYOUT.metaDir, "exports.lock"), { recursive: true });
 
-    await expect(recordExport(projectDir, exportRecord(0))).rejects.toMatchObject({ error_code: "CONFLICT" });
+    // A short injected maxWaitMs (Issue #115) -- this test only cares that
+    // exhaustion surfaces the typed CONFLICT, not the real production
+    // budget, so it need not pay the real FILE_LOCK_MAX_WAIT_MS on every run.
+    await expect(recordExport(projectDir, exportRecord(0), 300)).rejects.toMatchObject({ error_code: "CONFLICT" });
 
     // Nothing was written: the failed append must not silently drop into a
     // half-state, and the lock itself is still held (we created it).

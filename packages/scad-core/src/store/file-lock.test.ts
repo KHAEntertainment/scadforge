@@ -8,8 +8,8 @@ import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:f
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { LOCK_OWNER_FILE, STALE_LOCK_MIN_AGE_MS, withFileLock } from "./file-lock.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FILE_LOCK_MAX_WAIT_MS, LOCK_OWNER_FILE, STALE_LOCK_MIN_AGE_MS, withFileLock } from "./file-lock.js";
 
 let workDir: string;
 let lockDir: string;
@@ -156,4 +156,67 @@ describe("withFileLock wall-clock wait budget (Issue #115)", () => {
     expect(elapsedMs).toBeGreaterThanOrEqual(300);
     expect(elapsedMs).toBeLessThan(2000);
   }, 10000);
+});
+
+describe("withFileLock maxWaitMs clamping (Issue #115)", () => {
+  async function expectFallsBackToDefault(maxWaitMs: number): Promise<void> {
+    await mkdir(lockDir);
+    await writeOwner(lockDir, { pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname() });
+
+    // `withFileLock` measures elapsed time with `performance.now()`
+    // (monotonic, Issue #115) rather than `Date.now()` -- vitest's fake
+    // timers must be told to fake it explicitly, it is not in the default
+    // `toFake` list.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    try {
+      const pending = withFileLock(lockDir, "test", async () => "should never run", maxWaitMs);
+      pending.catch(() => {}); // avoid an unhandled-rejection warning while it's still pending below
+
+      // Just short of the default deadline: must NOT have settled yet -- a
+      // non-finite maxWaitMs must fall back to FILE_LOCK_MAX_WAIT_MS, never
+      // to "wait forever" (Infinity) or "never wait" (NaN falling through to
+      // the 200-attempt count cap instead).
+      await vi.advanceTimersByTimeAsync(FILE_LOCK_MAX_WAIT_MS - 500);
+      let settled = false;
+      pending.then(
+        () => (settled = true),
+        () => (settled = true)
+      );
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await expect(pending).rejects.toMatchObject({ error_code: "CONFLICT" });
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("NaN maxWaitMs falls back to the production default, not the 200-attempt count cap", async () => {
+    await expectFallsBackToDefault(NaN);
+  });
+
+  it("Infinity maxWaitMs falls back to the production default, not an unbounded wait", async () => {
+    await expectFallsBackToDefault(Infinity);
+  });
+
+  it("maxWaitMs=0 gives up after exactly one failed attempt, near-instantly -- passes through unchanged", async () => {
+    await mkdir(lockDir); // no owner.json -- fresh, non-reclaimable, same as the "mid-acquisition" fixture above
+
+    const start = Date.now();
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 0)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  it("a negative maxWaitMs behaves the same as 0 -- one attempt, then CONFLICT, passes through unchanged", async () => {
+    await mkdir(lockDir);
+
+    const start = Date.now();
+    await expect(withFileLock(lockDir, "test", async () => "should never run", -50)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+    expect(Date.now() - start).toBeLessThan(500);
+  });
 });
