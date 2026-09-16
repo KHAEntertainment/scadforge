@@ -566,13 +566,19 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
   // wrongly restore the PARENT SNAPSHOT'S value instead of the TRUE
   // pre-edit live value.
   //
-  // Issue #118 audit: this test drives three `updateParams`/`submitEditorCommand`
-  // round trips, each a real `docker run` via `paramsResponse()`'s
-  // `runParamExport()`. Measured under heavy concurrent load (`pnpm -r
-  // build` + 3 extra vitest processes): 9/10 passed, median 2893.0ms, max
-  // 4578.2ms; the 1 failure was `Test timed out in 5000ms`. 15_000ms is 3x
-  // that measured max, rounded, and matches the repo's docker-shelling test
-  // floor.
+  // Issue #118 audit (correction posted on the issue -- the prior comment
+  // here mischaracterized the mechanics): the ONE `api.updateParams` call
+  // below is what shells out, and it does so TWICE -- `planParamUpdate`'s
+  // `readParamSchema` (runtime.ts:234) and `paramsResponse`'s own
+  // `runParamExport` (scad-core-impl.ts:441), both real `docker run`s. The
+  // three `api.submitEditorCommand` calls that follow shell out ZERO times
+  // each: "No engine work happens anywhere in this function"
+  // (scad-core-impl.ts:523) -- the proof they trust was already rendered by
+  // an earlier `verifyEditorCommand`, outside any lock. Measured under heavy
+  // concurrent load (`pnpm -r build` + 3 extra vitest processes): 9/10
+  // passed, median 2893.0ms, max 4578.2ms; the 1 failure was `Test timed out
+  // in 5000ms`. 15_000ms is 3x that measured max, rounded, and matches the
+  // repo's docker-shelling test floor.
   it("undo after an intervening snapshot:false params write restores the TRUE pre-edit value, not the parent snapshot's", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p6");

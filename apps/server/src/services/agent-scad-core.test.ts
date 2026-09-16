@@ -89,6 +89,13 @@ describe("coherentProjectState (Issue #87 / S3-B ticket B3)", () => {
     expect(after.sidecarFeatures.map((f) => f.featureId)).toEqual([sidecar.features[0].featureId]);
   });
 
+  // Issue #118 audit round 2 (QA spot-check flagged this file's other
+  // readProject() tests near vitest's 5000ms default): readProject() always
+  // calls paramSchema() -> runParamExport() -> a real docker run. Measured
+  // under heavy concurrent load (`pnpm -r build` + 2 extra vitest
+  // processes): 10/10 passed, median 829.4ms, max 1638.0ms. 15_000ms is 3x
+  // that measured max, rounded, and matches the repo's docker-shelling test
+  // floor.
   it("readProject()'s wire ProjectState now legitimately carries editor (Issue #92 / S3-B ticket B7) -- otherwise unchanged", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -100,10 +107,15 @@ describe("coherentProjectState (Issue #87 / S3-B ticket B3)", () => {
     expect(Object.keys(projectState).sort()).toEqual(
       ["editor", "head_snapshot", "param_schema", "params", "scad", "validation"].sort()
     );
-  });
+  }, 15_000);
 });
 
 describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
+  // Issue #118 audit round 2: real docker run via readProject() ->
+  // paramSchema(). Measured under heavy concurrent load (`pnpm -r build` + 2
+  // extra vitest processes): 10/10 passed, median 741.2ms, max 1490.4ms.
+  // 15_000ms is 3x that measured max, rounded, and matches the repo's
+  // docker-shelling test floor.
   it("a fresh project reads a ready block with an empty feature list and a real (non-fallback) editorRevision", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -124,8 +136,13 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     // Not the missing/corrupt/unsupported-version fallback -- a ready sidecar
     // must use the real digest-folded revision.
     expect(editor?.editorRevision).not.toBe(editor?.sourceRevision);
-  });
+  }, 15_000);
 
+  // Issue #118 audit round 2: real docker run via readProject() ->
+  // paramSchema(). Measured under heavy concurrent load (`pnpm -r build` + 2
+  // extra vitest processes): 10/10 passed, median 920.4ms, max 2191.9ms.
+  // 15_000ms is 3x that measured max, rounded, and matches the repo's
+  // docker-shelling test floor.
   it("a ready sidecar with two features reports them (and their real eligibility, Issue #91 / S3-B ticket B5) in featureId order, not insertion order", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -149,8 +166,13 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
       { featureId: low.featureId, state: "unsupported", reason: 'Parameter "width" is not in the current parameter schema.' },
       { featureId: high.featureId, state: "unsupported", reason: 'Parameter "width" is not in the current parameter schema.' }
     ]);
-  });
+  }, 15_000);
 
+  // Issue #118 audit round 2: real docker run via readProject() ->
+  // paramSchema(). Measured under heavy concurrent load (`pnpm -r build` + 2
+  // extra vitest processes): 10/10 passed, median 1174.2ms, max 2380.3ms.
+  // 15_000ms is 3x that measured max, rounded, and matches the repo's
+  // docker-shelling test floor.
   it("a ready sidecar feature bound to a real Customizer parameter reports requires-proof (real eligibility)", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -163,8 +185,13 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     const { editor } = await agentCore.readProject();
 
     expect(editor?.eligibility).toEqual([{ featureId: sidecar.features[0].featureId, state: "requires-proof", reason: null }]);
-  });
+  }, 15_000);
 
+  // Issue #118 audit round 2: real docker run via readProject() ->
+  // paramSchema(). Measured under heavy concurrent load (`pnpm -r build` + 2
+  // extra vitest processes): 10/10 passed, median 708.4ms, max 1054.5ms.
+  // 15_000ms is 3x that measured max, rounded, and matches the repo's
+  // docker-shelling test floor.
   it("a legacy (pre-S3) project reads legacy-empty with an empty feature list", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -187,7 +214,7 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     // all, so 'empty' is not a fabrication") -- the real digest-folded
     // revision applies, not the missing/corrupt/unsupported-version fallback.
     expect(editor?.editorRevision).not.toBe(editor?.sourceRevision);
-  });
+  }, 15_000);
 
   it("a corrupt root sidecar reads corrupt with an empty feature list and editorRevision falling back to sourceRevision", async () => {
     const runtime = runtimeFor(root);
