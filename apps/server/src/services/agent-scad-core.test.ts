@@ -89,6 +89,11 @@ describe("coherentProjectState (Issue #87 / S3-B ticket B3)", () => {
     expect(after.sidecarFeatures.map((f) => f.featureId)).toEqual([sidecar.features[0].featureId]);
   });
 
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. Measured under heavy
+  // load: median 829.4ms, max 1638.0ms; 3x that max is 4914.0ms,
+  // comfortably covered by the floor.
   it("readProject()'s wire ProjectState now legitimately carries editor (Issue #92 / S3-B ticket B7) -- otherwise unchanged", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -100,10 +105,15 @@ describe("coherentProjectState (Issue #87 / S3-B ticket B3)", () => {
     expect(Object.keys(projectState).sort()).toEqual(
       ["editor", "head_snapshot", "param_schema", "params", "scad", "validation"].sort()
     );
-  });
+  }, 15_000);
 });
 
 describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. Measured under heavy
+  // load: median 741.2ms, max 1490.4ms; 3x that max is 4471.2ms,
+  // comfortably covered by the floor.
   it("a fresh project reads a ready block with an empty feature list and a real (non-fallback) editorRevision", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -124,8 +134,13 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     // Not the missing/corrupt/unsupported-version fallback -- a ready sidecar
     // must use the real digest-folded revision.
     expect(editor?.editorRevision).not.toBe(editor?.sourceRevision);
-  });
+  }, 15_000);
 
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. Measured under heavy
+  // load: median 920.4ms, max 2191.9ms; 3x that max is 6575.7ms,
+  // comfortably covered by the floor.
   it("a ready sidecar with two features reports them (and their real eligibility, Issue #91 / S3-B ticket B5) in featureId order, not insertion order", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -149,8 +164,13 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
       { featureId: low.featureId, state: "unsupported", reason: 'Parameter "width" is not in the current parameter schema.' },
       { featureId: high.featureId, state: "unsupported", reason: 'Parameter "width" is not in the current parameter schema.' }
     ]);
-  });
+  }, 15_000);
 
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. Measured under heavy
+  // load: median 1174.2ms, max 2380.3ms; 3x that max is 7140.9ms,
+  // comfortably covered by the floor.
   it("a ready sidecar feature bound to a real Customizer parameter reports requires-proof (real eligibility)", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -163,8 +183,13 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     const { editor } = await agentCore.readProject();
 
     expect(editor?.eligibility).toEqual([{ featureId: sidecar.features[0].featureId, state: "requires-proof", reason: null }]);
-  });
+  }, 15_000);
 
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. Measured under heavy
+  // load: median 708.4ms, max 1054.5ms; 3x that max is 3163.5ms,
+  // comfortably covered by the floor.
   it("a legacy (pre-S3) project reads legacy-empty with an empty feature list", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -187,8 +212,17 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     // all, so 'empty' is not a fabrication") -- the real digest-folded
     // revision applies, not the missing/corrupt/unsupported-version fallback.
     expect(editor?.editorRevision).not.toBe(editor?.sourceRevision);
-  });
+  }, 15_000);
 
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. Unlike the corrupt
+  // params-authority test below, `readSidecarLocked` returns a STATUS
+  // ("corrupt") rather than throwing, so the coherent read succeeds and
+  // `readProject` proceeds to `paramSchema()` -- one real docker run,
+  // proven by this test asserting on `editor.sidecarStatus` from a
+  // successfully returned value. Measured basis is QA's, from the full-gate
+  // run at this head: max 2030ms.
   it("a corrupt root sidecar reads corrupt with an empty feature list and editorRevision falling back to sourceRevision", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -202,8 +236,16 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     expect(editor?.features).toEqual([]);
     expect(editor?.eligibility).toEqual([]);
     expect(editor?.editorRevision).toBe(editor?.sourceRevision);
-  });
+  }, 15_000);
 
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. `readSidecarLocked`
+  // returns a STATUS ("missing") rather than throwing, so the coherent read
+  // succeeds and `readProject` proceeds to `paramSchema()` -- one real
+  // docker run, proven by this test asserting on `editor.sidecarStatus`
+  // from a successfully returned value. Measured basis is QA's, from the
+  // full-gate run at this head: max 2214ms.
   it("a missing root sidecar (modern marker, no file) reads missing with an empty feature list and editorRevision falling back to sourceRevision", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -217,8 +259,16 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     expect(editor?.features).toEqual([]);
     expect(editor?.eligibility).toEqual([]);
     expect(editor?.editorRevision).toBe(editor?.sourceRevision);
-  });
+  }, 15_000);
 
+  // This test shells out to docker via readProject() -> uncached
+  // paramSchema() -> runParamExport (agent-scad-core.ts:184-194), so the
+  // repo's 15_000ms docker-shelling floor applies. `readSidecarLocked`
+  // returns a STATUS ("unsupported-version") rather than throwing, so the
+  // coherent read succeeds and `readProject` proceeds to `paramSchema()` --
+  // one real docker run, proven by this test asserting on
+  // `editor.sidecarStatus` from a successfully returned value. Measured
+  // basis is QA's, from the full-gate run at this head: max 2695ms.
   it("an unsupported future sidecar version reads unsupported-version with an empty feature list and editorRevision falling back to sourceRevision", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -232,7 +282,7 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     expect(editor?.features).toEqual([]);
     expect(editor?.eligibility).toEqual([]);
     expect(editor?.editorRevision).toBe(editor?.sourceRevision);
-  });
+  }, 15_000);
 
   it("the whole read fails when the root params authority is corrupt -- never a fabricated empty editor block", async () => {
     const runtime = runtimeFor(root);
@@ -244,6 +294,15 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
     await expect(agentCore.readProject()).rejects.toThrow();
   });
 
+  // Issue #118: this test issues 8 concurrent `readProject()` calls plus 2
+  // `writeScad()` calls, each a real `docker run` (`paramSchema()`/
+  // `runSyntaxCheck()` -> `runOpenscad()`, no container reuse) -- genuine
+  // subprocess latency, not redundant test-file work or a lock-queuing race.
+  // This test's real docker calls mean the repo's 15_000ms docker-shelling
+  // floor applies regardless of measured max. Measured under concurrent CPU
+  // load (`pnpm -r build` + 3 extra vitest processes): 8/10 passed, median
+  // 3478.1ms, max 4146.1ms; the 2 failures were both `Test timed out in
+  // 5000ms`. 3x that max is 12438.3ms, comfortably covered by the floor.
   it("a concurrent write_scad while read_project runs never yields a block whose sourceRevision disagrees with the returned scad", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -261,8 +320,16 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
       const recomputed = computeSourceRevision(state.head_snapshot, state.scad, state.params);
       expect(state.editor?.sourceRevision).toBe(recomputed);
     }
-  });
+  }, 15_000);
 
+  // Issue #118: two `readProject()` calls (before/after `setParams`), each a
+  // real `docker run` via `paramSchema()` -> `runParamExport()` ->
+  // `runOpenscad()` -- both load-bearing for the before/after revision
+  // comparison, not redundant. This test's real docker calls mean the
+  // repo's 15_000ms docker-shelling floor applies regardless of measured
+  // max. Measured under the same heavy concurrent load: 10/10 passed,
+  // median 2664.8ms, max 4324.9ms; 3x that max is 12974.7ms, comfortably
+  // covered by the floor.
   it("a set_params call changes the editor revision the next read_project reports", async () => {
     const runtime = runtimeFor(root);
     const dir = runtime.dirFor("my-bracket");
@@ -280,7 +347,7 @@ describe("readProject() editor block (Issue #92 / S3-B ticket B7)", () => {
 
     expect(after.editor?.editorRevision).not.toBe(before.editor?.editorRevision);
     expect(after.editor?.sourceRevision).not.toBe(before.editor?.sourceRevision);
-  });
+  }, 15_000);
 });
 
 describe("old-adapter editor omission path (packages/agent handler forwarding, Issue #92)", () => {

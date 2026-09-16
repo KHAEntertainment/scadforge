@@ -386,6 +386,24 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
     expect(recomputedDigest).toBe(receipt.sidecarDigest);
   });
 
+  // Issue #118 audit round 2 (item 3, Tech Lead ruling): this test takes NO
+  // docker path -- `initProject` is the pure store function
+  // (packages/scad-core/src/store/store.ts), `coherentSourceState` is
+  // fs-only, `persistFakeProof` renders nothing, and `submitEditorCommand`
+  // does no engine work ("No engine work happens anywhere in this
+  // function", scad-core-impl.ts:523). Its load sensitivity is filesystem
+  // and file-lock contention, not container startup -- do NOT "correct"
+  // this to the repo's 15_000ms docker-shelling floor; that floor does not
+  // apply here.
+  //
+  // Measured basis: this worker's own controlled load (`pnpm -r build` loop
+  // + 2 extra concurrent vitest processes) gave 15/15 passed, median
+  // 841.2ms, max 1175.2ms -- 3x that stays under the 5000ms default. QA's
+  // heavier three-loop recipe (a tight `pnpm -r build` loop with no pause,
+  // PLUS a 20x server-test loop, PLUS a 20x web-test loop, all concurrent)
+  // measured this same test at max 2509ms (median 1293ms) -- genuinely more
+  // pressure than this worker generated. The Tech Lead ruled on the heavier
+  // number: 3 x 2509 = 7527, rounded up to 8000.
   it("undo then redo of a set-value edit produces two more snapshots and ends at the post-edit values", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p3");
@@ -471,8 +489,17 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
     expect(redoReceipt.values).toEqual({ wall: 9 });
     expect(redoReceipt.snapshotId).not.toBe(undoReceipt.snapshotId);
     expect(redoReceipt.snapshotId).not.toBe(editReceipt.snapshotId);
-  });
+  }, 8000);
 
+  // Issue #118: `api.updateParams` ends in `paramsResponse()` ->
+  // `runParamExport()` -> `runOpenscad()`, a real `docker run` -- inherent to
+  // that (off-limits) product path, not redundant test-file work; the
+  // conflict itself (`submitEditorCommand`) never touches OpenSCAD. This
+  // test's real docker calls mean the repo's 15_000ms docker-shelling floor
+  // applies regardless of measured max. Measured under heavy concurrent
+  // load (`pnpm -r build` + 3 extra vitest processes): 9/10 passed, median
+  // 2572.3ms, max 4466.0ms; the 1 failure was `Test timed out in 5000ms`.
+  // 3x that max is 13398.0ms, comfortably covered by the floor.
   it("an external PUT /params write between proof and commit makes the commit return CONFLICT", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p4");
@@ -509,7 +536,7 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
         proofId
       })
     ).rejects.toMatchObject({ code: "CONFLICT" });
-  });
+  }, 15_000);
 
   it("two concurrent identical requests produce exactly one snapshot", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
@@ -557,6 +584,25 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
   // snapshot's own params never see that intervening write, so undo would
   // wrongly restore the PARENT SNAPSHOT'S value instead of the TRUE
   // pre-edit live value.
+  //
+  // Issue #118 audit (correction posted on the issue -- the prior comment
+  // here mischaracterized the mechanics): the ONE `api.updateParams` call
+  // below is what shells out, and it does so TWICE -- `planParamUpdate`'s
+  // `readParamSchema` (runtime.ts:234) and `paramsResponse`'s own
+  // `runParamExport` (scad-core-impl.ts:441), both real `docker run`s. The
+  // three `api.submitEditorCommand` calls that follow shell out ZERO times
+  // each: "No engine work happens anywhere in this function"
+  // (scad-core-impl.ts:523) -- in PRODUCTION, the proof `submitEditorCommand`
+  // trusts was already rendered by an earlier `verifyEditorCommand` call,
+  // outside any lock; THIS TEST never calls `verifyEditorCommand` at all,
+  // it fakes that proof directly via `persistFakeProof` below, so the
+  // engine never runs on either the production or the test path here. This
+  // test's real docker calls (through `api.updateParams`) mean the repo's
+  // 15_000ms docker-shelling floor applies regardless of measured max.
+  // Measured under heavy concurrent load (`pnpm -r build` + 3 extra vitest
+  // processes): 9/10 passed, median 2893.0ms, max 4578.2ms; the 1 failure
+  // was `Test timed out in 5000ms`. 3x that max is 13734.6ms, comfortably
+  // covered by the floor.
   it("undo after an intervening snapshot:false params write restores the TRUE pre-edit value, not the parent snapshot's", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p6");
@@ -652,7 +698,7 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
       proofId: redoProof
     });
     expect(redoReceipt.values).toEqual({ wall: 9 });
-  });
+  }, 15_000);
 
   // ── "after-claim" fault point (Issue #111) ──────────────────────────────
   //
