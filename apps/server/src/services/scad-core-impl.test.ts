@@ -473,6 +473,14 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
     expect(redoReceipt.snapshotId).not.toBe(editReceipt.snapshotId);
   });
 
+  // Issue #118: `api.updateParams` ends in `paramsResponse()` ->
+  // `runParamExport()` -> `runOpenscad()`, a real `docker run` -- inherent to
+  // that (off-limits) product path, not redundant test-file work; the
+  // conflict itself (`submitEditorCommand`) never touches OpenSCAD. Measured
+  // under heavy concurrent load (`pnpm -r build` + 3 extra vitest
+  // processes): 9/10 passed, median 2572.3ms, max 4466.0ms; the 1 failure
+  // was `Test timed out in 5000ms`. 15_000ms is 3x that measured max,
+  // rounded, and matches the repo's docker-shelling test floor.
   it("an external PUT /params write between proof and commit makes the commit return CONFLICT", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p4");
@@ -509,7 +517,7 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
         proofId
       })
     ).rejects.toMatchObject({ code: "CONFLICT" });
-  });
+  }, 15_000);
 
   it("two concurrent identical requests produce exactly one snapshot", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
@@ -557,6 +565,14 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
   // snapshot's own params never see that intervening write, so undo would
   // wrongly restore the PARENT SNAPSHOT'S value instead of the TRUE
   // pre-edit live value.
+  //
+  // Issue #118 audit: this test drives three `updateParams`/`submitEditorCommand`
+  // round trips, each a real `docker run` via `paramsResponse()`'s
+  // `runParamExport()`. Measured under heavy concurrent load (`pnpm -r
+  // build` + 3 extra vitest processes): 9/10 passed, median 2893.0ms, max
+  // 4578.2ms; the 1 failure was `Test timed out in 5000ms`. 15_000ms is 3x
+  // that measured max, rounded, and matches the repo's docker-shelling test
+  // floor.
   it("undo after an intervening snapshot:false params write restores the TRUE pre-edit value, not the parent snapshot's", async () => {
     const runtime = createServerRuntime({ [PROJECTS_DIR_ENV_VAR]: root } as NodeJS.ProcessEnv);
     const dir = runtime.dirFor("p6");
@@ -652,7 +668,7 @@ describe("submitEditorCommand integration (S3-B ticket B6, Issue #98)", () => {
       proofId: redoProof
     });
     expect(redoReceipt.values).toEqual({ wall: 9 });
-  });
+  }, 15_000);
 
   // ── "after-claim" fault point (Issue #111) ──────────────────────────────
   //
