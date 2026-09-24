@@ -1,0 +1,8 @@
+# Private repo: PR-Agent (see .github/workflows/ai-review.yml) is the reviewer here.
+# Keep CodeRabbit quiet so it doesn't post summaries or edit PR descriptions.
+reviews:
+  auto_review:
+    enabled: false
+  high_level_summary: false
+  poem: false
+  review_status: false
