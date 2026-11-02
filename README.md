@@ -2,7 +2,7 @@
 
 **Describe a part. Generate editable OpenSCAD. Inspect and refine the model.**
 
-[![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both)](https://svg.khaentertainment.com/go)
+[![Built with Showrunner](https://svg.khaentertainment.com/badge.svg?theme=midnight&anim=both&project=KHAEntertainment/scadforge)](https://svg.khaentertainment.com/go?project=KHAEntertainment/scadforge)
 
 ScadForge is a local-first, single-user CAD workspace that turns natural-language
 requests into parametric [OpenSCAD](https://openscad.org/) models. A Claude agent
