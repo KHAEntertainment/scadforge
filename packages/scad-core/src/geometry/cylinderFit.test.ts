@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-import type { Axis, Vec3 } from "../measure.js";
+import type { Axis, Vec3 } from "./vec.js";
 import { angularCoverage, classifySurface, evaluateCylinder, fitCircleInPlane, sagittaMm } from "./cylinderFit.js";
 import { INSPECTION_THRESHOLDS } from "./thresholds.js";
 import type { Refusal } from "./inspectionTypes.js";

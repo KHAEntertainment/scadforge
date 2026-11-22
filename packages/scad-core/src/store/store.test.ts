@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -15,18 +16,43 @@ import {
   readProjectManifest,
   readSnapshotManifest,
   recordExport,
-  revertToSnapshot
+  revertToSnapshot,
+  updateRootParamsLocked
 } from "./store.js";
-import { snapshotDir, rootParamsPath } from "./paths.js";
+import { historyDir, projectFilePath, snapshotDir, rootModelPath, rootParamsPath, transactionsDir } from "./paths.js";
+import { __setFaultActionForTests } from "./transaction.js";
 import {
-  attachRendersToSnapshot,
-  attachValidationToSnapshot,
+  attachRendersToSnapshotLocked,
+  attachValidationToSnapshotLocked,
   resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   resolveSnapshotValidationPath,
   SNAPSHOT_MESH_FILE,
-  snapshotMeshPath
+  snapshotMeshPath,
+  type AttachRendersOptions,
+  type RenderAttachment
 } from "./attachments.js";
+import { withRecoveredProject } from "./recovered.js";
+import type { SnapshotId } from "@scadforge/protocol";
+import type { EditorFeature, EditorSidecar, ProjectManifest, SnapshotManifest } from "@scadforge/protocol";
+import type { ValidationResult } from "../types.js";
+import { canonicalJson, sidecarDigest } from "../editor/canonical.js";
+import { EMPTY_SIDECAR, readSidecarLocked, sidecarPath, snapshotSidecarPath, writeSidecarLocked } from "../editor/sidecar.js";
+
+/** Test-only convenience: opens the boundary once and calls the ctx-taking attacher, mirroring how a real caller (`apps/server`'s `build`/`renderAndAttach`) does it. */
+function attachRendersToSnapshot(
+  dir: string,
+  snapshotId: SnapshotId,
+  attachments: readonly RenderAttachment[],
+  options?: AttachRendersOptions
+) {
+  return withRecoveredProject(dir, (ctx) => attachRendersToSnapshotLocked(ctx, snapshotId, attachments, options));
+}
+
+/** Test-only convenience: see {@link attachRendersToSnapshot}. */
+function attachValidationToSnapshot(dir: string, snapshotId: SnapshotId, validation: ValidationResult) {
+  return withRecoveredProject(dir, (ctx) => attachValidationToSnapshotLocked(ctx, snapshotId, validation));
+}
 
 let projectDir: string;
 
@@ -35,6 +61,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  __setFaultActionForTests(null);
+  delete process.env.SCADFORGE_FAULT_POINT;
   await rm(projectDir, { recursive: true, force: true });
 });
 
@@ -525,7 +553,10 @@ describe("project store (filesystem, temp dir)", () => {
     // loop exhausts and fails with the frozen CONFLICT code.
     await mkdir(join(projectDir, PROJECT_LAYOUT.metaDir, "exports.lock"), { recursive: true });
 
-    await expect(recordExport(projectDir, exportRecord(0))).rejects.toMatchObject({ error_code: "CONFLICT" });
+    // A short injected maxWaitMs (Issue #115) -- this test only cares that
+    // exhaustion surfaces the typed CONFLICT, not the real production
+    // budget, so it need not pay the real FILE_LOCK_MAX_WAIT_MS on every run.
+    await expect(recordExport(projectDir, exportRecord(0), 300)).rejects.toMatchObject({ error_code: "CONFLICT" });
 
     // Nothing was written: the failed append must not silently drop into a
     // half-state, and the lock itself is still held (we created it).
@@ -649,7 +680,7 @@ describe("project store (filesystem, temp dir)", () => {
     // is a real id from this run, not stale/duplicated.
     const project = await readProjectManifest(projectDir);
     expect(new Set(ids).has(project.head as string)).toBe(true);
-  });
+  }, 20000); // S3-B ticket B4: staging now does per-file digesting plus a flush/fsync per staged and published file, so 12 fully-serialized contenders legitimately need more headroom than the default timeout under load -- matches the sibling concurrency tests below.
 
   it("exhausting SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS surfaces the typed CONFLICT error instead of silently overwriting", async () => {
     await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
@@ -761,4 +792,386 @@ describe("project store (filesystem, temp dir)", () => {
     const manifest = JSON.parse(await readFile(join(torn, PROJECT_LAYOUT.snapshot.manifestFile), "utf8"));
     expect(manifest.id).toBe("0002");
   }, 20000);
+
+  it("reclaims an EMPTY orphaned claim directory immediately, no age wait (Issue #98 F2)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+
+    // Simulate a kill right after claimNextSnapshotId's exclusive mkdir,
+    // BEFORE any staging content ever reached the directory: history/0002
+    // exists, completely empty, no manifest.json, project.json.head never
+    // advanced past 0001. Deliberately NOT backdated (unlike the hard-kill
+    // test above) -- the fix must not need ORPHANED_CLAIM_MIN_AGE_MS to
+    // elapse for an empty directory.
+    const orphan = snapshotDir(projectDir, "0002");
+    await mkdir(orphan, { recursive: true });
+
+    const startedAt = Date.now();
+    const recovered = await createSnapshot(projectDir, {
+      content: "cube(3);\n",
+      params: {},
+      message: "recovered after empty orphaned claim",
+      origin: "manual",
+      pass: null
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(recovered.id).toBe("0002"); // reclaimed immediately, id reused -- sequence stays gapless
+    // Well within SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS's retry budget and nowhere
+    // near the old 60s age wait this fix removes for the empty case.
+    expect(elapsedMs).toBeLessThan(2000);
+
+    // The committed 0001 snapshot was never touched.
+    const first = await readSnapshotManifest(projectDir, "0001");
+    expect(first.origin).toBe("initial");
+  }, 20000);
+});
+
+// ── corruption vs. legacy absence (Issue #73 / S3-B ticket B2) ──────────────
+//
+// The pre-#73 code folded a genuinely corrupt file into the SAME empty/null
+// result as "this file was never written" -- silently discarding whatever
+// was actually on disk the next time something merged onto it. These prove
+// the split: legacy absence still degrades exactly as before; corruption now
+// fails loudly and leaves the bytes untouched.
+describe("corruption vs. legacy absence (Issue #73)", () => {
+  it("a corrupt root params.json fails mergeParamsAtomic with INTERNAL_ERROR and leaves the bytes on disk untouched", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n", params: { a: 1 } });
+    const corruptBytes = "{ this is not valid json";
+    await writeFile(rootParamsPath(projectDir), corruptBytes, "utf8");
+
+    await expect(mergeParamsAtomic(projectDir, { b: 2 }, async (merged) => merged)).rejects.toMatchObject({
+      error_code: "INTERNAL_ERROR"
+    });
+
+    // Refusing to merge means refusing to write -- the corrupt bytes are
+    // still exactly what they were, preserved for inspection/repair rather
+    // than silently replaced by a one-key `{b: 2}` file.
+    expect(await readFile(rootParamsPath(projectDir), "utf8")).toBe(corruptBytes);
+  });
+
+  it("a MISSING root params.json (legacy project) still merges from {} -- ordinary absence, not corruption", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    await rm(rootParamsPath(projectDir), { force: true });
+
+    const merged = await mergeParamsAtomic(projectDir, { fresh: 1 }, async (m) => m);
+    expect(merged).toEqual({ fresh: 1 });
+  });
+
+  it("a corrupt project.json fails createSnapshot BEFORE any write, and releases the history-id claim (no new snapshot directory is left behind)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const before = await readdirNames(historyDir(projectDir));
+    await writeFile(projectFilePath(projectDir), "{ not valid json at all", "utf8");
+
+    await expect(
+      createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "must not land", origin: "manual", pass: null })
+    ).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+
+    // No new snapshot directory was claimed -- the corruption is caught
+    // before claimNextSnapshotId ever calls mkdir on a new id.
+    const after = await readdirNames(historyDir(projectDir));
+    expect(after).toEqual(before);
+  });
+
+  it("a corrupt snapshot manifest.json fails readSnapshotManifest with INTERNAL_ERROR, not SNAPSHOT_NOT_FOUND", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    await writeFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "{ corrupt", "utf8");
+
+    await expect(readSnapshotManifest(projectDir, "0001")).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+  });
+
+  it("an unreadable/corrupt snapshot directory in history/ fails the WHOLE listSnapshots call, naming the offending id -- never a silent skip", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    await createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "v2", origin: "manual", pass: null });
+    // Corrupt the FIRST snapshot's manifest -- a naive implementation could
+    // silently drop just this one entry and still return a (shorter) list.
+    await writeFile(join(snapshotDir(projectDir, "0001"), PROJECT_LAYOUT.snapshot.manifestFile), "{ corrupt", "utf8");
+
+    await expect(listSnapshots(projectDir)).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+    await expect(listSnapshots(projectDir)).rejects.toThrow(/0001/);
+  });
+});
+
+async function readdirNames(dir: string): Promise<string[]> {
+  return (await readdir(dir)).sort();
+}
+
+// ── editor sidecar snapshot capture and revert copy-forward (Issue #87 / S3-B ticket B3) ──
+
+function makeFeature(overrides: Partial<EditorFeature> = {}): EditorFeature {
+  return {
+    featureId: randomUUID(),
+    label: "Width",
+    projectId: randomUUID(),
+    createdAtRevision: "a".repeat(64),
+    sourceFingerprint: "b".repeat(64),
+    bindingVersion: 1,
+    provenance: { kind: "manual" },
+    binding: { kind: "linear", parameter: "width", axis: "x", mapping: { scale: 1, offset: 0, anchor: "min" } },
+    ...overrides
+  };
+}
+
+/** Test-only convenience mirroring `attachRendersToSnapshot` above. */
+function writeSidecar(dir: string, sidecar: EditorSidecar) {
+  return withRecoveredProject(dir, (ctx) => writeSidecarLocked(ctx, sidecar));
+}
+
+function readSidecar(dir: string) {
+  return withRecoveredProject(dir, (ctx) => readSidecarLocked(ctx));
+}
+
+/** Simulates a snapshot that predates S3 (Issue #68/#87): strips its captured `editor.json` and the manifest's `editor` descriptor, WITHOUT touching the project marker or any other snapshot. Only used to construct a pre-S3 fixture on an otherwise S3-B-created project -- `initProject`'s own first snapshot is always modern (see the "new projects are S3-modern from their first snapshot" test below), so a genuinely legacy snapshot has to be simulated this way. */
+async function stripEditorFromSnapshot(dir: string, id: string): Promise<void> {
+  await rm(snapshotSidecarPath(dir, id), { force: true });
+  const manifestPath = join(snapshotDir(dir, id), PROJECT_LAYOUT.snapshot.manifestFile);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as SnapshotManifest;
+  delete manifest.editor;
+  await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+}
+
+describe("editor sidecar: snapshot capture (Issue #87 / S3-B ticket B3)", () => {
+  it("a brand-new project is S3-modern from its very first ('initial') snapshot -- no init-time special case, an emergent property of ordinary snapshot capture", async () => {
+    const { project, snapshot } = await initProject(projectDir, {
+      id: "p",
+      name: "n",
+      provider: providerConfig,
+      content: "cube(1);\n"
+    });
+
+    expect(project.editor_store_version).toBe(1);
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(canonicalJson(EMPTY_SIDECAR));
+
+    expect(snapshot.editor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(EMPTY_SIDECAR) });
+    const capturedBytes = await readFile(snapshotSidecarPath(projectDir, snapshot.id), "utf8");
+    expect(capturedBytes).toBe(canonicalJson(EMPTY_SIDECAR));
+
+    const projectManifest = JSON.parse(await readFile(projectFilePath(projectDir), "utf8")) as ProjectManifest;
+    expect(projectManifest.editor_store_version).toBe(1);
+  });
+
+  it("an ordinary params snapshot on a READY project embeds editor.json whose digest equals the manifest descriptor", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const sidecar: EditorSidecar = { version: 1, features: [makeFeature()] };
+    await writeSidecar(projectDir, sidecar);
+
+    const snap = await createSnapshot(projectDir, {
+      content: "cube(1);\n",
+      params: { size: 5 },
+      message: "params update",
+      origin: "manual",
+      pass: null
+    });
+
+    expect(snap.editor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(sidecar) });
+    const capturedBytes = await readFile(snapshotSidecarPath(projectDir, snap.id), "utf8");
+    expect(capturedBytes).toBe(canonicalJson(sidecar));
+  });
+
+  it("createSnapshot refuses (INTERNAL_ERROR, naming the status and the absolute path) when the root sidecar is corrupt", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" });
+    const corruptBytes = "{ not json";
+    await writeFile(sidecarPath(projectDir), corruptBytes, "utf8");
+
+    await expect(
+      createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "must not land", origin: "manual", pass: null })
+    ).rejects.toMatchObject({ error_code: "INTERNAL_ERROR", message: expect.stringContaining(sidecarPath(projectDir)) });
+
+    // No new snapshot was claimed, and the corrupt bytes are untouched.
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]);
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(corruptBytes);
+  });
+});
+
+describe("editor sidecar: revert exact copy-forward (Issue #87 / S3-B ticket B3, AC6)", () => {
+  it("revert to a snapshot with two features when the root has three yields exactly the two, byte-for-byte", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001, S3-modern, empty
+
+    const two: EditorSidecar = { version: 1, features: [makeFeature(), makeFeature()] };
+    await writeSidecar(projectDir, two);
+    const target = await createSnapshot(projectDir, { content: "cube(1);\n", params: {}, message: "two features", origin: "manual", pass: null }); // 0002 -- the revert TARGET
+
+    const three: EditorSidecar = { version: 1, features: [...two.features, makeFeature()] };
+    await writeSidecar(projectDir, three);
+    await createSnapshot(projectDir, { content: "cube(1);\n", params: {}, message: "three features", origin: "manual", pass: null }); // 0003 -- current head/root
+
+    const reverted = await revertToSnapshot(projectDir, target.id);
+
+    // The new ROOT sidecar is EXACTLY the target's two features -- never
+    // merged with the three the root had a moment ago.
+    const rootAfter = await readSidecar(projectDir);
+    expect(rootAfter.status).toBe("ready");
+    expect(rootAfter.sidecar?.features.map((f) => f.featureId).sort()).toEqual(
+      two.features.map((f) => f.featureId).sort()
+    );
+
+    // And the REVERTED snapshot's own captured copy matches, byte-for-byte,
+    // the TARGET's own captured copy (not merely equal in content).
+    const revertedBytes = await readFile(snapshotSidecarPath(projectDir, reverted.id), "utf8");
+    const targetBytes = await readFile(snapshotSidecarPath(projectDir, target.id), "utf8");
+    expect(revertedBytes).toBe(targetBytes);
+    expect(reverted.editor?.sha256).toBe(target.editor?.sha256);
+  });
+
+  it("revert to a PRE-S3 target yields the canonical empty sidecar and keeps the (already-set) marker", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    await stripEditorFromSnapshot(projectDir, "0001"); // simulate: 0001 predates S3
+
+    const sidecar: EditorSidecar = { version: 1, features: [makeFeature()] };
+    await writeSidecar(projectDir, sidecar);
+    await createSnapshot(projectDir, { content: "cube(1);\n", params: {}, message: "modern head", origin: "manual", pass: null }); // 0002 -- root now has 1 feature
+
+    const reverted = await revertToSnapshot(projectDir, "0001");
+
+    const rootAfter = await readSidecar(projectDir);
+    expect(rootAfter).toEqual({ status: "ready", sidecar: EMPTY_SIDECAR, digest: sidecarDigest(EMPTY_SIDECAR), error: null });
+
+    const projectManifest = JSON.parse(await readFile(projectFilePath(projectDir), "utf8")) as ProjectManifest;
+    expect(projectManifest.editor_store_version).toBe(1); // never downgraded
+
+    expect(reverted.editor).toEqual({ version: 1, file: "editor.json", sha256: sidecarDigest(EMPTY_SIDECAR) });
+  });
+
+  it("revertToSnapshot on a CORRUPT root sidecar throws and neither the root sidecar nor head changes", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    const corruptBytes = "{ not json";
+    await writeFile(sidecarPath(projectDir), corruptBytes, "utf8");
+    const headBefore = (await readProjectManifest(projectDir)).head;
+
+    await expect(revertToSnapshot(projectDir, "0001")).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(corruptBytes);
+    expect((await readProjectManifest(projectDir)).head).toBe(headBefore);
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]); // no new snapshot was left behind
+  });
+
+  it("revertToSnapshot on a CORRUPT target snapshot sidecar throws and nothing changes", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001, valid empty sidecar
+    const rootBefore = await readFile(sidecarPath(projectDir), "utf8");
+    const headBefore = (await readProjectManifest(projectDir)).head;
+    // Tamper 0001's OWN captured copy while its manifest descriptor still
+    // points at it -- a digest mismatch, i.e. corruption, never legacy-empty.
+    await writeFile(snapshotSidecarPath(projectDir, "0001"), "{ not json", "utf8");
+
+    await expect(revertToSnapshot(projectDir, "0001")).rejects.toMatchObject({ error_code: "INTERNAL_ERROR" });
+
+    expect(await readFile(sidecarPath(projectDir), "utf8")).toBe(rootBefore); // root untouched
+    expect((await readProjectManifest(projectDir)).head).toBe(headBefore);
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]);
+  });
+});
+
+// ── staged roll-forward transactions (Issue #90 / S3-B ticket B4) ───────────
+
+/** Arms `SCADFORGE_FAULT_POINT=name` for the duration of `action`, always disarming afterward — even a caller that never awaits the fault (an untouched name) must not leak the env var into a later test. */
+async function withFaultPoint<T>(name: string, action: () => Promise<T>): Promise<T> {
+  process.env.SCADFORGE_FAULT_POINT = name;
+  try {
+    return await action();
+  } finally {
+    delete process.env.SCADFORGE_FAULT_POINT;
+  }
+}
+
+class SimulatedCrash extends Error {}
+
+describe("staged roll-forward transactions (Issue #90 / S3-B ticket B4)", () => {
+  it("a crash during staging (before commit.json) leaves root and history byte-identical -- no partial entry is ever visible", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    __setFaultActionForTests(() => {
+      throw new SimulatedCrash("simulated crash: after-partial-staging");
+    });
+
+    await withFaultPoint("after-partial-staging", () =>
+      expect(
+        createSnapshot(projectDir, { content: "cube(2);\n", params: {}, message: "should not land", origin: "manual", pass: null })
+      ).rejects.toThrow(/simulated crash/)
+    );
+
+    expect(await readFile(rootModelPath(projectDir), "utf8")).toBe("cube(1);\n");
+    expect(await readdirNames(historyDir(projectDir))).toEqual(["0001"]); // no partial directory left behind
+
+    const snapshots = await listSnapshots(projectDir);
+    expect(snapshots.map((s) => s.id)).toEqual(["0001"]);
+  });
+
+  it("a crash after decision (commit.json durable) but mid-publication is completed by the next boundary entry -- the receipt matches exactly what was decided", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    __setFaultActionForTests(() => {
+      throw new SimulatedCrash("simulated crash: after-publish-root-source");
+    });
+
+    await withFaultPoint("after-publish-root-source", () =>
+      expect(
+        createSnapshot(projectDir, { content: "cube(2);\n", params: { a: 1 }, message: "second", origin: "manual", pass: null })
+      ).rejects.toThrow(/simulated crash/)
+    );
+
+    // The ORIGINAL call rejected -- the caller gets no success response. The
+    // operation is nonetheless durably committed: the fault is disarmed now
+    // (withFaultPoint's finally already ran), so this fresh boundary entry's
+    // own `recover()` finishes publication idempotently before it does
+    // anything else.
+    const snapshots = await listSnapshots(projectDir);
+    expect(snapshots.map((s) => s.id)).toEqual(["0001", "0002"]);
+    expect(snapshots[1]?.message).toBe("second");
+    expect(snapshots[1]?.params).toEqual({ a: 1 });
+    expect(await readFile(rootModelPath(projectDir), "utf8")).toBe("cube(2);\n");
+    const project = await readProjectManifest(projectDir);
+    expect(project.head).toBe("0002");
+  });
+
+  it("a manifest-less history/<id> directory (an abandoned id claim with no linked transaction) is skipped by listSnapshots, never a hard failure (Tech Lead correction C2)", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n" }); // 0001
+    // Simulates a crash right after claimNextSnapshotId's exclusive mkdir but
+    // BEFORE any staging transaction ever started -- recover() has nothing to
+    // reconcile (no transaction is linked to this directory at all), so this
+    // gap can ONLY ever be closed by Issue #28's existing age-gated orphan
+    // reclaim, never by B4's own transaction recovery.
+    const orphan = snapshotDir(projectDir, "0002");
+    await mkdir(orphan);
+    const past = new Date(Date.now() - 2 * ORPHANED_CLAIM_MIN_AGE_MS);
+    await utimes(orphan, past, past);
+
+    const snapshots = await listSnapshots(projectDir);
+    expect(snapshots.map((s) => s.id)).toEqual(["0001"]); // skipped, not a hard failure -- listSnapshots itself never claims/deletes anything
+
+    // The store keeps working: the next writer reclaims the stale, manifest-less debris and reuses the id -- gapless.
+    const next = await createSnapshot(projectDir, {
+      content: "cube(2);\n",
+      params: {},
+      message: "after gap",
+      origin: "manual",
+      pass: null
+    });
+    expect(next.id).toBe("0002");
+  });
+
+  it("updateRootParamsLocked (the snapshot-free params write) stages and publishes ONLY params.json -- history and root model.scad are untouched, and no staging directory is left behind", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n", params: { a: 1 } }); // 0001
+    const historyBefore = await readdirNames(historyDir(projectDir));
+
+    await withRecoveredProject(projectDir, (ctx) => updateRootParamsLocked(ctx, { a: 1, b: 2 }));
+
+    expect(await readdirNames(historyDir(projectDir))).toEqual(historyBefore); // no snapshot created
+    expect(await readFile(rootModelPath(projectDir), "utf8")).toBe("cube(1);\n"); // root model untouched
+    const params = JSON.parse(await readFile(rootParamsPath(projectDir), "utf8")) as { parameterSets: { current: unknown } };
+    expect(params.parameterSets.current).toEqual({ a: 1, b: 2 });
+
+    const stagingEntries = await readdir(transactionsDir(projectDir)).catch(() => []);
+    expect(stagingEntries).toEqual([]);
+  });
+
+  it("a crash during updateRootParamsLocked's staging leaves root params.json untouched", async () => {
+    await initProject(projectDir, { id: "p", name: "n", provider: providerConfig, content: "cube(1);\n", params: { a: 1 } });
+    const before = await readFile(rootParamsPath(projectDir), "utf8");
+    __setFaultActionForTests(() => {
+      throw new SimulatedCrash("simulated crash: after-full-staging");
+    });
+
+    await withFaultPoint("after-full-staging", () =>
+      expect(withRecoveredProject(projectDir, (ctx) => updateRootParamsLocked(ctx, { a: 1, c: 3 }))).rejects.toThrow(/simulated crash/)
+    );
+
+    expect(await readFile(rootParamsPath(projectDir), "utf8")).toBe(before);
+  });
 });

@@ -14,7 +14,16 @@ import { readFile } from "node:fs/promises";
 import { basename, relative } from "node:path";
 import { rename, stat } from "node:fs/promises";
 import { join } from "node:path";
-import type { SnapshotManifest, ToolArtifact, ViewName } from "@scadforge/protocol";
+import { parseAgentEditorContext } from "@scadforge/protocol";
+import type {
+  AgentEditorContext,
+  EditorFeature,
+  EditorSidecarStatus,
+  ProjectManifest,
+  SnapshotManifest,
+  ToolArtifact,
+  ViewName
+} from "@scadforge/protocol";
 import type {
   AgentExportRequest,
   AgentRenderRequest,
@@ -28,17 +37,24 @@ import type {
 } from "@scadforge/agent";
 import { lookup as libraryLookup } from "@scadforge/libs";
 import {
-  attachValidationToSnapshot,
-  createSnapshot,
+  attachValidationToSnapshotLocked,
+  computeSourceRevision,
+  createSnapshotLocked,
+  editorEligibility,
+  editorRevision,
   exportRun,
   exportsDir,
   mergeParamsAtomic,
+  readProjectManifestLocked,
+  readSidecarLocked,
   recordExport,
   rootModelPath,
   runParamExport,
   runSyntaxCheck,
   snapshotMeshPath,
-  validateModel
+  sourceFingerprint,
+  validateModel,
+  withRecoveredProject
 } from "@scadforge/scad-core";
 import type {
   ExportRunResult,
@@ -52,7 +68,14 @@ import type {
 } from "@scadforge/scad-core";
 import type { ExportRecord } from "@scadforge/protocol";
 import { renderAndAttach } from "./scad-core-impl.js";
-import { planParamUpdate, readParams, readProject, readScad, stageSnapshotModel, type ServerRuntime } from "./runtime.js";
+import {
+  planParamUpdate,
+  readParamsLocked,
+  readProject,
+  readScadLocked,
+  stageSnapshotModel,
+  type ServerRuntime
+} from "./runtime.js";
 import { exportFileUrl, renderFileUrl, snapshotMeshUrl, snapshotUrl } from "./urls.js";
 
 /** An empty schema, used when the current model cannot be parsed for parameters yet. */
@@ -84,6 +107,67 @@ export interface AgentScadCoreOptions {
 }
 
 /**
+ * The agent's coherent project + source + params (+, since Issue #87, editor
+ * sidecar) read result. INTERNAL-ONLY extension mirroring `scad-core-impl.ts`'s
+ * `SourceState` — the seam B5/B6/B7 read from, no change to the wire
+ * `ProjectState` (`readProject()` below still returns exactly that, unchanged).
+ * `sidecarDigest`/`editorRevision` are `null` whenever the sidecar status is
+ * `missing`/`corrupt`/`unsupported-version` (Tech Lead correction C1) —
+ * `sidecarFeatures` is `[]` in that case.
+ *
+ * `sourceRevision`/`sourceFingerprint` (Issue #92, S3-B ticket B7) are
+ * exposed here so `readProject()` below can build `AgentEditorContext`
+ * without a second, separately-timed computation outside this coherent
+ * read — `sourceFingerprint` in particular is the ONE shared digest B5's
+ * proof records and B6's editor document also consume (see
+ * `@scadforge/scad-core`'s `sourceFingerprint` doc comment).
+ */
+export interface CoherentProjectState {
+  project: ProjectManifest;
+  scad: string;
+  params: ParamValues;
+  sidecarStatus: EditorSidecarStatus;
+  sidecarFeatures: EditorFeature[];
+  sidecarDigest: string | null;
+  editorRevision: string | null;
+  sourceRevision: string;
+  sourceFingerprint: string;
+}
+
+/**
+ * ONE boundary entry for project + scad + params + editor sidecar together
+ * (Issue #73: D7's "same recovered coherent read" requirement) — a
+ * concurrent writer landing between independently-timed reads could hand
+ * back a head that disagrees with the scad/params/sidecar it's paired with.
+ * Exported (was inlined in `readProject()` below) so this coherent-read
+ * result is directly unit-testable and independently reusable by a future
+ * ticket, without touching the wire `ProjectState` shape.
+ */
+export async function coherentProjectState(dir: string): Promise<CoherentProjectState> {
+  return withRecoveredProject(dir, async (ctx) => {
+    const project = await readProjectManifestLocked(ctx);
+    const scad = await readScadLocked(ctx);
+    const params = await readParamsLocked(ctx);
+    const sidecarRead = await readSidecarLocked(ctx);
+    const sourceRevision = computeSourceRevision(project.head, scad, params);
+    return {
+      project,
+      scad,
+      params,
+      sidecarStatus: sidecarRead.status,
+      sidecarFeatures: sidecarRead.sidecar?.features ?? [],
+      sidecarDigest: sidecarRead.digest,
+      editorRevision: sidecarRead.digest !== null ? editorRevision(sourceRevision, sidecarRead.digest) : null,
+      sourceRevision,
+      // Computed inside the same locked read as `scad`, alongside
+      // `sourceRevision` above -- no extra I/O, since `sourceFingerprint` is
+      // a pure hash of `scad` alone.
+      sourceFingerprint: sourceFingerprint(scad)
+    };
+  });
+}
+
+/**
  * Binds `packages/agent`'s CAD seam to one project.
  *
  * Every method rejects with a `ScadForgeError` (the `ScadCoreFailure` shape
@@ -111,9 +195,62 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
 
   return {
     async readProject(): Promise<ProjectState> {
-      const project = await readProject(dir);
-      const [scad, params, param_schema] = await Promise.all([readScad(dir), readParams(dir), paramSchema()]);
-      return { scad, params, param_schema, validation: lastValidation, head_snapshot: project.head };
+      // `coherentProjectState` (above) is the ONE boundary entry for project
+      // + scad + params + editor sidecar together -- the old code ran
+      // project/scad/params as three INDEPENDENT operations (an unlocked
+      // `readProject` plus two more via `Promise.all`), so a concurrent
+      // writer landing between them could hand the agent a head that
+      // disagrees with the scad/params it's paired with. `paramSchema()`
+      // stays OUTSIDE the lock -- it is a slow OpenSCAD subprocess call, and
+      // (like `scad-core-impl.ts`'s `paramsResponse`) already tolerates
+      // being a live, best-effort derived view rather than a value pinned to
+      // the exact coherent instant above.
+      const coherent = await coherentProjectState(dir);
+      const param_schema = await paramSchema();
+
+      // D7 agent referenceability (Issue #92, S3-B ticket B7): `eligibility`
+      // is PURE (no I/O -- see the eligibility seam doc) and is computed
+      // against the coherent read's OWN `sidecarFeatures`, so it only
+      // inherits `param_schema`'s existing best-effort/live-view tolerance
+      // above -- never a second, independently-timed sidecar read.
+      const eligibility = editorEligibility(coherent.sidecarFeatures, param_schema);
+
+      // Tech-Lead-approved fallback (2026-09-14, Q1): `AgentEditorContext.
+      // editorRevision` is a required hex64 field, but `coherent.editorRevision`
+      // is `null` whenever the sidecar is untrustworthy (`missing`/`corrupt`/
+      // `unsupported-version` -- see `CoherentProjectState`'s doc comment).
+      // B3's `readSidecarLocked` deliberately never fabricates a digest for a
+      // sidecar that does not trustworthily exist, so there is no real
+      // sidecar digest to fold in for those three statuses. Falling back to
+      // `sourceRevision` verbatim reports the agent's actual, current source
+      // identity without inventing anything: it can never collide with a
+      // genuine (domain-prefixed) editor revision, and it still changes
+      // whenever the source changes even though no sidecar is available.
+      const agentEditorRevision = coherent.editorRevision ?? coherent.sourceRevision;
+
+      // `parseAgentEditorContext` (AC2): the production adapter must never
+      // emit a block the frozen mirror schema would reject -- validating
+      // here, not just trusting the object literal below, is what makes that
+      // an enforced invariant rather than an assumption.
+      const editor: AgentEditorContext = parseAgentEditorContext({
+        version: 1,
+        projectId: coherent.project.id,
+        editorRevision: agentEditorRevision,
+        sourceRevision: coherent.sourceRevision,
+        sourceFingerprint: coherent.sourceFingerprint,
+        sidecarStatus: coherent.sidecarStatus,
+        features: coherent.sidecarFeatures,
+        eligibility
+      });
+
+      return {
+        scad: coherent.scad,
+        params: coherent.params,
+        param_schema,
+        validation: lastValidation,
+        head_snapshot: coherent.project.head,
+        editor
+      };
     },
 
     async writeScad(request: WriteScadRequest): Promise<WriteScadOutcome> {
@@ -125,11 +262,12 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // Params are carried forward UNCHANGED (`accepted: {}`), but still go
       // through `mergeParamsAtomic` (Issue #44): reading "current params" and
       // writing them back into this snapshot must hold the SAME cross-process
-      // params lock every other params writer uses, or this content-only edit
-      // could still race a concurrent `set_params`/REST params update and
-      // silently regress its just-committed change.
-      const snapshot = await mergeParamsAtomic(dir, {}, (params) =>
-        createSnapshot(dir, {
+      // params lock (the recovery boundary) every other params writer uses,
+      // or this content-only edit could still race a concurrent
+      // `set_params`/REST params update and silently regress its
+      // just-committed change.
+      const snapshot = await mergeParamsAtomic(dir, {}, (params, ctx) =>
+        createSnapshotLocked(ctx, {
           content: request.content,
           params,
           message: request.message,
@@ -158,10 +296,13 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // and creates the snapshot WHILE HOLDING the cross-process params lock,
       // so this can never race a concurrent REST params update (or another
       // `set_params`/`write_scad` call) merging a DISJOINT key onto the same
-      // file.
-      const snapshot = await mergeParamsAtomic(dir, plan.accepted, async (merged) =>
-        createSnapshot(dir, {
-          content: await readScad(dir),
+      // file. Reads the current source through the `ctx` this callback
+      // already holds (`readScadLocked`) -- the exported `readScad` would
+      // re-enter the boundary and throw immediately (Issue #73's
+      // non-reentrancy guard).
+      const snapshot = await mergeParamsAtomic(dir, plan.accepted, async (merged, ctx) =>
+        createSnapshotLocked(ctx, {
+          content: await readScadLocked(ctx),
           params: merged,
           message: `Set ${Object.keys(params).length - unknown_params.length} parameter(s)`,
           origin: "manual",
@@ -236,9 +377,16 @@ export function createAgentScadCore(options: AgentScadCoreOptions): AgentScadCor
       // inspection of what a given revision actually measured would all be
       // permanently null.
       if (targetId && !isPreview) {
-        // A validation run whose bookkeeping fails must not fail the tool —
-        // the model still needs to see the report it just paid for.
-        await attachValidationToSnapshot(dir, targetId, result).catch(() => {});
+        // Issue #73: this bookkeeping failure used to be swallowed
+        // (`.catch(() => {})`) so a validation that genuinely succeeded but
+        // failed to PERSIST would report success anyway — the History
+        // badge, `ExportResponse.validation` and any later inspection of
+        // this revision would then silently disagree with what the agent
+        // was just told. `ValidationResult`'s frozen shape has no secondary
+        // field to carry a bookkeeping error alongside a geometry verdict,
+        // so the only honest way to report it is to fail the whole tool
+        // call.
+        await withRecoveredProject(dir, (ctx) => attachValidationToSnapshotLocked(ctx, targetId, result));
       }
       return result;
     },

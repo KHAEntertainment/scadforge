@@ -18,6 +18,7 @@ import { createParamsRoute } from "./routes/params.js";
 import { createExportRoute } from "./routes/export.js";
 import { createSourceRoute } from "./routes/source.js";
 import { createBuildRoute } from "./routes/build.js";
+import { createEditorRoute } from "./routes/editor.js";
 import { bodySizeLimit } from "./middleware/body-limit.js";
 import { errorBody } from "./services/errors.js";
 import type { ScadCoreApi } from "./services/scad-core-api.js";
@@ -57,6 +58,7 @@ export function createApp(deps: AppDeps) {
   app.route(API_BASE_PATH, createExportRoute(deps.scadCore));
   app.route(API_BASE_PATH, createSourceRoute(deps.scadCore));
   app.route(API_BASE_PATH, createBuildRoute(deps.scadCore));
+  app.route(API_BASE_PATH, createEditorRoute(deps.scadCore));
 
   app.notFound((c) => c.json(errorBody("NOT_FOUND", "Route not found."), 404));
 
