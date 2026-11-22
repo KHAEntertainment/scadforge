@@ -62,10 +62,14 @@
 //     Hold off.
 //   - no record and the directory at least `STALE_LOCK_MIN_AGE_MS` old: the
 //     creator died between `mkdir` and publication. ADOPT it (below).
-//   - a record that exists but is unreadable, and the directory at least
-//     `STALE_LOCK_MIN_AGE_MS` old: RECLAIM by rename, under the breaker. This
-//     is a legacy/corruption path only -- publication above never produces
-//     it.
+//   - an `owner.json` that was READ successfully but is torn or invalid, and
+//     the directory at least `STALE_LOCK_MIN_AGE_MS` old: RECLAIM by rename,
+//     under the breaker. This is a legacy/corruption path only -- publication
+//     above never produces it.
+//   - an `owner.json` whose READ FAILS (`EIO`, `EACCES`, `EMFILE`, ...): hold
+//     off, always. A failed read says nothing about the record (it may belong
+//     to a live holder), so it is never reclaimed and never adopted -- the
+//     same principle as the other-host rule: no oracle, never guess.
 //   - anything else (a live pid): hold off, backoff, retry until
 //     `FILE_LOCK_MAX_WAIT_MS`.
 //
@@ -138,6 +142,16 @@
 //     reclaimed by rename. New publication never produces one, but a pre-fix
 //     writer paused mid-write for that long can: its later write lands in the
 //     renamed-away directory and it believes it still holds the lock.
+//   - A record whose read keeps failing (a permissions fault, a failing disk)
+//     is never reclaimed or adopted: the lock fails closed and needs an
+//     operator to remove the directory.
+//   - Release verifies the token before removing the lock. If reading the
+//     record fails at release (say `EMFILE` under file-descriptor pressure)
+//     the read is retried a few times (5 retries, 25 ms apart); if it still
+//     fails the lock is LEFT IN PLACE, naming this live process, and the log
+//     says so (`[file-lock] could not VERIFY ownership of '<lockDir>' at
+//     release ...`). Later callers then see `CONFLICT` until this process
+//     restarts or the directory is removed. Never thrown, never masks `fn`.
 //   - Mixed-version writers: a pre-fix or `main` build never publishes a
 //     record (or publishes a non-atomic one) and holds an ownerless directory
 //     for its whole critical section. Once that has lasted
@@ -201,6 +215,10 @@ export const LOCK_OWNER_FILE = "owner.json";
 
 /** Minimum age (ms) of an ownerless lock directory before it is presumed to be debris from a holder that died before writing `owner.json`, rather than a live holder still in the middle of acquiring. */
 export const STALE_LOCK_MIN_AGE_MS = 60_000;
+
+/** Release re-reads the owner record this many times after a FAILED read (not an absent or invalid one), `RELEASE_READ_RETRY_DELAY_MS` apart -- about 125 ms in all. */
+const RELEASE_READ_RETRIES = 5;
+const RELEASE_READ_RETRY_DELAY_MS = 25;
 
 /** The lock-ownership record written into a held lock directory. `token` is optional on READ: an `owner.json` from a pre-token writer (or a hand-written fixture) lacks it and still drives staleness exactly as before. */
 interface LockOwner {
@@ -267,8 +285,14 @@ async function publishOwnerFile(lockDir: string, token: string, ownsEmptyDir: bo
   }
 }
 
-/** What reading `lockDir`'s owner record found: a complete record, none at all (`ENOENT`), or a file that is there but cannot be used (torn, malformed, wrong shape, unreadable). */
-type OwnerRead = { state: "record"; owner: LockOwner } | { state: "absent" } | { state: "unreadable" };
+/**
+ * What reading `lockDir`'s owner record found: a complete record; none at all
+ * (`ENOENT`/`ENOTDIR`); a file that was READ but is torn, malformed or the
+ * wrong shape (`unreadable`); or a read that FAILED (`read-failed`: `EIO`,
+ * `EACCES`, `EMFILE`, ... -- nothing is known about the record, so it must
+ * never be treated as stale, ownerless or someone else's).
+ */
+type OwnerRead = { state: "record"; owner: LockOwner } | { state: "absent" } | { state: "unreadable" } | { state: "read-failed"; code: string };
 
 async function readOwnerState(lockDir: string): Promise<OwnerRead> {
   let raw: string;
@@ -276,7 +300,7 @@ async function readOwnerState(lockDir: string): Promise<OwnerRead> {
     raw = await readFile(join(lockDir, LOCK_OWNER_FILE), "utf8");
   } catch (err) {
     const code = errorCode(err);
-    return code === "ENOENT" || code === "ENOTDIR" ? { state: "absent" } : { state: "unreadable" };
+    return code === "ENOENT" || code === "ENOTDIR" ? { state: "absent" } : { state: "read-failed", code: code ?? "UNKNOWN" };
   }
   try {
     const parsed = JSON.parse(raw) as Partial<LockOwner>;
@@ -287,12 +311,6 @@ async function readOwnerState(lockDir: string): Promise<OwnerRead> {
     // fall through: torn or malformed
   }
   return { state: "unreadable" };
-}
-
-/** Reads `lockDir`'s owner record. Returns `null` for "absent or unreadable/malformed", never a thrown error. A record without a `token` (old shape) is returned with `token` undefined. Only `owner.json` is read -- a leftover publication temp file is never a record. */
-async function readOwnerFile(lockDir: string): Promise<LockOwner | null> {
-  const read = await readOwnerState(lockDir);
-  return read.state === "record" ? read.owner : null;
 }
 
 /** Whether `pid` is still alive on THIS host. `process.kill(pid, 0)` sends no signal; it only probes existence/permission. Only `ESRCH` ("no such process") is treated as dead -- any other outcome (success, or `EPERM` for a live process owned by another user) is treated as alive, so liveness checks never accidentally reclaim a lock a live process holds. */
@@ -317,6 +335,7 @@ type LockVerdict = "hold-off" | "reclaim" | "adopt";
  */
 async function lockVerdict(lockDir: string): Promise<LockVerdict> {
   const read = await readOwnerState(lockDir);
+  if (read.state === "read-failed") return "hold-off"; // cannot judge -- never reclaim or adopt on a failed read
   if (read.state === "record") {
     if (read.owner.hostname !== hostname()) return "hold-off"; // no cross-host liveness oracle -- never guess
     return isProcessAlive(read.owner.pid) ? "hold-off" : "reclaim";
@@ -412,7 +431,22 @@ async function reclaimStaleLock(lockDir: string): Promise<boolean> {
  * masked by a release problem.
  */
 async function releaseLock(lockDir: string, token: string): Promise<void> {
-  const owner = await readOwnerFile(lockDir);
+  let read = await readOwnerState(lockDir);
+  // A failed READ (EMFILE under fd pressure, EIO, ...) says nothing about who
+  // owns the lock: retry a bounded number of times before giving up, so a
+  // transient fault cannot strand a lock naming this live process.
+  for (let retry = 0; retry < RELEASE_READ_RETRIES && read.state === "read-failed"; retry++) {
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, RELEASE_READ_RETRY_DELAY_MS));
+    read = await readOwnerState(lockDir);
+  }
+  if (read.state === "read-failed") {
+    console.error(
+      `[file-lock] could not VERIFY ownership of '${lockDir}' at release: its owner record could not be read (${read.code}) after ${RELEASE_READ_RETRIES + 1} attempts. ` +
+        `The lock was left in place naming this live process (pid ${process.pid}); later callers will see CONFLICT until this process restarts or the directory is removed.`
+    );
+    return;
+  }
+  const owner = read.state === "record" ? read.owner : null;
   if (owner?.token === token) {
     // One atomic rename takes the lock path out of the namespace with the
     // record still inside it; only then is the debris removed.

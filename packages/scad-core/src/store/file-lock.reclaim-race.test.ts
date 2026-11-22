@@ -34,7 +34,9 @@ const hooks = vi.hoisted(() => ({
   beforeMutate: null as null | ((op: GateOp, path: string) => Promise<void>),
   /** Fires immediately before the exclusive creation of `owner.json` in the lock directory (the `link` that publishes it, or the exclusive `writeFile` of the pre-adoption code). */
   beforePublish: null as null | ((path: string) => Promise<void>),
-  beforeTombstoneRemove: null as null | ((path: string) => Promise<void>)
+  beforeTombstoneRemove: null as null | ((path: string) => Promise<void>),
+  /** Fires immediately before every read of the lock directory's `owner.json`; a hook may throw to simulate a failed read. */
+  onOwnerRead: null as null | ((path: string) => Promise<void>)
 }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
@@ -64,6 +66,10 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       if (hooks.beforePublish && p === ownerPath()) await hooks.beforePublish(p as string);
       return (actual.writeFile as unknown as Fn)(p, ...rest);
     },
+    readFile: async (p: unknown, ...rest: unknown[]) => {
+      if (hooks.onOwnerRead && p === ownerPath()) await hooks.onOwnerRead(p as string);
+      return (actual.readFile as unknown as Fn)(p, ...rest);
+    },
     link: async (existing: unknown, to: unknown) => {
       if (hooks.beforePublish && to === ownerPath()) await hooks.beforePublish(to as string);
       return actual.link(existing as string, to as string);
@@ -89,12 +95,15 @@ beforeEach(async () => {
   hooks.beforeMutate = null;
   hooks.beforePublish = null;
   hooks.beforeTombstoneRemove = null;
+  hooks.onOwnerRead = null;
 });
 
 afterEach(async () => {
   hooks.beforeMutate = null;
   hooks.beforePublish = null;
   hooks.beforeTombstoneRemove = null;
+  hooks.onOwnerRead = null;
+  vi.restoreAllMocks();
   await real.rm(workDir, { recursive: true, force: true });
 });
 
@@ -481,5 +490,105 @@ describe("live acquirer slow to publish vs. reclaimer (Issue #128 review F1)", (
     expect(first.max).toBe(1);
     expect(second.max).toBe(1);
     expect(await real.readdir(workDir)).toEqual([]);
+  }, 20000);
+});
+
+describe("failed owner-record reads (Issue #128 batch 2)", () => {
+  const ioError = (code: string) => Object.assign(new Error(`${code}: simulated read failure`), { code });
+
+  it.each(["EIO", "EACCES"])(
+    "a live holder's OLD lock whose record read fails with %s is neither reclaimed nor adopted: the contender ends in CONFLICT and the holder is unaffected",
+    async (code) => {
+      const section = trackedSection();
+      const holder = withFileLock(lockDir, "test", section.fn, 8000);
+      await within(section.entered, "the live holder to enter fn");
+      const recordBefore = await real.readFile(join(lockDir, LOCK_OWNER_FILE), "utf8");
+      await backdateLockDir(); // a long fn, or a laptop that slept mid-hold
+
+      hooks.onOwnerRead = async () => {
+        throw ioError(code);
+      };
+      try {
+        await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({ error_code: "CONFLICT" });
+        expect(await real.readdir(workDir)).toEqual(["some.lock"]); // not renamed aside, no breaker
+        expect(await real.readdir(lockDir)).toEqual([LOCK_OWNER_FILE]); // nothing published into it (no adoption)
+        expect(await real.readFile(join(lockDir, LOCK_OWNER_FILE), "utf8")).toBe(recordBefore);
+      } finally {
+        hooks.onOwnerRead = null;
+        section.open();
+      }
+      await holder;
+
+      expect(section.calls).toBe(1);
+      expect(section.max).toBe(1);
+      expect(await real.readdir(workDir)).toEqual([]); // the holder released normally
+    },
+    20000
+  );
+
+  it("a transient read failure at release (EMFILE on the first read) is retried: the lock is released and nothing is logged", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    let failuresLeft = 1;
+
+    const result = await withFileLock(lockDir, "test", async () => {
+      hooks.onOwnerRead = async () => {
+        if (failuresLeft-- > 0) throw ioError("EMFILE");
+      };
+      return "fn-result";
+    });
+
+    expect(result).toBe("fn-result");
+    expect(logged).not.toHaveBeenCalled();
+    expect(await real.readdir(workDir)).toEqual([]);
+  }, 20000);
+
+  it("a read that keeps failing at release leaves the lock in place and logs ONE distinct 'could not verify' message (not the violation one); fn's result is still returned", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await withFileLock(lockDir, "test", async () => {
+      hooks.onOwnerRead = async () => {
+        throw ioError("EMFILE");
+      };
+      return "fn-result";
+    });
+
+    expect(result).toBe("fn-result");
+    expect(logged).toHaveBeenCalledTimes(1);
+    const message = String(logged.mock.calls[0]?.[0]);
+    expect(message).toMatch(/could not VERIFY ownership/);
+    expect(message).toMatch(/left in place naming this live process/);
+    expect(message).toMatch(/CONFLICT/);
+    expect(message).not.toMatch(/VIOLATION/);
+    expect(await real.readdir(workDir)).toEqual(["some.lock"]); // left in place
+  }, 20000);
+
+  it("a read that keeps failing at release never masks fn's own error", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const boom = new Error("fn failed");
+
+    await expect(
+      withFileLock(lockDir, "test", async () => {
+        hooks.onOwnerRead = async () => {
+          throw ioError("EMFILE");
+        };
+        throw boom;
+      })
+    ).rejects.toBe(boom);
+  }, 20000);
+
+  it("a torn record at release (read succeeded, content invalid) is NOT retried and keeps the VIOLATION behaviour", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    let readsAtRelease = 0;
+
+    await withFileLock(lockDir, "test", async () => {
+      await real.writeFile(join(lockDir, LOCK_OWNER_FILE), '{"pid": 12', "utf8");
+      hooks.onOwnerRead = async () => {
+        readsAtRelease++;
+      };
+    });
+
+    expect(readsAtRelease).toBe(1); // no retry for a read that succeeded
+    expect(logged).toHaveBeenCalledWith(expect.stringContaining("LOCK OWNERSHIP VIOLATION"));
+    expect(await real.readdir(workDir)).toEqual(["some.lock"]);
   }, 20000);
 });
