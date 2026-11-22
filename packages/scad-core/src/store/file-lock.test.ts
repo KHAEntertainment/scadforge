@@ -4,6 +4,7 @@
 // module header for the exact reclaim rule this exercises.
 
 import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
@@ -30,7 +31,7 @@ function deadPid(): number {
   return result.pid;
 }
 
-async function writeOwner(dir: string, owner: { pid: number; startedAt: string; hostname: string }): Promise<void> {
+async function writeOwner(dir: string, owner: { pid: number; startedAt: string; hostname: string; token?: string }): Promise<void> {
   await writeFile(join(dir, LOCK_OWNER_FILE), JSON.stringify(owner, null, 2), "utf8");
 }
 
@@ -69,7 +70,7 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
     // remains (removed again by withFileLock's own `finally`), so the work
     // dir is left with no `.stale-` leftovers.
     const leftovers = await readdir(workDir);
-    expect(leftovers.some((name) => name.includes(".stale-"))).toBe(false);
+    expect(leftovers.some((name) => name.includes(".stale-") || name.includes(".breaker-"))).toBe(false);
   }, 20000);
 
   it("a lock with NO owner.json and a FRESH mtime is NOT reclaimed -- it may simply be mid-acquisition", async () => {
@@ -218,5 +219,108 @@ describe("withFileLock maxWaitMs clamping (Issue #115)", () => {
       error_code: "CONFLICT"
     });
     expect(Date.now() - start).toBeLessThan(500);
+  });
+});
+
+// Breaker names embed the host and pid of their creator (Issue #128); these
+// fixtures hand-write that documented shape: `<lockDir>.breaker-<hostTag>-<pid>-<uuid>`.
+function breakerPath(pid: number, host: string = hostname()): string {
+  const tag = createHash("sha1").update(host).digest("hex").slice(0, 16);
+  return `${lockDir}.breaker-${tag}-${pid}-${randomUUID()}`;
+}
+
+async function seedDeadOwnerLock(): Promise<void> {
+  await mkdir(lockDir);
+  await writeOwner(lockDir, { pid: deadPid(), startedAt: new Date().toISOString(), hostname: hostname() });
+}
+
+describe("withFileLock reclaim breaker recovery (Issue #128)", () => {
+  it("a breaker left by a reclaimer that died (dead pid, this host) is removed and does not wedge the reclaim", async () => {
+    await seedDeadOwnerLock();
+    const deadBreaker = breakerPath(deadPid());
+    await mkdir(deadBreaker);
+
+    const start = Date.now();
+    await expect(withFileLock(lockDir, "test", async () => "acquired")).resolves.toBe("acquired");
+    expect(Date.now() - start).toBeLessThan(2000);
+
+    expect(await readdir(workDir)).toEqual([]); // no lock, dead breaker, tombstone or own-breaker debris
+  }, 20000);
+
+  it.each([
+    ["a live pid (this process)", () => breakerPath(process.pid)],
+    ["another host", () => breakerPath(deadPid(), `not-${hostname()}`)],
+    ["an unparseable name", () => `${lockDir}.breaker-garbage`]
+  ])("a breaker naming %s is never removed -- the contender backs off and ends in CONFLICT at its short deadline", async (_label, makePath) => {
+    await seedDeadOwnerLock();
+    const foreignBreaker = makePath();
+    await mkdir(foreignBreaker);
+
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+
+    const leftovers = await readdir(workDir);
+    expect(leftovers).toContain(foreignBreaker.slice(workDir.length + 1)); // untouched
+    expect(leftovers).toContain("some.lock"); // the stale lock was not reclaimed behind a contended breaker
+    expect(leftovers.filter((name) => name.includes(".breaker-"))).toHaveLength(1); // the contender removed its own
+  }, 20000);
+});
+
+describe("withFileLock owner token and guarded release (Issue #128)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("each acquisition records its own unique token in owner.json, readable while held", async () => {
+    const tokens: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      await withFileLock(lockDir, "test", async () => {
+        const owner = JSON.parse(await readFile(join(lockDir, LOCK_OWNER_FILE), "utf8"));
+        expect(owner).toMatchObject({ pid: process.pid, hostname: hostname() });
+        tokens.push(owner.token);
+      });
+    }
+    expect(tokens.every((t) => typeof t === "string" && t.length > 0)).toBe(true);
+    expect(new Set(tokens).size).toBe(2);
+  });
+
+  const takeovers: Array<[string, () => Promise<void>]> = [
+    ["another acquirer's token", () => writeOwner(lockDir, { pid: process.pid, startedAt: "x", hostname: hostname(), token: "someone-else" })],
+    ["an old-shape record without a token", () => writeOwner(lockDir, { pid: process.pid, startedAt: "x", hostname: hostname() })],
+    ["a torn, unparseable record", () => writeFile(join(lockDir, LOCK_OWNER_FILE), '{"pid": 12', "utf8")],
+    ["no owner record at all", () => rm(join(lockDir, LOCK_OWNER_FILE), { force: true })]
+  ];
+
+  it.each(takeovers)("release leaves the lock in place and logs loudly when owner.json holds %s; fn's result is still returned", async (_label, tamper) => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await withFileLock(lockDir, "test", async () => {
+      await tamper();
+      return "fn-result";
+    });
+
+    expect(result).toBe("fn-result"); // never throws after fn completed
+    expect(logged).toHaveBeenCalledWith(expect.stringContaining("LOCK OWNERSHIP VIOLATION"));
+    expect((await readdir(workDir)).includes("some.lock")).toBe(true); // never removed on mismatch
+  });
+
+  it("a release mismatch does not mask fn's own error", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const boom = new Error("fn failed");
+
+    await expect(
+      withFileLock(lockDir, "test", async () => {
+        await writeOwner(lockDir, { pid: process.pid, startedAt: "x", hostname: hostname(), token: "someone-else" });
+        throw boom;
+      })
+    ).rejects.toBe(boom);
+  });
+
+  it("a matching token releases normally and silently", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    await withFileLock(lockDir, "test", async () => "done");
+    expect(logged).not.toHaveBeenCalled();
+    expect(await readdir(workDir)).toEqual([]);
   });
 });
