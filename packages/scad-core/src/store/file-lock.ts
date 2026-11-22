@@ -28,33 +28,66 @@
 // for every subsequent caller too. The recovery boundary (`recovered.ts`)
 // can never run if the params lock it depends on can be wedged this way.
 //
-// The lock directory now carries an `owner.json` (`{pid, startedAt,
-// hostname, token}`), written right after the winning `mkdir` (see the token
-// notes below for what a failed write means). A
-// contender that sees `EEXIST` may reclaim the lock ONLY when the owner is
-// PROVABLY gone:
-//   - `owner.json` names a pid on THIS host, and that pid is not alive
-//     (`process.kill(pid, 0)` throws `ESRCH`) -- the owner crashed after
-//     acquiring the lock.
-//   - `owner.json` is absent (the holder died between its own `mkdir` and
-//     the `owner.json` write) AND the directory's mtime is older than
-//     `STALE_LOCK_MIN_AGE_MS` -- a live holder keeps writing under the
-//     directory, so a fresh, ownerless directory is presumed to be a
-//     holder that has not finished writing `owner.json` yet, not debris.
-// A lock whose owner is on ANOTHER host is never reclaimed -- there is no
-// cross-host liveness oracle here, and guessing wrong would let two
-// processes on different machines both believe they hold the same lock.
-// ── WHY A PATH RENAME ALONE IS NOT ATOMIC RECLAIM (Issue #128) ───────────
+// ── THE OWNER RECORD IS THE ARBITER (Issue #128) ─────────────────────────
 //
-// Deciding "stale" and then `rename(lockDir, tombstone)` are two separate
-// steps, and a rename names a PATH, not a directory instance. Between the
-// decision and the rename the stale directory can be reclaimed by another
-// contender, which then `mkdir`s the same path and becomes a live holder; the
-// late rename then moves THAT live lock away and admits a second holder. The
-// rename is atomic; the decision it acts on is not. Reclaim is therefore
-// serialized and the decision is re-made inside the serialization:
+// `mkdir` creates a directory INSTANCE at `lockDir`; by itself it does not say
+// who may run `fn`. The holder of an instance is whoever PUBLISHES its
+// `owner.json` (`{pid, startedAt, hostname, token}`, the token a fresh
+// `randomUUID()` per acquisition), and an instance accepts at most ONE
+// publication. Publication is exclusive AND atomic: the full record is written
+// to a uniquely named temp file inside the directory, then
+// `link(temp, owner.json)` -- which fails `EEXIST` if a record is already
+// there -- and the temp file is unlinked. A reader therefore sees no record or
+// a complete one, never a torn one, and a leftover temp file is never a record
+// (only `owner.json` is read). `EEXIST` or `ENOENT` on publication means
+// "lost": the instance belongs to someone else, or is gone, and the caller
+// retries. Any other publication error fails closed (the caller's own empty
+// directory is removed with a non-recursive `rmdir`, the raw error is
+// rethrown). `fn` runs ONLY for a publisher.
 //
-//   1. On a stale verdict a contender `mkdir`s a breaker whose name is unique
+// ── STALE-OWNER RECLAIM (Issue #73) ──────────────────────────────────────
+//
+// Before #73, a process that died while holding a lock (a hard kill, an OOM)
+// wedged every future writer of that resource forever: the `finally` that
+// removes the directory never runs. A contender that sees `EEXIST` now
+// classifies the instance:
+//   - a readable record naming ANOTHER host: never touched -- there is no
+//     cross-host liveness oracle, and guessing wrong would let two machines
+//     both believe they hold the same lock.
+//   - a readable record naming a pid on THIS host that is not alive
+//     (`process.kill(pid, 0)` throws `ESRCH`): the owner crashed. RECLAIM by
+//     rename, under the breaker below.
+//   - no record and the directory's mtime younger than
+//     `STALE_LOCK_MIN_AGE_MS`: its creator may simply not have published yet.
+//     Hold off.
+//   - no record and the directory at least `STALE_LOCK_MIN_AGE_MS` old: the
+//     creator died between `mkdir` and publication. ADOPT it (below).
+//   - a record that exists but is unreadable, and the directory at least
+//     `STALE_LOCK_MIN_AGE_MS` old: RECLAIM by rename, under the breaker. This
+//     is a legacy/corruption path only -- publication above never produces
+//     it.
+//   - anything else (a live pid): hold off, backoff, retry until
+//     `FILE_LOCK_MAX_WAIT_MS`.
+//
+// WHY AN OWNERLESS DIRECTORY IS ADOPTED, NEVER RENAMED. The creator of an
+// ownerless directory may be alive, merely paused for a minute. Renaming it
+// would authorize a move of an instance the creator can still publish into
+// and then use: the creator's late publication succeeds, and the rename that
+// was already authorized removes a now-LIVE lock. So the reclaimer does not
+// rename; it publishes ITS OWN record into that same directory with the same
+// exclusive publication. Whoever links first holds the lock; the other gets
+// `EEXIST` and retries. The record, not a stale decision, picks the winner.
+// Adopting an instance that changed under the decision is equally safe: the
+// instance still takes at most one publication.
+//
+// WHY A PATH RENAME ALONE IS NOT ATOMIC RECLAIM. Where rename IS used (a dead
+// owner's record, an unreadable record older than the age limit), "decide
+// stale" and `rename(lockDir, tombstone)` are still two steps, and a rename
+// names a PATH, not an instance: between them another contender can reclaim
+// the stale directory and `mkdir` a new live one at the same path, and the
+// late rename would move THAT away. Reclaim is therefore serialized and the
+// decision re-made inside the serialization:
+//   1. On a rename verdict a contender `mkdir`s a breaker whose name is unique
 //      and carries its owner -- `<lockDir>.breaker-<hostTag>-<pid>-<uuid>`.
 //      It always succeeds and is owned from the instant it exists, so there is
 //      no ownerless gap and no breaker `owner.json`.
@@ -65,58 +98,63 @@
 //      in-process contender -- another host, or an unparseable name) means
 //      "contended": the contender removes its own breaker and returns to the
 //      ordinary jittered backoff loop.
-//   3. Uncontended, it holds the breaker: it re-runs the staleness check
-//      fresh, renames and cleans up only if the lock is STILL stale, and
+//   3. Uncontended, it holds the breaker: it re-runs the classification fresh,
+//      renames and cleans up only if the verdict is STILL "reclaim", and
 //      removes its own breaker in a `finally`.
+// For two contenders R1 and R2 to both pass step 2, each must list before the
+// other's `mkdir`, but each does its own `mkdir` before its own list --
+// R1.mkdir < R1.list < R2.mkdir < R2.list < R1.mkdir is a cycle. There is no
+// tie-break on names (a larger name may already have listed before a smaller
+// one existed): both back off and the jitter breaks the symmetry next round.
+// Nothing is removed on an age or stale DECISION about a breaker (so a dead
+// breaker cannot reintroduce this race one level up) and no breaker path is
+// ever reused. The re-check is sufficient because a "reclaim" verdict cannot
+// change underneath the rename: a dead pid stays dead, and a published record
+// is never rewritten.
 //
-// Why this excludes: for two contenders R1 and R2 to both pass step 2, each
-// must list before the other's `mkdir`, but each does its own `mkdir` before
-// its own list -- R1.mkdir < R1.list < R2.mkdir < R2.list < R1.mkdir is a
-// cycle. There is no tie-break rule on names (a larger name may already have
-// listed before a smaller one existed): both back off, and the jitter breaks
-// the symmetry on the next round. Nothing is ever removed on an age or stale
-// DECISION about a breaker (so a dead breaker cannot reintroduce this race one
-// level up), and no breaker path is ever reused (the name is unique).
-//
-// Why the re-check is sufficient: a lock directory's contents only ever
-// change by (a) its owner's release, or (b) a reclaim under the breaker. A
-// stale verdict means the owner is provably dead (or ownerless for a minute),
-// so (a) cannot happen to that instance between the re-check and the rename,
-// and (b) is serialized by the breaker -- the path still names the instance
-// that was inspected. The breaker is reached only after a stale verdict, so a
-// lock held by a live owner pays no extra latency.
-//
-// Each acquisition also records a unique token (`randomUUID()`) in
-// `owner.json`, written with an exclusive create (`wx`). If that write finds
-// the file already there, or the directory gone, this acquirer lost the
-// directory to a reclaimer while it was paused and simply retries. Release
-// removes the lock ONLY if the token on disk is the caller's own; any other
-// state (another token, no token -- an `owner.json` from a pre-token writer --
-// a torn or absent file) is logged loudly and the directory is left alone.
-// `owner.json` without a token stays readable, so staleness is decided
+// Release is atomic too. After the token check the lock is renamed to a
+// unique `<lockDir>.released-<uuid>` tombstone, which is then removed. A
+// recursive `rm` of the lock path would unlink `owner.json` first and leave a
+// record-less directory a late publisher could still publish into.
+// Release removes the lock ONLY if the token on disk is the caller's own; any
+// other state (another token, no token -- an `owner.json` from a pre-token
+// writer -- a torn or absent file) is logged loudly and the directory is left
+// alone. `owner.json` without a token stays readable, so liveness is decided
 // exactly as before for old-shape records.
 //
+// GUARANTEE: at most one caller is inside `fn` for a lock path at any time, so
+// long as every writer of that path runs this module (see mixed-version
+// below), a dead owner's pid is not live, and the filesystem supports hard
+// links (publication fails closed, never silently weaker, where it does not).
+//
 // RESIDUALS (honest limits, not guarantees):
-//   - A LIVE acquirer paused for `STALE_LOCK_MIN_AGE_MS` or more between its
-//     `mkdir` and its owner write can be reclaimed as an ownerless debris
-//     directory. Its late exclusive owner write then either fails (the
-//     successor already wrote its record: it retries) or lands in the
-//     successor's still-ownerless directory (then the successor's own write
-//     fails and the SUCCESSOR retries): at most one proceeds, but the late
-//     acquirer can win the race. This is the pre-existing ownerless limit.
 //   - pid reuse can wedge a reclaim: a dead lock owner or dead breaker whose
 //     pid now belongs to an unrelated live process reads back as alive and is
 //     never reclaimed, until that process exits. A live pid is never
 //     overridden by age -- reclaiming a lock a live process holds would
 //     corrupt its read-merge-write, which is strictly worse than a stuck one.
-//   - A lock or breaker owned by ANOTHER host is never reclaimed; there is no
-//     cross-host liveness oracle here.
-//   - If a breaker's own removal fails (logged), its live pid keeps it
-//     "contended" until this process exits.
+//   - A lock or breaker owned by ANOTHER host is never reclaimed.
+//   - A legacy or corrupted UNREADABLE record older than the age limit is
+//     reclaimed by rename. New publication never produces one, but a pre-fix
+//     writer paused mid-write for that long can: its later write lands in the
+//     renamed-away directory and it believes it still holds the lock.
+//   - Mixed-version writers: a pre-fix or `main` build never publishes a
+//     record (or publishes a non-atomic one) and holds an ownerless directory
+//     for its whole critical section. Once that has lasted
+//     `STALE_LOCK_MIN_AGE_MS` it is indistinguishable from debris and is
+//     adopted, exactly the pre-existing ownerless limit.
+//   - If a breaker's own removal fails, the failure is logged
+//     (`[file-lock] failed to remove reclaim breaker '<path>':`) and the
+//     breaker, which names this still-live process, blocks later
+//     rename-based reclaims of this lock until the process exits. This
+//     fails closed (availability only): own-pid breakers are deliberately not
+//     exempted, because an in-process contender's live breaker is
+//     indistinguishable from a leaked one. Adoption and live-owner waits are
+//     unaffected.
 //
 // SPDX-License-Identifier: Apache-2.0
 
-import { mkdir, readdir, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, readdir, readFile, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -199,36 +237,62 @@ function clampMaxWaitMs(maxWaitMs: number): number {
 }
 
 /**
- * Records who holds `lockDir`, with an exclusive create (`wx`) so a late
- * writer can never clobber a successor's record. `"lost"` means the directory
- * is no longer this acquirer's (`EEXIST`: another record is already there;
- * `ENOENT`: the directory was reclaimed away) -- the caller must not touch it
- * and should retry. Any other failure is thrown: without a record there is no
- * token to verify at release, so the caller fails closed.
+ * Publishes this acquirer's owner record into `lockDir`: exclusive (at most
+ * one publication per directory instance) and atomic (never visible half
+ * written) -- the full record goes to a uniquely named temp file inside the
+ * directory, `link(temp, owner.json)` fails `EEXIST` if a record is already
+ * there, and the temp file is always unlinked afterwards. `"lost"` means the
+ * directory is no longer this acquirer's to publish into (`EEXIST`: another
+ * record is already there; `ENOENT`: the directory was removed) -- the caller
+ * must not touch it and should retry. Any other failure is thrown, and when
+ * `ownsEmptyDir` (this caller just `mkdir`ed `lockDir`) its still-empty
+ * directory is removed with a non-recursive `rmdir` first: without a record
+ * there is no token to verify at release, so the caller fails closed.
  */
-async function writeOwnerFile(lockDir: string, token: string): Promise<"written" | "lost"> {
+async function publishOwnerFile(lockDir: string, token: string, ownsEmptyDir: boolean): Promise<"written" | "lost"> {
   const owner: LockOwner = { pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname(), token };
+  const tempPath = join(lockDir, `${LOCK_OWNER_FILE}.tmp-${randomUUID()}`);
   try {
-    await writeFile(join(lockDir, LOCK_OWNER_FILE), JSON.stringify(owner, null, 2), { encoding: "utf8", flag: "wx" });
+    await writeFile(tempPath, JSON.stringify(owner, null, 2), { encoding: "utf8", flag: "wx" });
+    await link(tempPath, join(lockDir, LOCK_OWNER_FILE));
     return "written";
   } catch (err) {
     const code = errorCode(err);
     if (code === "EEXIST" || code === "ENOENT") return "lost";
+    await unlink(tempPath).catch(() => {});
+    if (ownsEmptyDir) await rmdir(lockDir).catch(() => {});
     throw err;
+  } finally {
+    await unlink(tempPath).catch(() => {});
   }
 }
 
-/** Reads `lockDir`'s owner record. Returns `null` for "absent or unreadable/malformed" -- both fall back to the ownerless/stale-mtime reclaim path, never a thrown error (a torn or missing owner file must never block the retry loop). A record without a `token` (old shape) is returned with `token` undefined. */
-async function readOwnerFile(lockDir: string): Promise<LockOwner | null> {
+/** What reading `lockDir`'s owner record found: a complete record, none at all (`ENOENT`), or a file that is there but cannot be used (torn, malformed, wrong shape, unreadable). */
+type OwnerRead = { state: "record"; owner: LockOwner } | { state: "absent" } | { state: "unreadable" };
+
+async function readOwnerState(lockDir: string): Promise<OwnerRead> {
+  let raw: string;
   try {
-    const parsed = JSON.parse(await readFile(join(lockDir, LOCK_OWNER_FILE), "utf8")) as Partial<LockOwner>;
-    if (typeof parsed.pid === "number" && typeof parsed.startedAt === "string" && typeof parsed.hostname === "string") {
-      return { pid: parsed.pid, startedAt: parsed.startedAt, hostname: parsed.hostname, token: typeof parsed.token === "string" ? parsed.token : undefined };
-    }
-    return null;
-  } catch {
-    return null;
+    raw = await readFile(join(lockDir, LOCK_OWNER_FILE), "utf8");
+  } catch (err) {
+    const code = errorCode(err);
+    return code === "ENOENT" || code === "ENOTDIR" ? { state: "absent" } : { state: "unreadable" };
   }
+  try {
+    const parsed = JSON.parse(raw) as Partial<LockOwner>;
+    if (typeof parsed.pid === "number" && typeof parsed.startedAt === "string" && typeof parsed.hostname === "string") {
+      return { state: "record", owner: { pid: parsed.pid, startedAt: parsed.startedAt, hostname: parsed.hostname, token: typeof parsed.token === "string" ? parsed.token : undefined } };
+    }
+  } catch {
+    // fall through: torn or malformed
+  }
+  return { state: "unreadable" };
+}
+
+/** Reads `lockDir`'s owner record. Returns `null` for "absent or unreadable/malformed", never a thrown error. A record without a `token` (old shape) is returned with `token` undefined. Only `owner.json` is read -- a leftover publication temp file is never a record. */
+async function readOwnerFile(lockDir: string): Promise<LockOwner | null> {
+  const read = await readOwnerState(lockDir);
+  return read.state === "record" ? read.owner : null;
 }
 
 /** Whether `pid` is still alive on THIS host. `process.kill(pid, 0)` sends no signal; it only probes existence/permission. Only `ESRCH` ("no such process") is treated as dead -- any other outcome (success, or `EPERM` for a live process owned by another user) is treated as alive, so liveness checks never accidentally reclaim a lock a live process holds. */
@@ -241,20 +305,26 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+/** What a contender that lost the `mkdir` race should do about the existing lock -- see the module header. */
+type LockVerdict = "hold-off" | "reclaim" | "adopt";
+
 /**
- * Whether `lockDir` (which just lost a `mkdir` race with `EEXIST`) is
- * reclaimable -- see the module header for the exact rule. Read-only:
- * never mutates `lockDir`.
+ * Classifies `lockDir` (which just lost a `mkdir` race with `EEXIST`).
+ * Read-only: never mutates `lockDir`. `"reclaim"` (rename-aside under the
+ * breaker) is returned only for verdicts that cannot change underneath the
+ * rename; an ownerless directory is `"adopt"` (publish into it), never
+ * renamed.
  */
-async function isReclaimableStaleLock(lockDir: string): Promise<boolean> {
-  const owner = await readOwnerFile(lockDir);
-  if (owner) {
-    if (owner.hostname !== hostname()) return false; // no cross-host liveness oracle -- never guess
-    return !isProcessAlive(owner.pid);
+async function lockVerdict(lockDir: string): Promise<LockVerdict> {
+  const read = await readOwnerState(lockDir);
+  if (read.state === "record") {
+    if (read.owner.hostname !== hostname()) return "hold-off"; // no cross-host liveness oracle -- never guess
+    return isProcessAlive(read.owner.pid) ? "hold-off" : "reclaim";
   }
   const dirStat = await stat(lockDir).catch(() => null);
-  if (!dirStat) return false; // vanished -- a concurrent reclaimer already freed it; just retry the mkdir
-  return Date.now() - dirStat.mtimeMs >= STALE_LOCK_MIN_AGE_MS;
+  if (!dirStat) return "hold-off"; // vanished -- a concurrent holder already released it; just retry the mkdir
+  if (Date.now() - dirStat.mtimeMs < STALE_LOCK_MIN_AGE_MS) return "hold-off"; // its creator may not have published yet
+  return read.state === "absent" ? "adopt" : "reclaim";
 }
 
 const BREAKER_NAME_RE = /^([0-9a-f]{16})-(\d+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -293,7 +363,7 @@ async function breakerContended(lockDir: string, ownBreaker: string): Promise<bo
 }
 
 /**
- * Reclaims `lockDir`, believed stale by {@link isReclaimableStaleLock}, under
+ * Reclaims `lockDir` by rename (verdict `"reclaim"` of {@link lockVerdict}), under
  * the unique-name breaker described in the module header: the stale decision
  * is re-made while this contender is the only one reclaiming, and the rename
  * happens only if it still holds. Returns `true` when the stale directory was
@@ -312,7 +382,7 @@ async function reclaimStaleLock(lockDir: string): Promise<boolean> {
   }
   try {
     if (await breakerContended(lockDir, breaker)) return false;
-    if (!(await isReclaimableStaleLock(lockDir))) return false; // re-check inside the serialization
+    if ((await lockVerdict(lockDir)) !== "reclaim") return false; // re-check inside the serialization
     const tombstone = `${lockDir}.stale-${randomUUID()}`;
     try {
       await rename(lockDir, tombstone);
@@ -344,8 +414,17 @@ async function reclaimStaleLock(lockDir: string): Promise<boolean> {
 async function releaseLock(lockDir: string, token: string): Promise<void> {
   const owner = await readOwnerFile(lockDir);
   if (owner?.token === token) {
-    await rm(lockDir, { recursive: true, force: true }).catch((cleanupErr) => {
-      console.error(`[file-lock] failed to remove released lock '${lockDir}':`, cleanupErr);
+    // One atomic rename takes the lock path out of the namespace with the
+    // record still inside it; only then is the debris removed.
+    const tombstone = `${lockDir}.released-${randomUUID()}`;
+    try {
+      await rename(lockDir, tombstone);
+    } catch (releaseErr) {
+      console.error(`[file-lock] failed to release lock '${lockDir}':`, releaseErr);
+      return;
+    }
+    await rm(tombstone, { recursive: true, force: true }).catch((cleanupErr) => {
+      console.error(`[file-lock] failed to remove released lock debris at '${tombstone}':`, cleanupErr);
     });
     return;
   }
@@ -384,45 +463,39 @@ export async function withFileLock<T>(
   const effectiveMaxWaitMs = clampMaxWaitMs(maxWaitMs);
   const startedAt = performance.now();
   for (let attempt = 0; attempt < FILE_LOCK_MAX_ATTEMPTS; attempt++) {
+    let created = false;
     try {
-      // Non-recursive, exclusive create: this IS the lock (same trick as
-      // `claimNextSnapshotId`'s exclusive-mkdir id claim).
+      // Non-recursive, exclusive create of the directory INSTANCE (same trick
+      // as `claimNextSnapshotId`'s exclusive-mkdir id claim). Holding the
+      // lock additionally needs this instance's single publication below.
       await mkdir(lockDir);
+      created = true;
     } catch (err) {
-      if (isEexist(err)) {
-        if (await isReclaimableStaleLock(lockDir)) {
-          const reclaimed = await reclaimStaleLock(lockDir);
-          if (reclaimed) continue; // retry mkdir(lockDir) immediately -- now unoccupied
-        }
-        if (performance.now() - startedAt >= effectiveMaxWaitMs) break; // deadline reached -- fall through to CONFLICT
-        await backoffDelay(attempt);
-        continue; // another writer (this process or another) holds the lock; retry
-      }
-      throw err;
+      if (!isEexist(err)) throw err;
     }
     const token = randomUUID();
-    let outcome: "written" | "lost";
-    try {
-      outcome = await writeOwnerFile(lockDir, token);
-    } catch (err) {
-      // Fail closed: without an owner record there is no token to verify at
-      // release. Non-recursive on purpose -- only an EMPTY directory (ours,
-      // seconds old) is removed.
-      await rmdir(lockDir).catch(() => {});
-      throw err;
+    let outcome: "written" | "lost" | "held-off" = "held-off";
+    if (created) {
+      outcome = await publishOwnerFile(lockDir, token, true);
+    } else {
+      const verdict = await lockVerdict(lockDir);
+      if (verdict === "adopt") {
+        outcome = await publishOwnerFile(lockDir, token, false);
+      } else if (verdict === "reclaim" && (await reclaimStaleLock(lockDir))) {
+        continue; // retry mkdir(lockDir) immediately -- now unoccupied
+      }
     }
-    if (outcome === "lost") {
-      // The directory was reclaimed out from under this acquirer before its
-      // owner write -- it is not ours; leave it alone and try again.
-      if (performance.now() - startedAt >= effectiveMaxWaitMs) break;
-      await backoffDelay(attempt);
-      continue;
+    if (outcome === "written") {
+      try {
+        return await fn();
+      } finally {
+        await releaseLock(lockDir, token);
+      }
     }
-    try {
-      return await fn();
-    } finally {
-      await releaseLock(lockDir, token);
-    }
+    // Held by a live owner, lost the publication, or lost the reclaim race:
+    // another writer (this process or another) holds it; back off and retry.
+    if (performance.now() - startedAt >= effectiveMaxWaitMs) break; // deadline reached -- fall through to CONFLICT
+    await backoffDelay(attempt);
   }
   throw new ScadForgeError(
     "CONFLICT",

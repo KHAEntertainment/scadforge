@@ -70,7 +70,7 @@ describe("withFileLock stale-owner reclaim (Issue #73)", () => {
     // remains (removed again by withFileLock's own `finally`), so the work
     // dir is left with no `.stale-` leftovers.
     const leftovers = await readdir(workDir);
-    expect(leftovers.some((name) => name.includes(".stale-") || name.includes(".breaker-"))).toBe(false);
+    expect(leftovers.some((name) => name.includes(".stale-") || name.includes(".breaker-") || name.includes(".released-"))).toBe(false);
   }, 20000);
 
   it("a lock with NO owner.json and a FRESH mtime is NOT reclaimed -- it may simply be mid-acquisition", async () => {
@@ -323,4 +323,62 @@ describe("withFileLock owner token and guarded release (Issue #128)", () => {
     expect(logged).not.toHaveBeenCalled();
     expect(await readdir(workDir)).toEqual([]);
   });
+});
+
+describe("withFileLock ownerless adoption and unreadable records (Issue #128 review F1)", () => {
+  async function backdate(path: string): Promise<void> {
+    const past = new Date(Date.now() - 2 * STALE_LOCK_MIN_AGE_MS);
+    await utimes(path, past, past);
+  }
+
+  it("an ownerless-old directory is ADOPTED, not renamed: the contender publishes its own record into the same directory, with no tombstone or breaker", async () => {
+    await mkdir(lockDir);
+    await backdate(lockDir);
+
+    let entriesWhileHeld: string[] = [];
+    let owner: { pid: number; token?: string } | null = null;
+    await withFileLock(lockDir, "test", async () => {
+      entriesWhileHeld = await readdir(workDir);
+      owner = JSON.parse(await readFile(join(lockDir, LOCK_OWNER_FILE), "utf8"));
+    });
+
+    expect(entriesWhileHeld).toEqual(["some.lock"]); // nothing was renamed aside, no breaker was taken
+    expect(owner).toMatchObject({ pid: process.pid });
+    expect(typeof (owner as unknown as { token: string }).token).toBe("string");
+    expect(await readdir(workDir)).toEqual([]);
+  });
+
+  it("a leftover publication temp file is never a record: a directory holding only one is still ownerless, and adopted once old", async () => {
+    await mkdir(lockDir);
+    // Looks like a live owner's record, but it is only a temp file -- if it were
+    // read as a record the lock would be held by a live pid and never adopted.
+    await writeFile(
+      join(lockDir, `${LOCK_OWNER_FILE}.tmp-leftover`),
+      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), hostname: hostname(), token: "leftover" }),
+      "utf8"
+    );
+    await backdate(lockDir);
+
+    await expect(withFileLock(lockDir, "test", async () => "acquired")).resolves.toBe("acquired");
+    expect(await readdir(workDir)).toEqual([]);
+  });
+
+  it("an owner.json that exists but is unreadable AND whose directory is old IS reclaimed by rename (legacy/corruption path)", async () => {
+    await mkdir(lockDir);
+    await writeFile(join(lockDir, LOCK_OWNER_FILE), '{"pid": 12', "utf8"); // torn
+    await backdate(lockDir);
+
+    await expect(withFileLock(lockDir, "test", async () => "acquired")).resolves.toBe("acquired");
+    expect(await readdir(workDir)).toEqual([]);
+  });
+
+  it("an owner.json that exists but is unreadable with a FRESH directory is NOT reclaimed -- a writer may be mid-write", async () => {
+    await mkdir(lockDir);
+    await writeFile(join(lockDir, LOCK_OWNER_FILE), '{"pid": 12', "utf8");
+
+    await expect(withFileLock(lockDir, "test", async () => "should never run", 300)).rejects.toMatchObject({
+      error_code: "CONFLICT"
+    });
+    expect(await readdir(workDir)).toEqual(["some.lock"]);
+  }, 20000);
 });
