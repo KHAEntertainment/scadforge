@@ -32,6 +32,14 @@ export interface PreviewTabProps {
   /** True while History has selected a snapshot older than the working head. */
   historical?: boolean;
   onReturnToCurrent?: () => void;
+  /** Same handler as the header's Build button (Issue #78) — omitted, no inline Build CTA is rendered. */
+  onBuild?: () => void;
+  /** True while a build is in flight. */
+  building?: boolean;
+  /** Disables every inline Build action in this tab; mirrors the header button's own conditions. */
+  buildDisabled?: boolean;
+  /** Why the action is disabled right now, shown as each button's tooltip. Null/undefined when enabled. */
+  buildDisabledReason?: string | null;
 }
 
 type PreviewMode = "orbit" | "live" | ViewName;
@@ -51,9 +59,13 @@ function meshPlaceholderMessage(status: SnapshotMeshStatus, snapshotId: string |
     case "checking":
       return "Loading model…";
     case "absent":
+      // Names the actual fix (Build) rather than just describing the
+      // symptom (Issue #78) — the "has no 3D mesh yet" / no "Send a message"
+      // substrings are load-bearing for `App.demo-ux.test.tsx` (Issue #41),
+      // so this appends the CTA sentence instead of replacing the copy.
       return snapshotId
-        ? `Snapshot ${snapshotId} has no 3D mesh yet — it is created when the model is validated. The rendered views above are still available.`
-        : "No 3D mesh for this snapshot yet.";
+        ? `Snapshot ${snapshotId} has no 3D mesh yet — Build validates the model and creates the mesh. The rendered views above are still available.`
+        : "No 3D mesh for this snapshot yet. Build validates the model and creates the mesh.";
     case "ready":
     case "idle":
     default:
@@ -71,7 +83,11 @@ export function PreviewTab({
   liveScad,
   liveParams,
   historical = false,
-  onReturnToCurrent
+  onReturnToCurrent,
+  onBuild,
+  building = false,
+  buildDisabled = false,
+  buildDisabledReason = null
 }: PreviewTabProps) {
   const [mode, setMode] = useState<PreviewMode>("orbit");
 
@@ -88,7 +104,13 @@ export function PreviewTab({
             <span className="live-stderr"> {message}</span>
           </div>
           <Viewer3D stlUrl={stlUrl} />
-          <ValidationPanel validation={validation} />
+          <ValidationPanel
+            validation={validation}
+            onBuild={onBuild}
+            building={building}
+            buildDisabled={buildDisabled}
+            buildDisabledReason={buildDisabledReason}
+          />
         </div>
       )}
     >
@@ -102,6 +124,10 @@ export function PreviewTab({
         liveParams={liveParams}
         historical={historical}
         onReturnToCurrent={onReturnToCurrent}
+        onBuild={onBuild}
+        building={building}
+        buildDisabled={buildDisabled}
+        buildDisabledReason={buildDisabledReason}
         mode={mode}
         onModeChange={setMode}
       />
@@ -126,6 +152,10 @@ function PreviewTabBody({
   liveParams,
   historical,
   onReturnToCurrent,
+  onBuild,
+  building,
+  buildDisabled,
+  buildDisabledReason,
   mode,
   onModeChange
 }: Required<Pick<PreviewTabProps, "stlUrl" | "meshStatus" | "snapshotId" | "validation" | "pngUrls" | "liveScad" | "liveParams">> & {
@@ -133,6 +163,10 @@ function PreviewTabBody({
   onModeChange: (mode: PreviewMode) => void;
   historical: boolean;
   onReturnToCurrent?: () => void;
+  onBuild?: () => void;
+  building: boolean;
+  buildDisabled: boolean;
+  buildDisabledReason: string | null;
 }) {
   const isLive = mode === "live";
   const [showGrid, setShowGrid] = useState(true);
@@ -290,6 +324,27 @@ function PreviewTabBody({
             inspect={inspectEnabled && mode === "orbit"}
             onInspect={setInspectOutcome}
           />
+          {/* Issue #78 AC1/AC5: the empty-mesh placeholder above only ever
+              explained the situation — this is the actual action that fixes
+              it, laid over the same viewport rather than replacing
+              `Viewer3D` (which must stay mounted for its single-canvas
+              WebGL-context lifetime, see `viewerUrl` above). Only shown in
+              orbit mode: `showPng` hides this whole wrapper for PNG views,
+              and Live has its own status strip. */}
+          {mode === "orbit" && onBuild && stlUrl === null && meshStatus === "absent" ? (
+            <div className="preview-build-cta" data-testid="preview-build-cta">
+              <button
+                type="button"
+                className="button button--primary"
+                data-testid="preview-build-button"
+                onClick={onBuild}
+                disabled={buildDisabled}
+                title={buildDisabledReason ?? undefined}
+              >
+                {building ? "Building…" : "Build"}
+              </button>
+            </div>
+          ) : null}
         </div>
         {showPng ? (
           activePng ? (
@@ -309,7 +364,13 @@ function PreviewTabBody({
 
       {/* Issue #41 symptom 3: the verdict belongs next to the thing it
           describes, not only as one coloured word in the status strip. */}
-      <ValidationPanel validation={validation} />
+      <ValidationPanel
+        validation={validation}
+        onBuild={onBuild}
+        building={building}
+        buildDisabled={buildDisabled}
+        buildDisabledReason={buildDisabledReason}
+      />
     </div>
   );
 }

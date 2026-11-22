@@ -45,6 +45,42 @@
 - **Contract freeze rule**: after their freeze issue merges, `packages/protocol/**`, `packages/scad-core/src/types.ts`, `packages/agent/src/tools/contract.ts` are Tech-Lead-owned. Workers must not edit them inside feature PRs — request changes via issue comment.
 - **Agent output contract**: never paste full `.scad` into chat; short summaries only.
 
+## Verification Gate
+The gate every PR head must pass before QA, review or merge. QA lanes run it exactly as written. A command that fails, or that did not run, fails the gate.
+
+Run from the worktree root, in this order. Each command must exit 0:
+
+1. `pnpm install --frozen-lockfile`
+2. `pnpm -r build`
+3. `pnpm -r test`. The Docker daemon must be up so every `@docker` suite executes. A skipped `@docker` suite counts as not run.
+4. `pnpm lint`
+5. `node scripts/check-licenses.mjs`
+
+**Evidence rules**
+- Report each command with its exit code, from one final run at the head being reported. A result carried over from an earlier commit, or from a partial re-run, is not evidence.
+- Report per-package test counts, including executed and skipped `@docker` counts. Keep the test output unfiltered: a filter that drops Vitest's summary lines hides skips.
+- After any fix, re-run the whole gate, not only the check that failed.
+
+**CI also runs these** (`.github/workflows/ci.yml`). Run them locally when a change touches the license gate, the Docker image or the M2 integration path:
+- `node scripts/check-licenses.mjs --self-test`
+- `node scripts/check-licenses.e2e.mjs`. It temporarily injects a GPL dependency and edits `package.json` and `pnpm-lock.yaml`, then reverts. Never run it in a read-only lane.
+- `bash docker/ci-smoke-render.sh` (pinned image build plus a smoke render)
+- `node evals/scenario-a2/run.mjs --no-compose` (M2 parameter and preview agreement)
+
+**Shared host**
+- Only one full `pnpm -r test` runs on a machine at a time; parallel Docker suites overload the host.
+- Serialize runs with a lock directory, `$HOME/.scadforge-suite.lock`. Its `owner` file holds the holder's agent id and a UTC timestamp.
+- Hold the lock only for the test run, never while editing, and always release it.
+- Report a lock whose owner is older than 45 minutes to the Tech Lead rather than breaking it.
+- A single non-Docker test file (`pnpm --filter <package> exec vitest run <file>`) needs no lock.
+
+**Known flake**
+- Issue #83: the same-key test in `apps/server/src/services/params-update.docker.test.ts` can time out under host load.
+- If it is the only failure, re-run that one file once and report both results.
+- Any other failure is a real failure.
+
+**Docs-only changes** (Markdown or comment lines only; no code, configuration or lockfile change) run `pnpm lint` and `node scripts/check-licenses.mjs`. The full suite is not required.
+
 ## Spike Decisions (Round-0 close, 2026-08-26 — all four spikes GO or GO-WITH-CAVEATS)
 - **OpenSCAD pin**: `docker.io/openscad/openscad@sha256:0af06bc2aa7a45d18b01a23cfb9dae6dddcd9542611e7be50edea6beb3b52fa7` → OpenSCAD **2026.01.19** (git e43242666), official weekly CI image, multi-arch (native arm64). AppImage-in-Docker rejected (x86 nightly segfaults under QEMU on Apple Silicon; arm64 AppImage too old; source build OOMs). Caveat: trails newest x86-only nightly ~5 weeks — recheck tags if a newer feature becomes load-bearing.
 - **render_views camera constants** (frozen into contract): common flags `--viewall --autocenter --projection=ortho --imgsize=1024,768 --backend=Manifold --render --colorscheme=Cornfield`; rotations iso `55,0,25`, front `90,0,0`, top `0,0,0`, right `90,0,90`. Verified: 3MF color export ✓, `--export-format=param` ✓, byte-identical determinism ✓, ~3.7s per 5-view set.
@@ -52,6 +88,7 @@
 - **WASM preview (M2)**: binary STL (`--export-format=binstl`) + three.js `STLLoader` (3MF compiled out of the wasm build; STL carries no color — server renders remain color authority). **Re-instantiate the module per render** inside one long-lived worker (`callMain` reuse aborts / leaks ~3.4GB). The spike measured ~1.6s/render and stable heap; its 12.7s uncached initialization included 56 BOSL2 fetches. M2 now bundles those sources into the worker; the old cold-start figure is historical, not a current benchmark.
 - **validate_mesh input**: parallel binary-STL export (zero-dep parse), NOT 3MF parsing — `openscad -o out.3mf -o out.stl` emits both in one render. `ValidationReport = {manifold, status, volume_mm3, surface_area, bbox, triangle_count, components, genus}`; `genus` meaningful only when `components === 1`. Gates: manifold hard, volume > 0.001 hard, components === 1 hard with `allowMultiPart` override. Use manifold-3d for manifoldness (hand-rolled edge-pairing gives false positives on CGAL unions).
 - **Agent SDK (M1 #13 requirements)**: pin `@anthropic-ai/claude-agent-sdk` **exactly 0.3.246** (zod ^4; caret ranges hit a fatal duplicate-tool_use-id bug); always `settingSources: []` (omitting it leaks operator ~/.claude config, 210× tokens) and `tools: []` (else MCP tools defer behind ToolSearch); real usage only via `message_delta` with `includePartialMessages: true`; tool-result images = MCP CallToolResult `{type:'image', data:<base64>, mimeType:'image/png'}` with a text label block before each image; NEVER `isError:true` on results carrying images (content collapses to string); pass budget enforced in the write_scad tool handler (not maxTurns) so mcp-server inherits it; "no .scad in chat" enforced host-side by stripping fenced blocks from assistant_text; SDK makes an auxiliary ~900-token haiku call per run (known cost constant). Cost: ~$0.08 single-pass turn, ~$0.14 two-pass; latency dominated by OpenSCAD, not the model.
+- **Agent SDK strict MCP isolation (Issue #75)**: also mandatory, always `strictMcpConfig: true` (maps to the CLI's `--strict-mcp-config`) — `settingSources: []` does NOT stop the bundled CLI from loading the OPERATOR's entire `~/.claude.json` MCP server list on top of the in-process `scadforge` server; measured before the fix at 12 attempted `claude.ai …` connectors, ~280 held connections and 157K cache-creation tokens (~$1.57) for their tool schemas on one trivial turn, ~0 (verified <20 established connections on a live turn) after. `createRealAgentProvider` (`apps/server/src/services/agent-impl.ts`) also wires the CLI's stderr — previously discarded entirely — to the server's stderr: one write per stderr chunk (never one per line), lines prefixed with the turn id, buffered per turn id (`chat.ts` locks per project, so concurrent turns on different projects share the forwarder and must not bleed into each other's lines), and never throwing (a failed write, e.g. `EPIPE`, is dropped and logged at most once per turn). `SCADFORGE_AGENT_STDERR=0` disables it, default enabled.
 
 ## Completed Features
 - [x] Monorepo scaffold + CI + license gate (Issue #2, PR #8, merged 2026-08-26)
@@ -76,6 +113,17 @@
 - **Path→URL seam**: `artifactUrl`/`exportFileName`/`readImageBase64` are implemented host-side in `apps/server`; `packages/agent` stays HTTP-free (required for the M4 stdio MCP host) and GPL-free (the GPL `packages/libs` binding lives in the server).
 - **Model cost**: `SCADFORGE_MODEL` unset → SDK defaults to Opus; a single-pass Scenario A turn cost **$0.97** vs Spike 3's $0.08–0.14 on a cheaper model. Set the default explicitly before the M3 eval harness runs 10–20 prompts per change.
 - **Contract friction logged (no frozen edits)**: (1) `ChatTurnRequest.images` has no path into the agent — text-only in M1, needed for v2 photo input; (2) `ToolResultEvent` is summary-only so SSE consumers can't read a `ValidationReport` from the stream (harness reads the persisted manifest); (3) `writeScadResultSchema` can't express a failed syntax check (superset workaround parses); (4) no error code distinguishes green-validation early-stop from genuine `PASS_BUDGET_EXHAUSTED`.
+
+## External Review Policy (owner decision 2026-09-13)
+- **Mode**: `off`. CodeRabbit on the current free plan posts a walkthrough comment but never submits a formal review, so a review-completion gate keyed on it can never clear (observed on PRs #71, #74, #80, #81).
+- **Substitute**: every PR gets an internal read-only QA lane plus an independent read-only review lane with distinct agent identities before the Tech Lead rates it. Neither lane may hold implementation ownership. CodeRabbit's walkthrough is read as advisory context only.
+- **Trusted / required / ignored reviewers**: none.
+- Revisit if the CodeRabbit plan changes or a reviewer that submits formal reviews is adopted.
+
+## Execution Routing Policy (owner decision 2026-09-13)
+- **Independent review**: `openrouter` harness, model `nvidia/nemotron-3-ultra-550b-a55b:free`, reasoning `high`. Approved by the owner per use; the free tier does not draw on the OpenRouter budget. Fallbacks in order when it is unavailable: MiniMax M3 via `opencode`, then GLM 5.3 via `openrouter` (budget-checked).
+- **Implementation**: `claude` / latest Sonnet / high (unchanged from the global guide).
+- **QA**: DeepSeek V4 Pro via `qwen` when it has balance; otherwise Kimi K3 via `kimi`; otherwise `claude` / Sonnet. Recorded because on 2026-09-13 the first two routes failed (402 insufficient balance; zero output).
 
 ## Current Status
 - **Last updated**: 2026-09-08

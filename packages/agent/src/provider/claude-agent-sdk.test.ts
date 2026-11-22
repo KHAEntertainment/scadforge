@@ -92,7 +92,11 @@ describe("buildQuery — the mandatory options are the provider's job, never the
     expect(built.options.allowDangerouslySkipPermissions).toBe(true);
   });
 
-  it("exposes MANDATORY_SDK_OPTIONS as the single source of those five", () => {
+  it("always sets strictMcpConfig: true (Issue #75: omitting it loads the operator's entire ~/.claude.json MCP server list)", () => {
+    expect(built.options.strictMcpConfig).toBe(true);
+  });
+
+  it("exposes MANDATORY_SDK_OPTIONS as the single source of those six", () => {
     for (const [key, value] of Object.entries(MANDATORY_SDK_OPTIONS)) {
       expect(built.options[key]).toEqual(value);
     }
@@ -118,6 +122,35 @@ describe("buildQuery — the mandatory options are the provider's job, never the
   it("does not leak the SDK's maxTurns into the pass budget", () => {
     // Spike 3 §6 amendment 3: maxTurns counts API round trips, not build passes.
     expect(built.options.maxTurns).toBe(40);
+  });
+
+  it("omits stderr when no onStderr was configured (Issue #75)", () => {
+    expect(built.options.stderr).toBeUndefined();
+  });
+
+  it("binds THIS turn's id to every stderr chunk, not shared mutable state (Issue #75 QA fix 2)", () => {
+    // The provider instance is shared across every turn it ever runs
+    // (`agent-impl.ts` constructs one for the server's lifetime), so the SDK's
+    // one-arg `stderr` callback must be wrapped per `query()` call with the
+    // id of the turn that call actually belongs to -- never read off `this`.
+    const calls: Array<[string, string]> = [];
+    const onStderr = (data: string, turnId: string) => {
+      calls.push([data, turnId]);
+    };
+    const withStderr = new ClaudeAgentSdkProvider({ binding: sdk.binding, onStderr });
+
+    const builtA = withStderr.buildQuery(sdk.binding, turnInput({ turnId: "turn-A" }), toolSet());
+    const builtB = withStderr.buildQuery(sdk.binding, turnInput({ turnId: "turn-B" }), toolSet());
+
+    (builtA.options.stderr as (d: string) => void)("from A\n");
+    (builtB.options.stderr as (d: string) => void)("from B\n");
+    (builtA.options.stderr as (d: string) => void)("from A again\n");
+
+    expect(calls).toEqual([
+      ["from A\n", "turn-A"],
+      ["from B\n", "turn-B"],
+      ["from A again\n", "turn-A"]
+    ]);
   });
 });
 
