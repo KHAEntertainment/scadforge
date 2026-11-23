@@ -42,7 +42,11 @@ export default tseslint.config(
       "**/vite.config.ts",
       "scripts/**/*.mjs",
       "evals/**/*.mjs",
-      "apps/server/**/*.{ts,mjs}"
+      "apps/server/**/*.{ts,mjs}",
+      // S3-B ticket B8 (Issue #99): the fault-qualification harness's driver
+      // scripts are plain Node child processes (spawned, not vitest-transformed),
+      // so they need `process`/`node:` globals like the other Node-context files above.
+      "packages/scad-core/src/test-support/drivers/**/*.mjs"
     ],
     languageOptions: {
       globals: {

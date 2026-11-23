@@ -209,8 +209,13 @@ describe("Issue #41 symptom 1 — the 3D preview is blank", () => {
     fireEvent.click(rows[1]);
 
     fireEvent.click(screen.getByRole("tab", { name: "Preview" }));
-    await waitFor(() => expect(screen.getByTestId("viewer-placeholder")).toBeInTheDocument());
-    expect(screen.getByTestId("viewer-placeholder")).toHaveTextContent("Snapshot 0001");
+    // Issue #117: wait on the SETTLED snapshot identity, not just placeholder
+    // presence -- `useSnapshotMesh` renders the generic "Loading model…"
+    // placeholder first (status "checking") before settling to the
+    // snapshot-specific "Snapshot 0001 has no 3D mesh yet…" text (status
+    // "absent"), and under CPU contention the first assertion can land on
+    // the transient "checking" render.
+    await waitFor(() => expect(screen.getByTestId("viewer-placeholder")).toHaveTextContent("Snapshot 0001"));
     // The validation panel followed the selection too.
     expect(screen.getByTestId("validation-panel-badge")).toHaveTextContent("Not validated");
   });

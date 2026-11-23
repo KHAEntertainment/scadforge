@@ -50,14 +50,15 @@ import type { RenderRef, SnapshotId, SnapshotManifest } from "@scadforge/protoco
 import type { ValidationResult, ViewName } from "../types.js";
 import { withTypedError } from "../errors.js";
 import { snapshotDir } from "./paths.js";
+import type { LockedProject } from "./recovered.js";
 import {
-  readDerivedEnrichment,
+  readDerivedEnrichmentLocked,
   snapshotDerivedDir,
   snapshotDerivedRenderPath,
   snapshotDerivedValidationReportPath,
   snapshotDerivedViewsDir,
-  writeDerivedRenders,
-  writeDerivedValidation
+  writeDerivedRendersLocked,
+  writeDerivedValidationLocked
 } from "./derived.js";
 
 /** One rendered PNG to attach. */
@@ -70,7 +71,7 @@ export interface RenderAttachment {
   height: number;
 }
 
-/** Options for {@link attachRendersToSnapshot}. */
+/** Options for {@link attachRendersToSnapshotLocked}. */
 export interface AttachRendersOptions {
   /**
    * Builds the HTTP URL the UI fetches a render from. `apps/server` owns the
@@ -87,7 +88,7 @@ export interface AttachRendersOptions {
  * target of a later render attach.
  *
  * This is the WRITE-time / just-attached location, used by
- * `attachRendersToSnapshot` itself and by callers re-pointing at a render
+ * `attachRendersToSnapshotLocked` itself and by callers re-pointing at a render
  * they just attached in this same call (guaranteed to exist there). For
  * READING a render that might pre-date this fix, use
  * {@link resolveSnapshotRenderPath} instead.
@@ -96,7 +97,7 @@ export function snapshotRenderPath(projectDir: string, snapshotId: SnapshotId, v
   return snapshotDerivedRenderPath(projectDir, snapshotId, view);
 }
 
-/** The snapshot's derived `views/` directory — where `attachRendersToSnapshot` copies PNGs. */
+/** The snapshot's derived `views/` directory — where `attachRendersToSnapshotLocked` copies PNGs. */
 export function snapshotViewsDir(projectDir: string, snapshotId: SnapshotId): string {
   return snapshotDerivedViewsDir(projectDir, snapshotId);
 }
@@ -171,26 +172,32 @@ async function readRawManifest(projectDir: string, snapshotId: SnapshotId): Prom
  * enrichment merged in. `history/<id>/manifest.json` is never opened for
  * writing by this function.
  *
+ * Takes `ctx` (Issue #73): attaching renders is a mutable-attachment step
+ * that must run under the recovery boundary — the caller pins the target
+ * snapshot id and re-enters the boundary before calling this, exactly like
+ * `store.ts`'s other locked writers (see `apps/server`'s `build`/
+ * `renderAndAttach` for the pin-then-release-then-recheck pattern).
+ *
  * Rejects only with a typed `ScadForgeError`.
  */
-export async function attachRendersToSnapshot(
-  projectDir: string,
+export async function attachRendersToSnapshotLocked(
+  ctx: LockedProject,
   snapshotId: SnapshotId,
   attachments: readonly RenderAttachment[],
   options: AttachRendersOptions = {}
 ): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const manifest = await readRawManifest(projectDir, snapshotId);
+      const manifest = await readRawManifest(ctx.projectDir, snapshotId);
 
-      const viewsDir = snapshotDerivedViewsDir(projectDir, snapshotId);
+      const viewsDir = snapshotDerivedViewsDir(ctx.projectDir, snapshotId);
       await mkdir(viewsDir, { recursive: true });
 
-      const existing = await readDerivedEnrichment(projectDir, snapshotId);
+      const existing = await readDerivedEnrichmentLocked(ctx, snapshotId);
       const byView = new Map<string, RenderRef>((existing.renders ?? manifest.renders).map((r) => [r.view, r]));
       for (const attachment of attachments) {
         const file = `${PROJECT_LAYOUT.snapshot.viewsDir}/${attachment.view}.png`;
-        const dest = snapshotDerivedRenderPath(projectDir, snapshotId, attachment.view);
+        const dest = snapshotDerivedRenderPath(ctx.projectDir, snapshotId, attachment.view);
         if (attachment.sourcePath !== dest) await copyFile(attachment.sourcePath, dest);
         const { size } = await stat(dest);
         byView.set(attachment.view, {
@@ -205,7 +212,7 @@ export async function attachRendersToSnapshot(
       }
 
       const renders = [...byView.values()];
-      await writeDerivedRenders(projectDir, snapshotId, renders);
+      await writeDerivedRendersLocked(ctx, snapshotId, renders);
 
       manifest.renders = renders;
       return manifest;
@@ -224,16 +231,18 @@ export async function attachRendersToSnapshot(
  * `history/<id>/validation.json` are never opened for writing by this
  * function.
  *
+ * Takes `ctx` (Issue #73) — see {@link attachRendersToSnapshotLocked}.
+ *
  * Rejects only with a typed `ScadForgeError`.
  */
-export async function attachValidationToSnapshot(
-  projectDir: string,
+export async function attachValidationToSnapshotLocked(
+  ctx: LockedProject,
   snapshotId: SnapshotId,
   validation: ValidationResult
 ): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const manifest = await readRawManifest(projectDir, snapshotId);
+      const manifest = await readRawManifest(ctx.projectDir, snapshotId);
 
       const summary = {
         badge: validation.gate.badge,
@@ -242,7 +251,7 @@ export async function attachValidationToSnapshot(
         volume_mm3: validation.report.volume_mm3,
         warning_count: validation.gate.warnings.length
       };
-      await writeDerivedValidation(projectDir, snapshotId, validation.report, summary);
+      await writeDerivedValidationLocked(ctx, snapshotId, validation.report, summary);
 
       // `files.validation_json` is a logical pointer (SDP §8): nothing joins
       // it against `snapshotDir` to physically locate the file (that's what

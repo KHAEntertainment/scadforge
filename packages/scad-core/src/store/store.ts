@@ -7,16 +7,28 @@
 // rewrites or deletes an existing one. No database (PROJECT_CONTEXT.md
 // "Do not introduce a database").
 //
+// ── THE RECOVERY BOUNDARY (Issue #73 / S3-B ticket B2) ──────────────────────
+//
+// Every function here that touches root `model.scad`/`params.json`/
+// `project.json` now goes through `recovered.ts`'s `withRecoveredProject` —
+// the single mutable-project access boundary. Each EXPORTED function below
+// is a thin delegator: it opens the boundary once and calls its own
+// `*Locked(ctx, ...)` sibling, which does the actual work and NEVER reopens
+// the boundary itself. A caller that already holds a `ctx` (this package's
+// own `revertToSnapshotLocked`, or `apps/server`'s composed operations) must
+// call the `*Locked` variant directly — calling the exported delegator from
+// inside an active boundary throws immediately (`recovered.ts`'s
+// non-reentrancy guard), rather than deadlocking on the underlying lock.
+//
 // ── CONCURRENCY POLICY (binding for #17's routes and the M4 MCP server) ─────
 //
 // `createSnapshot` MUST be safe when called concurrently against the SAME
 // `.scadforge/` tree — not just from two Promises in one Node process, but
 // from two SEPARATE OS processes (the GUI server and, from M4 onward, the
-// stdio MCP server, both writing the same project directory). An in-process
-// mutex/lock cannot provide that guarantee, so snapshot id allocation is
-// NOT "read project.json's head, compute next id, write files" (that read
-// -modify-write has a race: two callers can read the same head and both
-// compute the same next id, and `mkdir(dir, {recursive:true})` does NOT
+// stdio MCP server, both writing the same project directory). Snapshot id
+// allocation is NOT "read project.json's head, compute next id, write files"
+// (that read-modify-write has a race: two callers can read the same head and
+// both compute the same next id, and `mkdir(dir, {recursive:true})` does NOT
 // throw on an existing directory, so the second writer's files silently land
 // on top of the first's — the exact defect QA reported).
 //
@@ -25,13 +37,14 @@
 // atomic at the filesystem/OS level — POSIX guarantees exactly one caller
 // (in-process or cross-process, same machine) gets ENOERR for a given path;
 // every other concurrent caller gets `EEXIST` and must retry with a freshly
-// re-read head. This makes the id sequence gapless-and-collision-free without
-// any external lock manager, and it composes correctly with the trailing
-// `project.json.head` write: a caller can only ever compute id N+1 after it
-// has observed head=N on disk, which is only true once the writer that
-// claimed N has fully committed `project.json` — so the final head writes
-// are transitively ordered by the same directory-claim race, never racing
-// each other out of order.
+// re-read head. Since Issue #73, `createSnapshotLocked` ALSO runs under the
+// project's params lock (the recovery boundary), so this id-claim race can
+// only ever be with a writer that failed to acquire that lock in the first
+// place — a defense-in-depth belt, not the primary mechanism, which stays
+// the atomic directory claim below (a lock alone is not sufficient across a
+// process that dies mid-write without releasing it; the directory claim's
+// own orphan-reclaim, `isReclaimableOrphanClaim`, is what makes id
+// allocation itself gapless-and-collision-free even then).
 //
 // If a caller cannot claim ANY id within `SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS`
 // (pathological contention, or a filesystem that cannot honor exclusive
@@ -45,11 +58,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createTwoFilesPatch } from "diff";
 import {
   PROJECT_LAYOUT,
+  type EditorReceipt,
+  type EditorSidecar,
   type ExportRecord,
   type ProjectManifest,
   type ProviderConfig,
@@ -70,20 +86,37 @@ import {
   metaDir,
   nextSnapshotId,
   projectFilePath,
-  rootModelPath,
   rootParamsPath,
+  sidecarPath,
   snapshotDir
 } from "./paths.js";
-import { readDerivedEnrichment, writeDerivedValidation } from "./derived.js";
+import { readDerivedEnrichmentLocked, writeDerivedValidationLocked } from "./derived.js";
 import { withFileLock } from "./file-lock.js";
-import { withParamsLock } from "./params-lock.js";
+import { type LockedProject, type ReadResult, withRecoveredProject } from "./recovered.js";
 import {
-  attachRendersToSnapshot,
+  captureSidecarForSnapshotLocked,
+  readSidecarLocked,
+  readSnapshotSidecarLocked,
+  serializeCanonicalSidecar
+} from "../editor/sidecar.js";
+import {
+  attachRendersToSnapshotLocked,
   resolveSnapshotMeshPath,
   resolveSnapshotRenderPath,
   resolveSnapshotValidationPath,
   snapshotMeshPath
 } from "./attachments.js";
+import {
+  decideLocked,
+  publishLocked,
+  reconcileTransactionLocked,
+  stageTransactionLocked,
+  type TransactionClaimLink,
+  type TransactionIntent
+} from "./transaction.js";
+import type { AcceptedOperationRecord } from "./claims.js";
+import { computeSourceRevision } from "./revision.js";
+import { editorRevision as computeEditorRevision } from "../editor/canonical.js";
 
 // ── ProjectManifest (project.json) ──────────────────────────────────────────
 
@@ -103,6 +136,12 @@ export interface InitProjectInput {
  * Initializes a new project's `.scadforge/` structure and creates its first
  * ("initial") snapshot. `projectDir` must not already contain a `.scadforge/`
  * directory.
+ *
+ * `.scadforge/` (and the lock directory the recovery boundary needs under
+ * it) does not exist yet for a brand-new project, so this creates the meta
+ * tree FIRST and only THEN enters the boundary — the boundary itself must
+ * never special-case "the lock's parent doesn't exist yet", since for every
+ * OTHER writer that is a genuine `PROJECT_NOT_FOUND` (see `recovered.ts`).
  */
 export async function initProject(
   projectDir: string,
@@ -113,48 +152,101 @@ export async function initProject(
       await mkdir(metaDir(projectDir), { recursive: true });
       await mkdir(historyDir(projectDir), { recursive: true });
       await mkdir(exportsDir(projectDir), { recursive: true });
-
-      const now = new Date().toISOString();
-      let project: ProjectManifest = {
-        schema_version: 1,
-        id: input.id,
-        name: input.name,
-        created: now,
-        updated: now,
-        openscad_image: OPENSCAD_IMAGE,
-        openscad_version: OPENSCAD_VERSION,
-        provider: input.provider,
-        head: null
-      };
-      await writeProjectManifest(projectDir, project);
-
-      const snapshot = await createSnapshot(projectDir, {
-        content: input.content,
-        params: input.params ?? {},
-        message: input.message ?? "",
-        origin: "initial",
-        pass: null
-      });
-
-      project = await readProjectManifest(projectDir);
-      return { project, snapshot };
+      return withRecoveredProject(projectDir, (ctx) => initProjectLocked(ctx, input));
     },
     "INTERNAL_ERROR",
     "failed to initialize project"
   );
 }
 
+async function initProjectLocked(
+  ctx: LockedProject,
+  input: InitProjectInput
+): Promise<{ project: ProjectManifest; snapshot: SnapshotManifest }> {
+  const now = new Date().toISOString();
+  let project: ProjectManifest = {
+    schema_version: 1,
+    id: input.id,
+    name: input.name,
+    created: now,
+    updated: now,
+    openscad_image: OPENSCAD_IMAGE,
+    openscad_version: OPENSCAD_VERSION,
+    provider: input.provider,
+    head: null
+  };
+  await writeProjectManifest(ctx.projectDir, project);
+
+  const snapshot = await createSnapshotLocked(ctx, {
+    content: input.content,
+    params: input.params ?? {},
+    message: input.message ?? "",
+    origin: "initial",
+    pass: null
+  });
+
+  project = await readProjectManifestLocked(ctx);
+  return { project, snapshot };
+}
+
+/**
+ * Reads `projectDir`'s `project.json`. Distinguishes the project not
+ * existing (`PROJECT_NOT_FOUND`) from `project.json` existing but being
+ * unparseable (`INTERNAL_ERROR`, Issue #73 AC) — the pre-#73 code folded
+ * both into `PROJECT_NOT_FOUND`, which misreported real corruption as a
+ * project that was simply never created.
+ */
 export async function readProjectManifest(projectDir: string): Promise<ProjectManifest> {
-  return withTypedError(
-    async () => {
-      const raw = await readFile(projectFilePath(projectDir), "utf8").catch((err) => {
-        throw new ScadForgeError("PROJECT_NOT_FOUND", `project not found at '${projectDir}'`, { cause: err });
-      });
-      return JSON.parse(raw) as ProjectManifest;
-    },
-    "PROJECT_NOT_FOUND",
-    `failed to read project manifest at '${projectDir}'`
-  );
+  return withRecoveredProject(projectDir, (ctx) => readProjectManifestLocked(ctx));
+}
+
+/** `ctx`-taking sibling of {@link readProjectManifest}, for a caller composing this read with other locked reads under one boundary entry (`apps/server`'s `projectResponse`/`coherentSourceState`/agent `readProject`). */
+export async function readProjectManifestLocked(ctx: LockedProject): Promise<ProjectManifest> {
+  let raw: string;
+  try {
+    raw = await readFile(projectFilePath(ctx.projectDir), "utf8");
+  } catch (err) {
+    throw new ScadForgeError("PROJECT_NOT_FOUND", `project not found at '${ctx.projectDir}'`, { cause: err });
+  }
+  try {
+    return JSON.parse(raw) as ProjectManifest;
+  } catch (err) {
+    throw new ScadForgeError(
+      "INTERNAL_ERROR",
+      `project manifest at '${projectFilePath(ctx.projectDir)}' is corrupt`,
+      { cause: err }
+    );
+  }
+}
+
+/**
+ * Same read as {@link readProjectManifestLocked}, but typed so a caller that
+ * treats "no project.json yet" as an ordinary, expected state (id-claiming
+ * during `createSnapshot`, which may run before `project.json` exists on a
+ * still-being-initialized project) can tell that apart from corruption,
+ * which must never be silently treated the same way (Issue #73 AC6: a
+ * corrupt `project.json` must fail `createSnapshot` before any write, not
+ * be read as "no manifest yet").
+ */
+async function readProjectManifestOrNullLocked(ctx: LockedProject): Promise<ReadResult<ProjectManifest>> {
+  let raw: string;
+  try {
+    raw = await readFile(projectFilePath(ctx.projectDir), "utf8");
+  } catch {
+    return { kind: "absent" };
+  }
+  try {
+    return { kind: "present", value: JSON.parse(raw) as ProjectManifest };
+  } catch (err) {
+    return {
+      kind: "corrupt",
+      error: new ScadForgeError(
+        "INTERNAL_ERROR",
+        `project manifest at '${projectFilePath(ctx.projectDir)}' is corrupt`,
+        { cause: err }
+      )
+    };
+  }
 }
 
 async function writeProjectManifest(projectDir: string, manifest: ProjectManifest): Promise<void> {
@@ -185,6 +277,73 @@ export interface CreateSnapshotInput {
   buildRenderUrl?: (snapshotId: SnapshotId, view: RenderRef["view"], file: string) => string;
 }
 
+/**
+ * Additive extension for a snapshot-producing commit that must publish a
+ * durable operation claim + receipt in the SAME transaction as the snapshot
+ * (S3-B ticket B6, Issue #98). Only ever present for an editor command.
+ */
+export interface CreateSnapshotEditorExtension {
+  /** Links this transaction to the caller's already-reserved durable operation claim. */
+  claim: TransactionClaimLink;
+  /**
+   * The claim's undo/redo before/after record. Omitted (not just falsy —
+   * genuinely absent) for an undo/redo commit itself, which deliberately
+   * does not become traversable (`editor/commands.ts`'s
+   * `applyEditorTraversal`).
+   */
+  accepted?: AcceptedOperationRecord;
+  /**
+   * Builds the `EditorReceipt` to stage and publish alongside everything
+   * else. Called synchronously, AFTER the snapshot id is claimed and the
+   * resulting source revision / sidecar digest / editor revision are known,
+   * BEFORE staging begins — so a caller that only needs the receipt (rather
+   * than restructuring this function's return type) captures it via a
+   * closure variable set inside this callback.
+   */
+  buildReceipt: (facts: { snapshotId: SnapshotId; sourceRevision: string; sidecarDigest: string; editorRevision: string }) => EditorReceipt;
+}
+
+/**
+ * Additive options for a snapshot-producing commit (S3-B ticket B6, Issue
+ * #98 — Tech Lead ruling, generalized after the F1 fault-matrix finding
+ * (#103) that the sidecar override must stand alone, independent of any
+ * operation-claim/receipt concern). Omitted entirely, `createSnapshotLocked`
+ * behaves byte-for-byte as before: the default
+ * `captureSidecarForSnapshotLocked` "read current root" capture, no claim
+ * link, no receipt.
+ *
+ * Every field here lands in the SAME `commit.json` as the snapshot/root
+ * files this call already stages — there is no second write, and no caller
+ * (editor commands, revert, the legacy-empty first-mutation path) ever calls
+ * `writeSidecarBytesLocked` as a SEPARATE transaction before this one.
+ * Store.ts keeps sole ownership of the id claim, the empty-claimed-directory
+ * cleanup on a pre-decide failure, and the single stage → decide → publish;
+ * a caller never reaches into any of that itself.
+ */
+export interface CreateSnapshotOptions {
+  /**
+   * The COMPLETE new sidecar this snapshot should carry, staged as BOTH the
+   * root `.scadforge/editor.json` AND this snapshot's own captured copy +
+   * manifest descriptor — instead of `captureSidecarForSnapshotLocked`'s
+   * "whatever the current root sidecar already is" default. Canonicalized
+   * here via B3's `serializeCanonicalSidecar`; a caller must never hand-roll
+   * canonical bytes itself. Omitted for an ordinary (non-sidecar-changing)
+   * snapshot: `revert` and editor `put-feature`/`remove-feature` supply
+   * this; editor `set-value` does not (its sidecar is unchanged).
+   */
+  sidecar?: EditorSidecar;
+  /**
+   * Flips `project.editor_store_version` to 1 in the SAME `project.json`
+   * write this call already stages for `head`/`updated`. The caller decides
+   * this (it already read the current sidecar/project state to get here) —
+   * store.ts never re-derives it. Ignored when omitted/false; never
+   * downgrades an already-modern project.
+   */
+  markerFlip?: boolean;
+  /** Present only for a durable-operation-claim commit (an editor command). */
+  editor?: CreateSnapshotEditorExtension;
+}
+
 /** Max attempts to claim a snapshot id before failing with `CONFLICT` (see the concurrency policy above). */
 export const SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS = 50;
 
@@ -206,11 +365,32 @@ function backoffDelay(attempt: number): Promise<void> {
  * ORPHANED CLAIM (issue #28): it carries no `manifest.json` (a committed
  * snapshot always has one -- it is written before `project.json.head`
  * advances, so its presence means the id is genuinely taken and must never
- * be touched) AND it has been quiet longer than `ORPHANED_CLAIM_MIN_AGE_MS`
- * (a live writer keeps the directory's mtime fresh while it creates files,
- * so a directory this old with no manifest can only be the debris of a
- * process that died between the exclusive mkdir and either the manifest
- * write or the cleanup path).
+ * be touched).
+ *
+ * EMPTY orphans reclaim IMMEDIATELY, no age wait (Issue #98 F2 — B8's fault
+ * matrix, PR #103): since B2/B4, `claimNextSnapshotId` is the ONLY thing
+ * that ever creates this directory directly, and always empty — B4's own
+ * publish step populates it exclusively via an atomic rename from staging,
+ * never an in-place write. Both this call and the `recover()` that already
+ * ran earlier in THIS boundary entry hold the SAME exclusive params lock, so
+ * nothing can be concurrently "still writing into" a directory this call can
+ * see right now; an empty, manifest-less directory found here can only be
+ * the debris of an earlier lock-holder that crashed before publish ever
+ * reached this id. The OLD unconditional age gate wedged every writer for up
+ * to `ORPHANED_CLAIM_MIN_AGE_MS` after exactly this crash.
+ *
+ * A NON-EMPTY, manifest-less orphan should no longer be PRODUCIBLE under
+ * B4's model at all: `publishHistoryDirIdempotent` populates `history/<id>/`
+ * exclusively via one atomic rename of the fully-staged directory, never an
+ * in-place/partial write — so there is no code path left that can leave
+ * behind a manifest-less directory with SOME content in it. This branch is
+ * kept anyway, conservatively, for two reasons: (1) defense in depth against
+ * a future writer that reintroduces a partial in-place write, and (2) a
+ * directory tree inherited from BEFORE this migration (pre-B4-shaped
+ * debris) could still carry exactly this shape. For that case the original
+ * age-gated wait (issue #28) still applies — a live writer keeps the
+ * directory's mtime fresh while it creates files, so quiet-long-enough with
+ * no manifest can only be dead-process debris.
  */
 async function isReclaimableOrphanClaim(dir: string): Promise<boolean> {
   const hasManifest = await stat(join(dir, PROJECT_LAYOUT.snapshot.manifestFile)).then(
@@ -218,23 +398,31 @@ async function isReclaimableOrphanClaim(dir: string): Promise<boolean> {
     () => false
   );
   if (hasManifest) return false;
+  const entries = await readdir(dir).catch(() => null);
+  if (entries === null) return false; // vanished (a concurrent reclaimer freed it) -- just retry the mkdir
+  if (entries.length === 0) return true;
   const dirStat = await stat(dir).catch(() => null);
-  if (!dirStat) return false; // vanished (a concurrent reclaimer freed it) -- just retry the mkdir
+  if (!dirStat) return false; // vanished mid-check -- just retry the mkdir
   return Date.now() - dirStat.mtimeMs >= ORPHANED_CLAIM_MIN_AGE_MS;
 }
 
 /**
- * Atomically claims the next snapshot id for `projectDir` — see the
+ * Atomically claims the next snapshot id for `ctx.projectDir` — see the
  * CONCURRENCY POLICY comment at the top of this file. Returns the claimed
  * `id` and the `parent` it was computed from, with the snapshot directory
  * already created (empty) and exclusively owned by this call.
+ *
+ * A corrupt `project.json` fails THIS call, before any directory is ever
+ * claimed (Issue #73 AC6) — legacy absence (no `project.json` yet, e.g.
+ * mid-`initProject`) still computes `parent: null` exactly as before.
  */
-async function claimNextSnapshotId(projectDir: string): Promise<{ id: SnapshotId; parent: SnapshotId | null }> {
+async function claimNextSnapshotId(ctx: LockedProject): Promise<{ id: SnapshotId; parent: SnapshotId | null }> {
   for (let attempt = 0; attempt < SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS; attempt++) {
-    const project = await readProjectManifestOrNull(projectDir);
-    const parent = project?.head ?? null;
+    const projectRead = await readProjectManifestOrNullLocked(ctx);
+    if (projectRead.kind === "corrupt") throw projectRead.error;
+    const parent = projectRead.kind === "present" ? projectRead.value.head : null;
     const id = nextSnapshotId(parent);
-    const dir = snapshotDir(projectDir, id);
+    const dir = snapshotDir(ctx.projectDir, id);
     try {
       // NON-recursive, exclusive create: this is the lock. `{ recursive: true }`
       // would succeed silently even when `dir` already exists, which is the
@@ -262,7 +450,7 @@ async function claimNextSnapshotId(projectDir: string): Promise<{ id: SnapshotId
   }
   throw new ScadForgeError(
     "CONFLICT",
-    `could not allocate a snapshot id in '${projectDir}' after ${SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS} attempts (high write contention)`
+    `could not allocate a snapshot id in '${ctx.projectDir}' after ${SNAPSHOT_ID_CLAIM_MAX_ATTEMPTS} attempts (high write contention)`
   );
 }
 
@@ -279,17 +467,57 @@ async function claimNextSnapshotId(projectDir: string): Promise<{ id: SnapshotId
  * ever silently overwriting another snapshot.
  */
 export async function createSnapshot(projectDir: string, input: CreateSnapshotInput): Promise<SnapshotManifest> {
+  return withRecoveredProject(projectDir, (ctx) => createSnapshotLocked(ctx, input));
+}
+
+/**
+ * `ctx`-taking sibling of {@link createSnapshot} for a caller that already
+ * holds the boundary (`initProjectLocked`, `revertToSnapshotLocked`,
+ * `mergeParamsAtomic`'s `persist`, `apps/server`'s composed writers). Never
+ * reacquires the lock.
+ *
+ * S3-B ticket B4: publishes through the staged roll-forward transaction
+ * mechanism (`stageTransactionLocked` → `decideLocked` → `publishLocked`,
+ * `transaction.ts`) instead of a bare write sequence. Nothing authoritative
+ * changes before `decideLocked`'s `commit.json` is durable. If anything
+ * throws before that point, {@link reconcileTransactionLocked} is called
+ * synchronously (not merely left for the next boundary entry) so the
+ * claimed-but-unstaged/unpublished `history/<id>` directory never lingers as
+ * a visible partial entry — this is what keeps `claimNextSnapshotId`'s
+ * "the id claim stays the id reservation; an abandoned reservation leaves a
+ * gap, never a partial entry" true even for an ordinary in-process failure,
+ * not only a real crash.
+ */
+export async function createSnapshotLocked(
+  ctx: LockedProject,
+  input: CreateSnapshotInput,
+  opts?: CreateSnapshotOptions
+): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const { id, parent } = await claimNextSnapshotId(projectDir);
-      const dir = snapshotDir(projectDir, id);
+      const { id, parent } = await claimNextSnapshotId(ctx);
+      const transactionId = randomUUID();
       try {
-        return await writeSnapshotFiles(projectDir, dir, id, parent, input);
+        const intent = await buildSnapshotIntent(ctx, transactionId, id, parent, input, opts);
+        const staged = await stageTransactionLocked(ctx, intent);
+        const decided = await decideLocked(ctx, staged);
+        await publishLocked(ctx, decided);
+        // The manifest we just staged & published, verbatim -- matches the
+        // pre-B4 behavior of returning the in-memory object rather than
+        // re-reading it (no DERIVED enrichment exists yet for a snapshot
+        // this call just created).
+        return intent.snapshot!.manifest;
       } catch (err) {
-        // The id was claimed but the write didn't complete -- clean up the
-        // partial directory so it never lingers as a corrupt/unlistable
-        // snapshot (best-effort; the real error below is what's reported).
-        await rm(dir, { recursive: true, force: true }).catch(() => {});
+        // Best-effort, synchronous self-heal: if `commit.json` was never
+        // written, this aborts the transaction (quarantining any staged
+        // bytes) and removes the claimed `history/<id>` directory -- but
+        // ONLY if it is still empty, and NEVER if a commit.json exists (see
+        // `transaction.ts`'s `reconcileTransactionLocked`). If publication
+        // was already durable and merely partial, this instead FINISHES it
+        // idempotently. Swallowed here because the ORIGINAL error below is
+        // what the caller needs to see; a real crash gets the same
+        // reconciliation from the next boundary entry's `recover()` either way.
+        await reconcileTransactionLocked(ctx, transactionId, id).catch(() => {});
         throw err;
       }
     },
@@ -298,63 +526,54 @@ export async function createSnapshot(projectDir: string, input: CreateSnapshotIn
   );
 }
 
-async function writeSnapshotFiles(
-  projectDir: string,
-  dir: string,
+/**
+ * Builds the COMPLETE `TransactionIntent` for a new snapshot: every root and
+ * history byte this operation will publish, computed from reads only —
+ * nothing here touches the real `history/<id>` directory or any root file.
+ * Throws (before any staging begins) exactly where `writeSnapshotFiles` used
+ * to throw: a corrupt `project.json`, or a root editor sidecar that is
+ * missing/corrupt/unsupported-version (`captureSidecarForSnapshotLocked`).
+ */
+async function buildSnapshotIntent(
+  ctx: LockedProject,
+  transactionId: string,
   id: SnapshotId,
   parent: SnapshotId | null,
-  input: CreateSnapshotInput
-): Promise<SnapshotManifest> {
-  const project = await readProjectManifestOrNull(projectDir);
-  const viewsDirPath = join(dir, PROJECT_LAYOUT.snapshot.viewsDir);
-  await mkdir(viewsDirPath, { recursive: true });
+  input: CreateSnapshotInput,
+  opts?: CreateSnapshotOptions
+): Promise<TransactionIntent> {
+  const projectRead = await readProjectManifestOrNullLocked(ctx);
+  if (projectRead.kind === "corrupt") throw projectRead.error;
+  const project = projectRead.kind === "present" ? projectRead.value : null;
 
-  // Normalize to LF-only (Issue #40) BEFORE writing, so the snapshot, root
+  // Normalize to LF-only (Issue #40) BEFORE staging, so the snapshot, root
   // `model.scad`, and the `diff.patch` against the parent all carry identical
   // bytes -- the CLI runner and `--export-format=param` parser then never see
   // a CRLF file the store did not intend.
   const content = normalizeLineEndings(input.content);
-
-  // model.scad
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.modelFile), content, "utf8");
 
   // params.json (Customizer preset format, matching the project root convention)
   const paramsFile: ParamsFile = {
     fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
     parameterSets: { [PARAMS_ACTIVE_PRESET]: input.params }
   };
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.paramsFile), JSON.stringify(paramsFile, null, 2), "utf8");
 
-  // message.md
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.messageFile), input.message ?? "", "utf8");
-
-  // diff.patch vs parent (null for the first snapshot)
-  let diffPatchRel: string | null = null;
+  // diff.patch vs parent (null for the first snapshot) -- a READ of the
+  // parent's own already-committed, immutable bytes; never touches staging.
+  let diffPatch: string | null = null;
   if (parent !== null) {
     const parentContent = await readFile(
-      join(snapshotDir(projectDir, parent), PROJECT_LAYOUT.snapshot.modelFile),
+      join(snapshotDir(ctx.projectDir, parent), PROJECT_LAYOUT.snapshot.modelFile),
       "utf8"
     ).catch(() => "");
-    const patch = createTwoFilesPatch(
-      `${parent}/model.scad`,
-      `${id}/model.scad`,
-      parentContent,
-      content
-    );
-    await writeFile(join(dir, PROJECT_LAYOUT.snapshot.diffFile), patch, "utf8");
-    diffPatchRel = PROJECT_LAYOUT.snapshot.diffFile;
+    diffPatch = createTwoFilesPatch(`${parent}/model.scad`, `${id}/model.scad`, parentContent, content);
   }
 
   // validation.json (verbatim ValidationReport) + the manifest's lightweight summary
-  let validationJsonRel: string | null = null;
+  let validationJson: string | null = null;
   let validationSummary: ValidationSummary | null = null;
   if (input.validation) {
-    await writeFile(
-      join(dir, PROJECT_LAYOUT.snapshot.validationFile),
-      JSON.stringify(input.validation.report, null, 2),
-      "utf8"
-    );
-    validationJsonRel = PROJECT_LAYOUT.snapshot.validationFile;
+    validationJson = JSON.stringify(input.validation.report, null, 2);
     validationSummary = {
       badge: input.validation.gate.badge,
       manifold: input.validation.report.manifold,
@@ -364,17 +583,18 @@ async function writeSnapshotFiles(
     };
   }
 
-  // renders
+  // renders -- staged by copying the caller's source PNG bytes; no live
+  // caller passes these through `CreateSnapshotInput` today (renders attach
+  // AFTER creation via `attachments.ts`), but the shape is preserved.
   const renders: RenderRef[] = [];
+  const renderEntries: { view: string; sourcePath: string }[] = [];
   for (const r of input.renders ?? []) {
     const file = `${PROJECT_LAYOUT.snapshot.viewsDir}/${r.view}.png`;
-    const dest = join(dir, file);
-    await copyFile(r.sourcePath, dest);
-    const { size } = await stat(dest);
-    // width/height are not re-derived here (the frozen camera contract
-    // fixes them per DEFAULT_IMAGE_SIZE / the request's imgsize override);
-    // callers that need exact per-file dimensions read them from the
-    // RenderResult that produced r.sourcePath.
+    const { size } = await stat(r.sourcePath);
+    // width/height are not re-derived here (the frozen camera contract fixes
+    // them per DEFAULT_IMAGE_SIZE / the request's imgsize override); callers
+    // that need exact per-file dimensions read them from the RenderResult
+    // that produced r.sourcePath.
     renders.push({
       view: r.view,
       file,
@@ -384,7 +604,38 @@ async function writeSnapshotFiles(
       bytes: size,
       render_ms: r.render_ms
     });
+    renderEntries.push({ view: r.view, sourcePath: r.sourcePath });
   }
+
+  // editor.json (S3-B B3, Issue #87): every new snapshot -- including
+  // ordinary source/params snapshots, not just editor commands -- captures a
+  // sidecar verbatim. `captureSidecarForSnapshotLocked` (S3-B ticket B6,
+  // Issue #98 F1 fix, PR #103) is a PURE READ: it refuses (never silently
+  // drops or fabricates) when the current root sidecar is missing/corrupt/
+  // unsupported-version, and otherwise just RETURNS the bytes to stage --
+  // it no longer writes anything itself. `opts.sidecar` overrides this
+  // default for a caller with its own resulting sidecar (an editor
+  // put-feature/remove-feature command, or `revertToSnapshotLocked` copying
+  // the target's exact sidecar forward): the caller has already verified
+  // (or, for revert, copied wholesale) whatever trustworthiness that sidecar
+  // needs, so no extra check is repeated here. Either way, `root.sidecar` is
+  // staged and published as PART OF THIS SAME transaction below -- never a
+  // separate `writeSidecarBytesLocked` call first. That used to run as its
+  // own stage → decide → publish for BOTH the legacy-empty first-mutation
+  // case and every revert, so a crash between the two left the root sidecar
+  // changed with no snapshot (revert: a MIXED ROOT, the target's sidecar
+  // next to the OLD model.scad/params.json) -- the exact defect B8's fault
+  // matrix (#103) found.
+  const sidecarCapture = opts?.sidecar
+    ? (() => {
+        const { bytes, digest } = serializeCanonicalSidecar(opts.sidecar!);
+        return {
+          descriptor: { version: 1 as const, file: "editor.json" as const, sha256: digest },
+          bytes,
+          legacyMarkerFlip: opts.markerFlip === true
+        };
+      })()
+    : await captureSidecarForSnapshotLocked(ctx);
 
   const manifest: SnapshotManifest = {
     id,
@@ -397,41 +648,103 @@ async function writeSnapshotFiles(
       model_scad: PROJECT_LAYOUT.snapshot.modelFile,
       params_json: PROJECT_LAYOUT.snapshot.paramsFile,
       message_md: PROJECT_LAYOUT.snapshot.messageFile,
-      validation_json: validationJsonRel,
-      diff_patch: diffPatchRel
+      validation_json: validationJson !== null ? PROJECT_LAYOUT.snapshot.validationFile : null,
+      diff_patch: diffPatch !== null ? PROJECT_LAYOUT.snapshot.diffFile : null
     },
     params: input.params,
     renders,
     validation: validationSummary,
-    annotations: []
+    annotations: [],
+    editor: sidecarCapture.descriptor
   };
-  await writeFile(join(dir, PROJECT_LAYOUT.snapshot.manifestFile), JSON.stringify(manifest, null, 2), "utf8");
 
-  // Update root model.scad / params.json to the current state.
-  await writeFile(rootModelPath(projectDir), content, "utf8");
-  await writeFile(rootParamsPath(projectDir), JSON.stringify(paramsFile, null, 2), "utf8");
+  const updatedProject: ProjectManifest | undefined = project
+    ? {
+        ...project,
+        head: id,
+        updated: manifest.timestamp,
+        ...(sidecarCapture.legacyMarkerFlip ? { editor_store_version: 1 as const } : {})
+      }
+    : undefined;
 
-  // Update project.json head.
-  if (project) {
-    project.head = id;
-    project.updated = manifest.timestamp;
-    await writeProjectManifest(projectDir, project);
+  // S3-B ticket B6: the receipt is built HERE, not by the caller, because
+  // `editorRevision`/`sourceRevision` need the id THIS call just claimed as
+  // the new `head` — a caller could not have computed them beforehand.
+  let receipt: EditorReceipt | undefined;
+  if (opts?.editor) {
+    const sourceRevision = computeSourceRevision(id, content, input.params);
+    const sidecarDigest = sidecarCapture.descriptor.sha256;
+    receipt = opts.editor.buildReceipt({
+      snapshotId: id,
+      sourceRevision,
+      sidecarDigest,
+      editorRevision: computeEditorRevision(sourceRevision, sidecarDigest)
+    });
   }
 
-  return manifest;
+  return {
+    transactionId,
+    root: {
+      model: content,
+      params: paramsFile,
+      // Staged unconditionally now (F1 fix): `publishRootFileIdempotent`
+      // skips the actual write when the target already matches this exact
+      // digest, so re-staging byte-identical bytes on an ordinary
+      // (non-sidecar-changing) snapshot is a harmless no-op at publish time
+      // -- the alternative (staging it only sometimes) is what produced the
+      // separate-transaction defect this fix closes.
+      sidecar: sidecarCapture.bytes,
+      ...(updatedProject ? { project: updatedProject } : {})
+    },
+    snapshot: {
+      id,
+      manifest,
+      model: content,
+      params: paramsFile,
+      message: input.message ?? "",
+      diff: diffPatch,
+      validation: validationJson,
+      sidecar: sidecarCapture.bytes,
+      renders: renderEntries
+    },
+    ...(opts?.editor ? { receipt, claim: opts.editor.claim, accepted: opts.editor.accepted } : {})
+  };
 }
 
+/**
+ * Reads a snapshot's `manifest.json`, merging in any post-creation
+ * enrichment (`derived.ts`). Distinguishes the snapshot not existing
+ * (`SNAPSHOT_NOT_FOUND`) from `manifest.json` existing but being unparseable
+ * (`INTERNAL_ERROR`, Issue #73 AC7) — the pre-#73 code folded corruption
+ * into "not found", which is how the head snapshot's route
+ * (`apps/server`'s `headSnapshot`) used to render real corruption as
+ * "this project simply has no head yet".
+ */
 export async function readSnapshotManifest(projectDir: string, id: SnapshotId): Promise<SnapshotManifest> {
+  return withRecoveredProject(projectDir, (ctx) => readSnapshotManifestLocked(ctx, id));
+}
+
+/** `ctx`-taking sibling of {@link readSnapshotManifest}. */
+export async function readSnapshotManifestLocked(ctx: LockedProject, id: SnapshotId): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const raw = await readFile(join(snapshotDir(projectDir, id), PROJECT_LAYOUT.snapshot.manifestFile), "utf8").catch(
-        (err) => {
-          throw new ScadForgeError("SNAPSHOT_NOT_FOUND", `snapshot '${id}' not found in '${projectDir}'`, {
-            cause: err
-          });
-        }
-      );
-      const manifest = JSON.parse(raw) as SnapshotManifest;
+      const manifestPath = join(snapshotDir(ctx.projectDir, id), PROJECT_LAYOUT.snapshot.manifestFile);
+      let raw: string;
+      try {
+        raw = await readFile(manifestPath, "utf8");
+      } catch (err) {
+        throw new ScadForgeError("SNAPSHOT_NOT_FOUND", `snapshot '${id}' not found in '${ctx.projectDir}'`, {
+          cause: err
+        });
+      }
+      let manifest: SnapshotManifest;
+      try {
+        manifest = JSON.parse(raw) as SnapshotManifest;
+      } catch (err) {
+        throw new ScadForgeError("INTERNAL_ERROR", `snapshot '${id}' manifest at '${manifestPath}' is corrupt`, {
+          cause: err
+        });
+      }
 
       // `history/<id>/manifest.json` itself is written exactly once, at
       // creation, and never opened for writing again (Issue #45). Renders and
@@ -443,15 +756,15 @@ export async function readSnapshotManifest(projectDir: string, id: SnapshotId): 
       // LEGACY PROJECTS (predate this fix): the pre-fix code wrote renders/
       // validation directly into `manifest.json` itself, so `manifest` (just
       // parsed above) ALREADY carries them for such a snapshot. There is no
-      // `derived/<id>/` tree for it, so `readDerivedEnrichment` returns both
-      // fields `null` and the `if` guards below leave the legacy data in
-      // `manifest.renders`/`manifest.validation` completely untouched --
+      // `derived/<id>/` tree for it, so `readDerivedEnrichmentLocked` returns
+      // both fields `null` and the `if` guards below leave the legacy data
+      // in `manifest.renders`/`manifest.validation` completely untouched --
       // manifest-level reads need no fallback. Only the PHYSICAL BYTES (the
       // PNG/`validation.json` a render/validation entry points at) can still
       // be missing from `derived/`, which is what `resolveSnapshotRenderPath`
       // / `resolveSnapshotValidationPath` (`attachments.ts`) fall back to
       // `history/<id>/` for.
-      const derived = await readDerivedEnrichment(projectDir, id);
+      const derived = await readDerivedEnrichmentLocked(ctx, id);
       if (derived.renders !== null) manifest.renders = derived.renders;
       if (derived.validation !== null) {
         manifest.validation = derived.validation;
@@ -464,11 +777,28 @@ export async function readSnapshotManifest(projectDir: string, id: SnapshotId): 
   );
 }
 
-/** Lists every snapshot manifest, oldest first. */
+/**
+ * Lists every snapshot manifest, oldest first. A directory with NO
+ * `manifest.json` at all is not (yet) a snapshot — an abandoned
+ * `claimNextSnapshotId` reservation a crash left behind before any staging
+ * transaction started, which `recover()` cannot discover on its own (no
+ * transaction is linked to it — Issue #90 correction C2) — and is skipped
+ * rather than failing the listing; the NEXT writer either reclaims the same
+ * id (Issue #28) or moves past it. A directory whose `manifest.json` EXISTS
+ * but is unparseable is genuine corruption and still fails the WHOLE
+ * listing, naming the offending id — never a silent skip (Issue #73 AC8): a
+ * caller that got a shorter-than-expected list before had no way to know a
+ * snapshot was missing versus simply created later.
+ */
 export async function listSnapshots(projectDir: string): Promise<SnapshotManifest[]> {
+  return withRecoveredProject(projectDir, (ctx) => listSnapshotsLocked(ctx));
+}
+
+/** `ctx`-taking sibling of {@link listSnapshots}. */
+export async function listSnapshotsLocked(ctx: LockedProject): Promise<SnapshotManifest[]> {
   return withTypedError(
     async () => {
-      const dir = historyDir(projectDir);
+      const dir = historyDir(ctx.projectDir);
       let entries: string[];
       try {
         entries = (await readdir(dir, { withFileTypes: true }))
@@ -476,16 +806,31 @@ export async function listSnapshots(projectDir: string): Promise<SnapshotManifes
           .map((e) => e.name)
           .sort();
       } catch (err) {
-        throw new ScadForgeError("PROJECT_NOT_FOUND", `project history not found at '${projectDir}'`, { cause: err });
+        throw new ScadForgeError("PROJECT_NOT_FOUND", `project history not found at '${ctx.projectDir}'`, { cause: err });
       }
       const manifests: SnapshotManifest[] = [];
       for (const id of entries) {
-        manifests.push(await readSnapshotManifest(projectDir, id));
+        try {
+          manifests.push(await readSnapshotManifestLocked(ctx, id));
+        } catch (err) {
+          // See this function's own doc comment (Issue #90 correction C2):
+          // no manifest.json at all -> not yet a snapshot, skip; anything
+          // else (a manifest.json that exists but fails to parse) is
+          // genuine corruption and still fails the whole listing.
+          if (ScadForgeError.is(err) && err.error_code === "SNAPSHOT_NOT_FOUND") continue;
+          throw new ScadForgeError(
+            "INTERNAL_ERROR",
+            `failed to list snapshots in '${ctx.projectDir}': snapshot '${id}' is unreadable (${
+              err instanceof Error ? err.message : String(err)
+            })`,
+            { cause: err }
+          );
+        }
       }
       return manifests;
     },
     "PROJECT_NOT_FOUND",
-    `failed to list snapshots in '${projectDir}'`
+    `failed to list snapshots in '${ctx.projectDir}'`
   );
 }
 
@@ -498,10 +843,11 @@ export async function listSnapshots(projectDir: string): Promise<SnapshotManifes
  * A revert REPLACES root `params.json` wholesale with `targetId`'s own full
  * bag (never a merge onto "current" — that's what makes it a revert), so it
  * cannot go through `mergeParamsAtomic` (whose whole point is merging new
- * values ONTO current). It still needs the SAME params lock (Issue #44): a
- * revert's `createSnapshot` call also writes root `params.json`/`model.scad`/
- * `project.json`, and without the lock it could interleave with a concurrent
- * `set_params`/params-update's own read-merge-write of the same files.
+ * values ONTO current). It still needs the SAME recovery boundary (Issue
+ * #44/#73): a revert's `createSnapshotLocked` call also writes root
+ * `params.json`/`model.scad`/`project.json`, and without the shared lock it
+ * could interleave with a concurrent `set_params`/params-update's own
+ * read-merge-write of the same files.
  */
 export interface RevertToSnapshotOptions {
   /** Rebuilds render URLs for the newly-created snapshot id. */
@@ -513,77 +859,126 @@ export async function revertToSnapshot(
   targetId: SnapshotId,
   options: RevertToSnapshotOptions = {}
 ): Promise<SnapshotManifest> {
+  return withRecoveredProject(projectDir, (ctx) => revertToSnapshotLocked(ctx, targetId, options));
+}
+
+/** `ctx`-taking sibling of {@link revertToSnapshot}. */
+export async function revertToSnapshotLocked(
+  ctx: LockedProject,
+  targetId: SnapshotId,
+  options: RevertToSnapshotOptions = {}
+): Promise<SnapshotManifest> {
   return withTypedError(
     async () => {
-      const target = await readSnapshotManifest(projectDir, targetId);
+      const target = await readSnapshotManifestLocked(ctx, targetId);
       const modelContent = await readFile(
-        join(snapshotDir(projectDir, targetId), target.files.model_scad),
+        join(snapshotDir(ctx.projectDir, targetId), target.files.model_scad),
         "utf8"
       );
-      const paramsRaw = await readFile(join(snapshotDir(projectDir, targetId), target.files.params_json), "utf8");
+      const paramsRaw = await readFile(join(snapshotDir(ctx.projectDir, targetId), target.files.params_json), "utf8");
       const paramsFile = JSON.parse(paramsRaw) as ParamsFile;
       const params = (paramsFile.parameterSets[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
 
-      return withParamsLock(projectDir, async () => {
-        // Resolve read locations before creating the new snapshot. Each
-        // resolver checks the post-creation `derived/` tree first and then
-        // the legacy `history/` location, so both project shapes restore.
-        // Missing artifacts are ordinary: a snapshot may never have been
-        // rendered or validated, and a stale legacy pointer must not make the
-        // model/params revert fail.
-        const renderSources = (
-          await Promise.all(
-            target.renders.map(async (render) => {
-              const sourcePath = await resolveSnapshotRenderPath(projectDir, targetId, render.view);
-              return sourcePath ? { render, sourcePath } : null;
-            })
-          )
-        ).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-        const validationSource = target.validation
-          ? await resolveSnapshotValidationPath(projectDir, targetId)
-          : null;
-        const meshSource = await resolveSnapshotMeshPath(projectDir, targetId);
+      // editor.json (S3-B B3, Issue #87): the target's EXACT canonical
+      // sidecar bytes are copied forward as the new ROOT sidecar -- never
+      // merged with whatever the current root sidecar has (mirrors how
+      // model.scad/params.json are wholesale-replaced, never merged, on
+      // revert). A pre-S3 target yields the canonical empty sidecar. Refuses
+      // when either the target's OWN captured sidecar, or the CURRENT root
+      // sidecar this overwrites, is corrupt -- never silently drop/repair
+      // either side.
+      //
+      // S3-B ticket B6 (Issue #98 F1 fix, PR #103): this used to write the
+      // root sidecar via its OWN separate `writeSidecarBytesLocked`
+      // transaction, BEFORE `createSnapshotLocked` below -- so a crash
+      // between the two left a MIXED ROOT (the target's sidecar published
+      // next to the OLD model.scad/params.json, no new snapshot at all).
+      // The target's sidecar is now passed through `createSnapshotLocked`'s
+      // `opts.sidecar`, staged and published as part of the SAME transaction
+      // as the snapshot -- the current-root corruption check that
+      // `writeSidecarBytesLocked` used to perform internally is replicated
+      // here instead, still BEFORE anything is staged.
+      const targetSidecar = await readSnapshotSidecarLocked(ctx, targetId);
+      if (targetSidecar.status === "corrupt") throw targetSidecar.error;
+      const currentSidecar = await readSidecarLocked(ctx);
+      if (currentSidecar.status === "corrupt" || currentSidecar.status === "unsupported-version") {
+        throw new ScadForgeError(
+          "INTERNAL_ERROR",
+          `refusing to revert: current root sidecar at '${sidecarPath(ctx.projectDir)}' is ${currentSidecar.status}` +
+            (currentSidecar.error ? ` (${currentSidecar.error.message})` : "") +
+            "; quarantine the file first, then retry"
+        );
+      }
+      // A still-legacy project reverting (to ANY target, including a pre-S3
+      // one) becomes modern going forward -- matches
+      // `captureSidecarForSnapshotLocked`'s own "legacy-empty -> flip" rule.
+      const revertMarkerFlip = currentSidecar.status === "legacy-empty";
 
-        const reverted = await createSnapshot(projectDir, {
+      // Resolve read locations before creating the new snapshot. Each
+      // resolver checks the post-creation `derived/` tree first and then
+      // the legacy `history/` location, so both project shapes restore.
+      // Missing artifacts are ordinary: a snapshot may never have been
+      // rendered or validated, and a stale legacy pointer must not make the
+      // model/params revert fail. Immutable file resolution, unlike the
+      // manifest read above, deliberately stays outside the boundary's
+      // concern (see `attachments.ts`'s resolvers) -- it is read-only
+      // against already-committed, write-once bytes.
+      const renderSources = (
+        await Promise.all(
+          target.renders.map(async (render) => {
+            const sourcePath = await resolveSnapshotRenderPath(ctx.projectDir, targetId, render.view);
+            return sourcePath ? { render, sourcePath } : null;
+          })
+        )
+      ).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+      const validationSource = target.validation
+        ? await resolveSnapshotValidationPath(ctx.projectDir, targetId)
+        : null;
+      const meshSource = await resolveSnapshotMeshPath(ctx.projectDir, targetId);
+
+      const reverted = await createSnapshotLocked(
+        ctx,
+        {
           content: modelContent,
           params,
           message: `Revert to ${targetId}`,
           origin: "revert",
           pass: null
-        });
+        },
+        { sidecar: targetSidecar.sidecar, markerFlip: revertMarkerFlip }
+      );
 
-        if (renderSources.length > 0) {
-          await attachRendersToSnapshot(
-            projectDir,
-            reverted.id,
-            renderSources.map(({ render, sourcePath }) => ({
-              view: render.view,
-              sourcePath,
-              render_ms: render.render_ms,
-              width: render.width,
-              height: render.height
-            })),
-            { buildRenderUrl: options.buildRenderUrl }
-          );
-        }
+      if (renderSources.length > 0) {
+        await attachRendersToSnapshotLocked(
+          ctx,
+          reverted.id,
+          renderSources.map(({ render, sourcePath }) => ({
+            view: render.view,
+            sourcePath,
+            render_ms: render.render_ms,
+            width: render.width,
+            height: render.height
+          })),
+          { buildRenderUrl: options.buildRenderUrl }
+        );
+      }
 
-        if (validationSource && target.validation) {
-          const report = JSON.parse(await readFile(validationSource, "utf8")) as ValidationReport;
-          await writeDerivedValidation(projectDir, reverted.id, report, target.validation);
-        }
+      if (validationSource && target.validation) {
+        const report = JSON.parse(await readFile(validationSource, "utf8")) as ValidationReport;
+        await writeDerivedValidationLocked(ctx, reverted.id, report, target.validation);
+      }
 
-        if (meshSource) {
-          const destination = snapshotMeshPath(projectDir, reverted.id);
-          await mkdir(dirname(destination), { recursive: true });
-          await copyFile(meshSource, destination);
-        }
+      if (meshSource) {
+        const destination = snapshotMeshPath(ctx.projectDir, reverted.id);
+        await mkdir(dirname(destination), { recursive: true });
+        await copyFile(meshSource, destination);
+      }
 
-        // Re-read through the normal merge surface so the caller immediately
-        // receives the restored render refs and validation summary. The raw
-        // `history/<new-id>/manifest.json` remains the immutable creation
-        // record; all copied enrichment lives under `derived/<new-id>/`.
-        return readSnapshotManifest(projectDir, reverted.id);
-      });
+      // Re-read through the normal merge surface so the caller immediately
+      // receives the restored render refs and validation summary. The raw
+      // `history/<new-id>/manifest.json` remains the immutable creation
+      // record; all copied enrichment lives under `derived/<new-id>/`.
+      return readSnapshotManifestLocked(ctx, reverted.id);
     },
     "SNAPSHOT_NOT_FOUND",
     `failed to revert to snapshot '${targetId}'`
@@ -592,8 +987,20 @@ export async function revertToSnapshot(
 
 // ── exports/ ledger (append-only list of ExportRecord written alongside files) ──
 
-/** Appends one export record. `.scadforge/exports/index.json` is a plain array; not part of the frozen contract's own file list, but a reasonable v1 ledger for a directory that otherwise only holds files. */
-export async function recordExport(projectDir: string, record: ExportRecord): Promise<void> {
+/**
+ * Appends one export record. Uses its OWN `exports.lock` (Issue #48),
+ * deliberately a SEPARATE lock resource from the project's params lock/
+ * recovery boundary above: the exports ledger is not part of the project's
+ * mutable root/history state the boundary protects, so this may run either
+ * inside or outside an active `withRecoveredProject` call without tripping
+ * its non-reentrancy guard (which only watches nested `withRecoveredProject`
+ * calls, not this module's own `withFileLock`).
+ *
+ * `maxWaitMs` (default `FILE_LOCK_MAX_WAIT_MS` via `withFileLock`) is an
+ * optional override of the exports lock's wall-clock give-up budget --
+ * additive, for tests only (Issue #115); production callers never pass it.
+ */
+export async function recordExport(projectDir: string, record: ExportRecord, maxWaitMs?: number): Promise<void> {
   await withTypedError(
     async () => {
       const exportsDirectory = exportsDir(projectDir);
@@ -603,34 +1010,39 @@ export async function recordExport(projectDir: string, record: ExportRecord): Pr
       // read the SAME current array, each push only its own record, and
       // whichever `writeFile` lands last wins wholesale -- silently losing
       // the other's entry. Cross-process safe (see file-lock.ts).
-      await withFileLock(join(metaDir(projectDir), "exports.lock"), "exports", async () => {
-        let records: ExportRecord[];
-        try {
-          records = JSON.parse(await readFile(indexPath, "utf8"));
-          if (!Array.isArray(records)) throw new Error("ledger is valid JSON but not an array");
-        } catch (err) {
-          if (typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "ENOENT") {
-            records = []; // no ledger yet -- the normal first-export case
-          } else {
-            // A corrupt or partially-written ledger is DETECTED, never
-            // silently parsed as empty (that would overwrite it with a
-            // one-record array, both losing every prior entry and
-            // destroying the evidence). The bytes on disk are left
-            // untouched for inspection/repair.
-            throw new ScadForgeError(
-              "INTERNAL_ERROR",
-              `exports ledger '${indexPath}' is corrupt (${err instanceof Error ? err.message : String(err)}) -- refusing to append; inspect or repair the file manually`
-            );
+      await withFileLock(
+        join(metaDir(projectDir), "exports.lock"),
+        "exports",
+        async () => {
+          let records: ExportRecord[];
+          try {
+            records = JSON.parse(await readFile(indexPath, "utf8"));
+            if (!Array.isArray(records)) throw new Error("ledger is valid JSON but not an array");
+          } catch (err) {
+            if (typeof err === "object" && err !== null && "code" in err && (err as { code?: unknown }).code === "ENOENT") {
+              records = []; // no ledger yet -- the normal first-export case
+            } else {
+              // A corrupt or partially-written ledger is DETECTED, never
+              // silently parsed as empty (that would overwrite it with a
+              // one-record array, both losing every prior entry and
+              // destroying the evidence). The bytes on disk are left
+              // untouched for inspection/repair.
+              throw new ScadForgeError(
+                "INTERNAL_ERROR",
+                `exports ledger '${indexPath}' is corrupt (${err instanceof Error ? err.message : String(err)}) -- refusing to append; inspect or repair the file manually`
+              );
+            }
           }
-        }
-        records.push(record);
-        // Atomic replace: a reader never sees a half-written ledger, and a
-        // crash mid-write leaves the previous complete version in place.
-        await mkdir(exportsDirectory, { recursive: true });
-        const tmpPath = `${indexPath}.tmp`;
-        await writeFile(tmpPath, JSON.stringify(records, null, 2), "utf8");
-        await rename(tmpPath, indexPath);
-      });
+          records.push(record);
+          // Atomic replace: a reader never sees a half-written ledger, and a
+          // crash mid-write leaves the previous complete version in place.
+          await mkdir(exportsDirectory, { recursive: true });
+          const tmpPath = `${indexPath}.tmp`;
+          await writeFile(tmpPath, JSON.stringify(records, null, 2), "utf8");
+          await rename(tmpPath, indexPath);
+        },
+        maxWaitMs
+      );
     },
     "INTERNAL_ERROR",
     "failed to record export"
@@ -639,12 +1051,30 @@ export async function recordExport(projectDir: string, record: ExportRecord): Pr
 
 // ── params.json read-merge-write (Issue #44) ────────────────────────────────
 
-async function readRootParamsOrEmpty(projectDir: string): Promise<ParamValues> {
+/**
+ * Reads root `params.json`. Legacy absence (no root `params.json` yet, e.g.
+ * a pre-S3 project) is ordinary and yields `{}`; a `params.json` that exists
+ * but cannot be parsed is CORRUPT and must never be silently treated as `{}`
+ * (Issue #73 AC5) — the pre-#73 code folded both into `{}`, silently
+ * discarding a real (if corrupt) params file on the next write.
+ */
+async function readRootParamsOrEmptyLocked(ctx: LockedProject): Promise<ReadResult<ParamValues>> {
+  let raw: string;
   try {
-    const parsed = JSON.parse(await readFile(rootParamsPath(projectDir), "utf8")) as ParamsFile;
-    return (parsed.parameterSets?.[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues;
+    raw = await readFile(rootParamsPath(ctx.projectDir), "utf8");
   } catch {
-    return {};
+    return { kind: "absent" };
+  }
+  try {
+    const parsed = JSON.parse(raw) as ParamsFile;
+    return { kind: "present", value: (parsed.parameterSets?.[PARAMS_ACTIVE_PRESET] ?? {}) as ParamValues };
+  } catch (err) {
+    return {
+      kind: "corrupt",
+      error: new ScadForgeError("INTERNAL_ERROR", `root params.json at '${rootParamsPath(ctx.projectDir)}' is corrupt`, {
+        cause: err
+      })
+    };
   }
 }
 
@@ -652,43 +1082,74 @@ async function readRootParamsOrEmpty(projectDir: string): Promise<ParamValues> {
  * THE single choke point for every writer that needs to merge new values onto
  * the CURRENT root `params.json` — a standalone params-only update
  * (`snapshot:false`), a `set_params`-driven snapshot, or a plain `write_scad`
- * carrying params forward unchanged (`accepted: {}`). Acquires the params
- * lock (`params-lock.ts`), reads the CURRENT persisted values, computes
- * `merged = {...current, ...accepted}`, and calls `persist(merged)` — all
- * while still holding the lock, so `persist`'s own writes (whether
- * `createSnapshot`, which also touches root `params.json`/`model.scad`/
- * `project.json`, or a bare params-only write) can never race a concurrent
- * caller's read-merge-write of the SAME file (Issue #44: two updates to
- * DISJOINT keys must both survive, never a last-write-wins lost update).
+ * carrying params forward unchanged (`accepted: {}`). Acquires the recovery
+ * boundary, reads the CURRENT persisted values (failing `INTERNAL_ERROR` on
+ * corruption rather than silently merging onto `{}` -- Issue #73 AC5), and
+ * calls `persist(merged, ctx)` — all while still holding the lock, so
+ * `persist`'s own writes can never race a concurrent caller's read-merge
+ * -write of the SAME file (Issue #44: two updates to DISJOINT keys must both
+ * survive, never a last-write-wins lost update).
  *
- * `persist` must not itself call `mergeParamsAtomic`/acquire the params lock
- * (the lock is not reentrant) — pass it the pre-fetched Customizer schema
- * validation result (`accepted`/`rejected`) computed BEFORE calling this, so
- * the only work done while holding the lock is filesystem I/O (keeps lock
- * hold time short — rapid successive writes, e.g. a slider drag, must not
- * degrade per Issue #44's AC).
+ * `persist` receives the SAME `ctx` this call is already holding and must
+ * use it (e.g. `createSnapshotLocked(ctx, ...)`) rather than any exported
+ * delegator — calling one of those would re-enter the boundary and throw
+ * immediately (Issue #73's non-reentrancy guard, `recovered.ts`). Keep
+ * `persist` to filesystem I/O only — anything slow (an OpenSCAD subprocess
+ * call to fetch the live Customizer schema, say) should run BEFORE calling
+ * this, so rapid successive writes (a slider-drag pattern) never degrade
+ * into a long lock-held chain, and a crashed holder cannot wedge every other
+ * writer for long either.
  */
 export async function mergeParamsAtomic<T>(
   projectDir: string,
   accepted: ParamValues,
-  persist: (merged: ParamValues) => Promise<T>
+  persist: (merged: ParamValues, ctx: LockedProject) => Promise<T>
 ): Promise<T> {
+  return withRecoveredProject(projectDir, async (ctx) => {
+    const currentRead = await readRootParamsOrEmptyLocked(ctx);
+    if (currentRead.kind === "corrupt") throw currentRead.error;
+    const current = currentRead.kind === "present" ? currentRead.value : {};
+    const merged = { ...current, ...accepted };
+    return persist(merged, ctx);
+  });
+}
+
+// ── snapshot-free root params write (S3-B ticket B4) ────────────────────────
+
+/**
+ * Writes the project's root `params.json` WITHOUT creating a snapshot — the
+ * `snapshot: false` path of `PUT /api/projects/:id/params`, staged through
+ * its own transaction (stage → decide → publish, `transaction.ts`) so a
+ * crash mid-write is recoverable exactly like every other root writer.
+ * Replaces `apps/server`'s former bare `writeRootParamsLocked` (Issue #90:
+ * "a snapshot-free params write stages the affected root document[] ...
+ * never reconstructing from the old head" — this stages ONLY `params.json`,
+ * touching root `model.scad`/`editor.json`/`project.json` not at all).
+ *
+ * Takes `ctx` (Issue #73): this is a root-state write, so it must run inside
+ * an active recovery boundary — its only caller (`scad-core-impl.ts`'s
+ * `updateParams`) already holds one via `mergeParamsAtomic`'s `persist`
+ * callback.
+ */
+export async function updateRootParamsLocked(ctx: LockedProject, params: ParamValues): Promise<void> {
   return withTypedError(
-    () =>
-      withParamsLock(projectDir, async () => {
-        const current = await readRootParamsOrEmpty(projectDir);
-        const merged = { ...current, ...accepted };
-        return persist(merged);
-      }),
+    async () => {
+      const transactionId = randomUUID();
+      try {
+        const paramsFile: ParamsFile = {
+          fileFormatVersion: PARAMS_FILE_FORMAT_VERSION,
+          parameterSets: { [PARAMS_ACTIVE_PRESET]: params }
+        };
+        const intent: TransactionIntent = { transactionId, root: { params: paramsFile } };
+        const staged = await stageTransactionLocked(ctx, intent);
+        const decided = await decideLocked(ctx, staged);
+        await publishLocked(ctx, decided);
+      } catch (err) {
+        await reconcileTransactionLocked(ctx, transactionId).catch(() => {});
+        throw err;
+      }
+    },
     "INTERNAL_ERROR",
     "failed to update params"
   );
-}
-
-async function readProjectManifestOrNull(projectDir: string): Promise<ProjectManifest | null> {
-  try {
-    return await readProjectManifest(projectDir);
-  } catch {
-    return null;
-  }
 }

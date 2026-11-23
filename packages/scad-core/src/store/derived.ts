@@ -28,6 +28,7 @@ import { join } from "node:path";
 import type { RenderRef, SnapshotId, ValidationSummary } from "@scadforge/protocol";
 import type { ValidationReport } from "../types.js";
 import { metaDir } from "./paths.js";
+import type { LockedProject } from "./recovered.js";
 
 /** `.scadforge/derived/` — sibling to `history/`, holds mutable post-creation enrichment. */
 export function derivedDir(projectDir: string): string {
@@ -74,9 +75,20 @@ async function readJsonOrNull<T>(path: string): Promise<T | null> {
   }
 }
 
-/** Reads whatever derived enrichment currently exists for `id` (both fields null when none has ever been attached). */
-export async function readDerivedEnrichment(projectDir: string, id: SnapshotId): Promise<DerivedEnrichment> {
-  const dir = snapshotDerivedDir(projectDir, id);
+/**
+ * Reads whatever derived enrichment currently exists for `id` (both fields
+ * null when none has ever been attached). Takes `ctx` — a `LockedProject` —
+ * rather than a bare `projectDir`: derived enrichment is written during the
+ * same mutable-attachment step `attachments.ts`'s locked writers perform
+ * under the recovery boundary, so every reader of it is expected to already
+ * hold one, keeping the read coherent with whatever attach just committed.
+ * A torn/unreadable index (`readJsonOrNull`) is treated as "never
+ * attached", not corruption: it is regenerated wholesale on the next
+ * attach, and unlike root `params.json`/`project.json` nothing is ever
+ * merged onto it, so there is no silent-loss risk in falling back to null.
+ */
+export async function readDerivedEnrichmentLocked(ctx: LockedProject, id: SnapshotId): Promise<DerivedEnrichment> {
+  const dir = snapshotDerivedDir(ctx.projectDir, id);
   const [renders, validation] = await Promise.all([
     readJsonOrNull<RenderRef[]>(join(dir, RENDERS_INDEX_FILE)),
     readJsonOrNull<ValidationSummary>(join(dir, VALIDATION_SUMMARY_FILE))
@@ -84,21 +96,21 @@ export async function readDerivedEnrichment(projectDir: string, id: SnapshotId):
   return { renders, validation };
 }
 
-/** Overwrites the derived render index for `id` — the upsert-by-view merge is the caller's job. */
-export async function writeDerivedRenders(projectDir: string, id: SnapshotId, renders: readonly RenderRef[]): Promise<void> {
-  const dir = snapshotDerivedDir(projectDir, id);
+/** Overwrites the derived render index for `id` — the upsert-by-view merge is the caller's job. See {@link readDerivedEnrichmentLocked} for why this takes `ctx`. */
+export async function writeDerivedRendersLocked(ctx: LockedProject, id: SnapshotId, renders: readonly RenderRef[]): Promise<void> {
+  const dir = snapshotDerivedDir(ctx.projectDir, id);
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, RENDERS_INDEX_FILE), JSON.stringify(renders, null, 2), "utf8");
 }
 
-/** Overwrites the derived validation record (verbatim report + summary) for `id`. */
-export async function writeDerivedValidation(
-  projectDir: string,
+/** Overwrites the derived validation record (verbatim report + summary) for `id`. See {@link readDerivedEnrichmentLocked} for why this takes `ctx`. */
+export async function writeDerivedValidationLocked(
+  ctx: LockedProject,
   id: SnapshotId,
   report: ValidationReport,
   summary: ValidationSummary
 ): Promise<void> {
-  const dir = snapshotDerivedDir(projectDir, id);
+  const dir = snapshotDerivedDir(ctx.projectDir, id);
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, VALIDATION_REPORT_FILE), JSON.stringify(report, null, 2), "utf8");
   await writeFile(join(dir, VALIDATION_SUMMARY_FILE), JSON.stringify(summary, null, 2), "utf8");

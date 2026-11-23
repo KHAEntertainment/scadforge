@@ -60,6 +60,16 @@ describe("buildSystemPrompt — Issue #16 AC checklist", () => {
     expect(prompt).toMatch(/Stopping early is\s+correct behaviour/);
   });
 
+  it("covers editor feature referenceability (Issue #92 / S3-B ticket B7)", () => {
+    expect(prompt).toMatch(/EDITOR FEATURE REFERENCES/);
+    expect(prompt).toMatch(/featureId/);
+    expect(prompt).toMatch(/editorRevision/);
+    expect(prompt).toMatch(/never by a label, a position in the list/i);
+    expect(prompt).toMatch(/DESCRIPTIVE, not permission/);
+    expect(prompt).toMatch(/"ready" or "legacy-empty"/);
+    expect(prompt).toMatch(/referenceability, not write authority/i);
+  });
+
   it("states the pass budget and the no-code-in-chat output contract", () => {
     expect(prompt).toContain(`${DEFAULT_MAX_PASSES} write_scad calls per turn`);
     expect(prompt).toContain("SCADFORGE_MAX_PASSES");

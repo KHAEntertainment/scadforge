@@ -67,6 +67,13 @@ const HEX64_D = HEX64(4);
 
 const ISO_NOW = "2026-09-12T00:00:00.000Z";
 
+// `projectId` accepts the same safe-id rule the server enforces on every
+// route (`isSafeId` in `apps/server/src/services/validation.ts`), not a UUID
+// (contract-change Issue #93). UUID-shaped ids also satisfy the rule, so
+// existing UUID fixtures (`UUID_B` above) stay valid without change.
+const VALID_PROJECT_IDS = ["hinged-box", "my-bracket-2", "Project.v1_2", UUID_B];
+const INVALID_PROJECT_IDS = ["", ".", "..", "a..b", "a/b", "a\\b", "a".repeat(129), "a b", "é"];
+
 function makeFeature(overrides: Partial<EditorFeature> = {}): EditorFeature {
   return {
     featureId: UUID_A,
@@ -191,6 +198,20 @@ describe("parseEditorSidecar", () => {
   it("rejects a featureId that is not a UUID", () => {
     const result = safeParseEditorSidecar(
       makeSidecar([makeFeature({ featureId: "not-a-uuid" })])
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it("accepts a slug projectId on a feature", () => {
+    const result = safeParseEditorSidecar(
+      makeSidecar([makeFeature({ projectId: "hinged-box" })])
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects a feature projectId that violates the safe-id rule", () => {
+    const result = safeParseEditorSidecar(
+      makeSidecar([makeFeature({ projectId: "a/b" })])
     );
     expect(result.ok).toBe(false);
   });
@@ -341,8 +362,13 @@ describe("parseEditorDocument", () => {
     expect(parsed.head).toBeNull();
   });
 
-  it("rejects a non-UUID projectId", () => {
-    const result = safeParseEditorDocument(makeDocument({ projectId: "nope" }));
+  it.each(VALID_PROJECT_IDS)("accepts a well-formed project id %j", (id) => {
+    const result = safeParseEditorDocument(makeDocument({ projectId: id }));
+    expect(result.ok).toBe(true);
+  });
+
+  it.each(INVALID_PROJECT_IDS)("rejects an invalid project id %j", (id) => {
+    const result = safeParseEditorDocument(makeDocument({ projectId: id }));
     expect(result.ok).toBe(false);
   });
 
@@ -585,6 +611,17 @@ describe("parseEditorReceipt", () => {
     const result = safeParseEditorReceipt({ ...good, snapshotId: "" });
     expect(result.ok).toBe(false);
   });
+
+  it("accepts a slug projectId", () => {
+    expect(parseEditorReceipt({ ...good, projectId: "hinged-box" }).projectId).toBe(
+      "hinged-box"
+    );
+  });
+
+  it("rejects a projectId that violates the safe-id rule", () => {
+    const result = safeParseEditorReceipt({ ...good, projectId: ".." });
+    expect(result.ok).toBe(false);
+  });
 });
 
 describe("parseEditorOperationResponse", () => {
@@ -713,8 +750,13 @@ describe("parseAgentEditorContext", () => {
     expect(result.ok).toBe(false);
   });
 
-  it("rejects a non-UUID projectId", () => {
-    const result = safeParseAgentEditorContext(makeContext({ projectId: "nope" }));
+  it.each(VALID_PROJECT_IDS)("accepts a well-formed project id %j", (id) => {
+    const result = safeParseAgentEditorContext(makeContext({ projectId: id }));
+    expect(result.ok).toBe(true);
+  });
+
+  it.each(INVALID_PROJECT_IDS)("rejects an invalid project id %j", (id) => {
+    const result = safeParseAgentEditorContext(makeContext({ projectId: id }));
     expect(result.ok).toBe(false);
   });
 });
@@ -766,7 +808,7 @@ describe("EditorProtocolError", () => {
   });
 
   it("rejects a clearly-wrong wire payload with a precise path", () => {
-    const result = safeParseEditorDocument({ version: 1, projectId: "nope" });
+    const result = safeParseEditorDocument({ version: 1, projectId: ".." });
     if (result.ok) throw new Error("expected failure");
     expect(result.error.path).toBe("EditorDocument.projectId");
   });

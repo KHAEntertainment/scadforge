@@ -26,6 +26,19 @@ export function isViewName(value: string | undefined | null): value is ViewName 
   return typeof value === "string" && (VIEW_NAMES as readonly string[]).includes(value);
 }
 
+/**
+ * A UUID path segment (S3-B ticket B6: `GET .../editor/operations/:operationId`
+ * validates this itself, before the request ever reaches `ScadCoreApi` —
+ * `operationId`/`proofId`/`featureId` are server/client-minted UUIDs per the
+ * wire-and-recovery contract, unlike `projectId`, which is a slug). Same
+ * pattern `@scadforge/protocol`'s own (private) `expectUuid` uses.
+ */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isUuid(id: string | undefined | null): id is string {
+  return typeof id === "string" && UUID_PATTERN.test(id);
+}
+
 /** Non-empty, trimmed string check for required text fields. */
 export function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
