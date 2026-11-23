@@ -322,37 +322,43 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
   };
 
   // ── chat signals (comment 1 item 3) ────────────────────────────────────
-  const chatSeenRef = useRef<{ kinds: Map<string, ChatItem["kind"]>; lost: Set<string> }>({ kinds: new Map(), lost: new Set() });
+  // A terminal item is keyed `turnId:kind`. Every key not seen before in this
+  // page's life raises `chat-turn-ended` once, whether or not the turn's
+  // `turn_running` item was ever rendered: a fast turn's start, write and done
+  // can arrive in one render. Keys present before activation are recorded
+  // without raising (the first read happens on activation anyway).
+  const chatSeenRef = useRef<{ lost: Set<string>; terminal: Set<string> }>({ lost: new Set(), terminal: new Set() });
   useEffect(() => {
-    const kinds = new Map<string, ChatItem["kind"]>();
     const lost = new Set<string>();
+    const terminalTurns = new Set<string>();
+    const seen = chatSeenRef.current.terminal;
+    let fresh = false;
     for (const item of options.chatItems) {
       const turnId = "turnId" in item ? item.turnId : null;
       if (!turnId) continue;
-      if (item.kind === "turn_running" || item.kind === "connection_lost" || item.kind === "turn_status" || item.kind === "reconciled_status" || item.kind === "error") {
-        kinds.set(turnId, item.kind);
-      }
       if (item.kind === "connection_lost") lost.add(turnId);
+      if (item.kind === "turn_status" || item.kind === "reconciled_status" || item.kind === "error") {
+        terminalTurns.add(turnId);
+        const key = `${turnId}:${item.kind}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          fresh = true;
+        }
+      }
     }
-    const previous = chatSeenRef.current;
-    chatSeenRef.current = { kinds, lost };
+    const previousLost = chatSeenRef.current.lost;
+    chatSeenRef.current = { lost, terminal: seen };
     if (!activeRef.current) return;
     for (const turnId of lost) {
-      if (!previous.lost.has(turnId)) raise(() => cacheRef.current.invalidate("chat-stream-dropped"));
+      if (!previousLost.has(turnId)) raise(() => cacheRef.current.invalidate("chat-stream-dropped"));
     }
-    for (const turnId of previous.lost) {
-      if (lost.has(turnId)) continue;
-      if (kinds.get(turnId) === "reconciled_status") raise(() => cacheRef.current.invalidate("chat-turn-ended"));
+    for (const turnId of previousLost) {
       // Dismissed with the outcome unknown: re-read so the editor is never
       // stranded; a late agent write then surfaces as a revision conflict.
-      else raise(() => cacheRef.current.refresh());
+      // (Reconciled turns carry a terminal item and are handled below.)
+      if (!lost.has(turnId) && !terminalTurns.has(turnId)) raise(() => cacheRef.current.refresh());
     }
-    for (const [turnId, kind] of kinds) {
-      const before = previous.kinds.get(turnId);
-      if (before === "turn_running" && (kind === "turn_status" || kind === "error")) {
-        raise(() => cacheRef.current.invalidate("chat-turn-ended"));
-      }
-    }
+    if (fresh) raise(() => cacheRef.current.invalidate("chat-turn-ended"));
   }, [options.chatItems, raise]);
 
   // ── post-receipt step ──────────────────────────────────────────────────

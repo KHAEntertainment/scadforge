@@ -130,9 +130,16 @@ export class FakeEditorServer {
   afterCommit: ((projectId: string) => void) | null = null;
   /** The next GET /editor for these project ids answers 500. */
   readonly failEditorGet = new Set<string>();
+  /**
+   * When set, the next chat POST is a fast turn: the agent writes these values,
+   * then `turn_started` and `turn_done` arrive in ONE chunk (one render), and
+   * the stream closes. Cleared after use.
+   */
+  fastChat: { values: ParamValues } | null = null;
 
   private readonly holds = new Map<Route, Array<{ gate: Promise<void>; arrive: () => void }>>();
   private proofCounter = 0;
+  private turnCounter = 0;
   private snapshotCounter = 0;
   private chatController: ReadableStreamDefaultController<Uint8Array> | null = null;
 
@@ -448,11 +455,23 @@ export class FakeEditorServer {
 
   private chat(state: ProjectState): Response {
     const encoder = new TextEncoder();
+    this.turnCounter += 1;
+    const turnId = `turn-${this.turnCounter}`;
+    const fast = this.fastChat;
+    this.fastChat = null;
     const stream = new ReadableStream<Uint8Array>({
       start: (controller) => {
+        const started = { type: "turn_started", turn_id: turnId, project_id: state.id, max_passes: 2 };
+        const frame = (event: { type: string }) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+        if (fast) {
+          this.externalWrite(state.id, fast.values);
+          const done = { type: "turn_done", turn_id: turnId, status: "completed", passes_used: 1, summary: "Done.", usage: null };
+          controller.enqueue(encoder.encode(frame(started) + frame(done)));
+          controller.close();
+          return;
+        }
         this.chatController = controller;
-        const event = { type: "turn_started", turn_id: "turn-1", project_id: state.id, max_passes: 2 };
-        controller.enqueue(encoder.encode(`event: turn_started\ndata: ${JSON.stringify(event)}\n\n`));
+        controller.enqueue(encoder.encode(frame(started)));
       }
     });
     return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });

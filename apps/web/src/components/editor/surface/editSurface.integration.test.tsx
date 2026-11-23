@@ -593,6 +593,28 @@ describe("Edit surface — PR #140 fix batch 1", () => {
     expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
     expect(server.commitPosts.filter((post) => post.projectId === "p1")).toHaveLength(0);
   });
+
+  it("F5: a fast chat turn whose terminal item is the only one ever rendered still re-reads the editor", async () => {
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled());
+    const getsBefore = editorGets();
+
+    // The agent writes wall = 6; start, write and done arrive in one chunk.
+    server.fastChat = { values: { wall: 6 } };
+    fireEvent.click(screen.getByRole("tab", { name: /chat/i }));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "make it thicker" } });
+    fireEvent.submit(screen.getByLabelText("Message").closest("form")!);
+    await waitFor(() => expect(server.log).toContain("POST /projects/p1/chat"));
+
+    fireEvent.click(screen.getByRole("tab", { name: "Edit" }));
+    await waitFor(() => expect(wallInput().value).toBe("6"), { timeout: 3000 });
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."), { timeout: 3000 });
+    expect(editorGets()).toBeGreaterThan(getsBefore);
+    // The revision changed under the log: nothing of ours is left to undo.
+    expect(screen.getByRole("button", { name: "Undo" })).toBeDisabled();
+  });
 });
 
 async function saveWallWithoutWaiting(value: string): Promise<void> {
