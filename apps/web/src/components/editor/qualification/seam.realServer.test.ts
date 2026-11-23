@@ -53,11 +53,13 @@ import {
   createProject,
   createProjectsDir,
   disposeHost,
+  HOOK_TIMEOUT_MS,
   mintRemoveFeatureProof,
   readEditorDocument,
   readProjectHeadLockFree,
   seedSidecar,
   snapshotCountOf,
+  snapshotIdsOf,
   startServerChild,
   waitFor,
   type ChildTracker,
@@ -116,13 +118,23 @@ async function holdProjectLock(dir: string): Promise<HeldLock> {
   const done = withRecoveredProject(dir, async () => {
     markHeld();
     await releaseGate;
-  }).catch(() => undefined);
-  await held;
+  });
+  // A2: an acquisition failure must REJECT this wait, not hang it until the
+  // test's own timeout. The failure is also swallowed on the way out, so a
+  // late rejection is never an unhandled one.
+  const failure = done.then(
+    () => undefined,
+    (cause: unknown) => {
+      throw cause;
+    }
+  );
+  failure.catch(() => undefined);
+  await Promise.race([held, failure]);
   return {
     held,
     release: async () => {
       markReleased();
-      await done;
+      await done.catch(() => undefined);
     }
   };
 }
@@ -146,12 +158,12 @@ beforeEach(async () => {
   projects = await createProjectsDir();
   server = await startServerChild(tracker, projects.dir);
   wire = createInterceptedFetch();
-});
+}, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await tracker.killAll();
   await projects.cleanup();
-});
+}, HOOK_TIMEOUT_MS);
 
 describe("C5 real-server seam cases (criterion 2)", () => {
   it("integration_delayed_original_post_after_unclaimed_lookup_commits_once", async () => {
@@ -219,6 +231,18 @@ describe("C5 real-server seam cases (criterion 2)", () => {
         () => editorTraffic(wire).filter((call) => call.method === "POST" && call.status !== null).length >= 2,
         { description: "the held original POST to be answered", timeoutMs: 10_000 }
       );
+
+      // F4(b): the released ORIGINAL really answered 200 — not a 409, not a
+      // 500 — and its receipt is the SAME receipt the controller already
+      // had. The server replayed it for the same operation id.
+      const originalPost = editorTraffic(wire).filter((call) => call.method === "POST")[0];
+      expect(originalPost.status).toBe(200);
+      expect(originalPost.responseBody).toMatchObject({
+        operationId: result.receipt.operationId,
+        snapshotId: result.receipt.snapshotId,
+        editorRevision: result.receipt.editorRevision
+      });
+
       expect(await snapshotCountOf(project.dir)).toBe(before + 1);
     } finally {
       for (const hold of holds) hold.release();
@@ -331,10 +355,26 @@ describe("C5 real-server seam cases (criterion 2)", () => {
 
       // The first writer learns its receipt through the real poll and is
       // still `committing` — it waits for a coherent document read.
-      await waitFor(() => host.controller.state().kind === "committing", {
-        description: "the first writer to reach the committing state with its receipt",
-        timeoutMs: 20_000
-      });
+      //
+      // F3: `committing` is entered with `receipt: null` when the commit is
+      // SENT, so the state alone is not the receipt. Wait for the receipt
+      // itself, and for it to be THIS operation's receipt.
+      await waitFor(
+        () => {
+          const state = host.controller.state();
+          return (
+            state.kind === "committing" && state.receipt !== null && state.receipt.operationId === state.operationId
+          );
+        },
+        {
+          description: "the first writer to reach the committing state with ITS receipt",
+          timeoutMs: 20_000
+        }
+      );
+      const committing = host.controller.state();
+      if (committing.kind !== "committing") throw new Error("unreachable");
+      const firstReceipt = committing.receipt;
+      if (firstReceipt === null) throw new Error("unreachable");
 
       // A SECOND WRITER commits between that receipt and the first writer's
       // document read.
@@ -354,6 +394,14 @@ describe("C5 real-server seam cases (criterion 2)", () => {
       });
       expect(second.kind).toBe("committed");
       if (second.kind !== "committed") throw new Error("unreachable");
+
+      // The store shows BOTH snapshots, in order: the first writer's receipt
+      // snapshot first, the second writer's after it.
+      const snapshotIds = await snapshotIdsOf(project.dir);
+      const firstIndex = snapshotIds.indexOf(firstReceipt.snapshotId);
+      const secondIndex = snapshotIds.indexOf(second.receipt.snapshotId);
+      expect(firstIndex).toBeGreaterThanOrEqual(0);
+      expect(secondIndex).toBeGreaterThan(firstIndex);
 
       // The first writer's document read is superseded by the second writer's
       // commit: the read returns the NEWER revision.
@@ -445,8 +493,24 @@ describe("C5 real-server seam cases (criterion 2)", () => {
       expect(refused?.errorBody?.error_code).toBe("CONFLICT");
       expect(refused?.errorBody?.message).toContain("could not acquire the");
 
-      // The operation is still ambiguous and the controller is still polling.
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      // F4(c): positive evidence of CONTINUED polling after the refusal —
+      // at least two further real operations lookups. The controller's poll
+      // intervals are 500/1000/2000/4000/8000/15000 ms
+      // (`controller/backoff.ts`), and each lookup attempt is cut off by the
+      // client's 2 s attempt timeout, so the next two lookups land a few
+      // seconds and ~10 s after the refusal.
+      const operationLookups = () =>
+        editorTraffic(wire).filter(
+          (call) => call.method === "GET" && call.url.includes("/editor/operations/")
+        ).length;
+      const lookupsAtRefusal = operationLookups();
+      await waitFor(() => operationLookups() >= lookupsAtRefusal + 2, {
+        description: "two further operations lookups after the refused re-send",
+        timeoutMs: 30_000
+      });
+
+      // During that window nothing settled, no claim was ever reserved, and
+      // the store's head did not move.
       expect(settled).toBe(false);
       const state = host.controller.state();
       expect(state.kind).toBe("resolving");
