@@ -26,6 +26,10 @@ function makeClient(): ApiClient {
     preflightSource: vi.fn(),
     updateSource: vi.fn(),
     build: vi.fn(),
+    getEditorDocument: vi.fn(),
+    verifyEditorCommand: vi.fn(),
+    commitEditorCommand: vi.fn(),
+    getEditorOperation: vi.fn(),
     fetchExportFile: vi.fn(),
     resolveUrl: vi.fn((path: string) => `http://api.test${path}`),
     headRaw: vi.fn()

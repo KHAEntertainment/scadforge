@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it, vi } from "vitest";
+import { ERROR_CODES } from "@scadforge/protocol";
 import { ApiClientError, createApiClient } from "./apiClient.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -161,6 +162,198 @@ describe("apiClient params methods (Issue #33)", () => {
     await expect(client.updateParams("p1", { values: { wall: 99 } })).rejects.toMatchObject({
       error_code: "VALIDATION_FAILED",
       message: expect.stringContaining("above its max")
+    });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Editor methods (S3-C C1, Issue #134 criterion 1): strict parsing on every
+// response, frozen error codes surfaced as ApiClientError, and the commit
+// route's 200 parsed as a BARE EditorReceipt.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const HEX64 = "a".repeat(64);
+const SHA64 = "b".repeat(64);
+const UUID = "12345678-1234-4234-9234-123456789abc";
+const PROOF_UUID = "12345678-1234-4234-9234-123456789abd";
+const FEATURE_UUID = "12345678-1234-4234-9234-123456789abe";
+
+function editorDocumentBody() {
+  return {
+    version: 1,
+    projectId: "hinged-box",
+    head: null,
+    sourceRevision: HEX64,
+    sourceFingerprint: HEX64,
+    editorRevision: HEX64,
+    scad: "cube(10);",
+    parameters: [],
+    values: {},
+    sidecar: { version: 1, features: [] },
+    sidecarStatus: "ready",
+    eligibility: []
+  };
+}
+
+function editorProofBody() {
+  return {
+    version: 1,
+    proofId: PROOF_UUID,
+    commandDigest: SHA64,
+    baseEditorRevision: HEX64,
+    expiresAt: "2026-11-23T00:00:00.000Z"
+  };
+}
+
+function editorReceiptBody() {
+  return {
+    version: 1,
+    projectId: "hinged-box",
+    operationId: UUID,
+    requestDigest: SHA64,
+    baseEditorRevision: HEX64,
+    editorRevision: HEX64,
+    snapshotId: "0001",
+    values: {},
+    sidecarDigest: SHA64
+  };
+}
+
+function editorVerifyRequestBody() {
+  return {
+    version: 1,
+    baseEditorRevision: HEX64,
+    command: { kind: "set-value", featureId: FEATURE_UUID, bindingVersion: 1, value: 10 },
+    intent: "edit",
+    traversal: null
+  } as const;
+}
+
+function editorCommitRequestBody() {
+  return { ...editorVerifyRequestBody(), operationId: UUID, proofId: PROOF_UUID } as const;
+}
+
+interface EditorMethodCase {
+  name: string;
+  call: (client: ReturnType<typeof createApiClient>) => Promise<unknown>;
+  url: string;
+  method: string;
+  successBody: unknown;
+}
+
+const EDITOR_METHOD_CASES: EditorMethodCase[] = [
+  {
+    name: "getEditorDocument",
+    call: (client) => client.getEditorDocument("hinged-box"),
+    url: "/api/projects/hinged-box/editor",
+    method: "GET",
+    successBody: editorDocumentBody()
+  },
+  {
+    name: "verifyEditorCommand",
+    call: (client) => client.verifyEditorCommand("hinged-box", editorVerifyRequestBody()),
+    url: "/api/projects/hinged-box/editor/verify",
+    method: "POST",
+    successBody: editorProofBody()
+  },
+  {
+    name: "commitEditorCommand",
+    call: (client) => client.commitEditorCommand("hinged-box", editorCommitRequestBody()),
+    url: "/api/projects/hinged-box/editor/commands",
+    method: "POST",
+    successBody: editorReceiptBody()
+  },
+  {
+    name: "getEditorOperation",
+    call: (client) => client.getEditorOperation("hinged-box", UUID),
+    url: `/api/projects/hinged-box/editor/operations/${UUID}`,
+    method: "GET",
+    successBody: { version: 1, state: "unknown", requestDigest: null }
+  }
+];
+
+describe("apiClient editor methods (Issue #134 criterion 1)", () => {
+  it.each(EDITOR_METHOD_CASES)("$name resolves the strict-parsed success body on its frozen route", async ({ call, url, method, successBody }) => {
+    const fetchImpl = vi.fn(async (requestUrl: string | URL, init?: RequestInit) => {
+      expect(String(requestUrl)).toBe(url);
+      expect(init?.method ?? "GET").toBe(method);
+      return jsonResponse(successBody);
+    });
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(call(client)).resolves.toEqual(successBody);
+  });
+
+  it.each(EDITOR_METHOD_CASES)("$name surfaces every frozen error code unchanged as ApiClientError", async ({ call }) => {
+    for (const code of ERROR_CODES) {
+      const fetchImpl = vi.fn(async () => jsonResponse({ error_code: code, message: `msg for ${code}` }, 400));
+      const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+      const failure = call(client);
+      await expect(failure).rejects.toBeInstanceOf(ApiClientError);
+      await expect(failure).rejects.toMatchObject({ error_code: code, message: `msg for ${code}` });
+    }
+  });
+
+  it.each(EDITOR_METHOD_CASES)("$name throws on a strict-parse failure — never a best-effort object", async ({ call, successBody }) => {
+    // (a) JSON that parses but fails the strict schema.
+    const wrongShape = vi.fn(async () => jsonResponse({ ...(successBody as Record<string, unknown>), version: 2 }));
+    const clientA = createApiClient({ fetchImpl: wrongShape as unknown as typeof fetch });
+    const failureA = call(clientA);
+    await expect(failureA).rejects.toBeInstanceOf(ApiClientError);
+    await expect(failureA).rejects.toMatchObject({ error_code: "INTERNAL_ERROR", kind: "unparseable-body" });
+
+    // (b) a non-JSON body (e.g. Vite's index.html fallback).
+    const html = vi.fn(async () => new Response("<!doctype html><html></html>", { status: 200 }));
+    const clientB = createApiClient({ fetchImpl: html as unknown as typeof fetch });
+    const failureB = call(clientB);
+    await expect(failureB).rejects.toBeInstanceOf(ApiClientError);
+    await expect(failureB).rejects.toMatchObject({ error_code: "INTERNAL_ERROR", kind: "unparseable-body" });
+  });
+
+  it("commitEditorCommand parses the 200 body as a BARE EditorReceipt (the route does not return an EditorOperationResponse)", async () => {
+    const wrapped = vi.fn(async () =>
+      jsonResponse({ version: 1, state: "committed", receipt: editorReceiptBody() })
+    );
+    const client = createApiClient({ fetchImpl: wrapped as unknown as typeof fetch });
+
+    // A wrapped body must NOT parse: the receipt parser rejects the extra fields.
+    await expect(client.commitEditorCommand("hinged-box", editorCommitRequestBody())).rejects.toMatchObject({
+      kind: "unparseable-body"
+    });
+
+    const bare = vi.fn(async () => jsonResponse(editorReceiptBody()));
+    const clientB = createApiClient({ fetchImpl: bare as unknown as typeof fetch });
+    await expect(clientB.commitEditorCommand("hinged-box", editorCommitRequestBody())).resolves.toEqual(editorReceiptBody());
+  });
+
+  it("classifies transport failures without prose parsing: network, unparseable error body", async () => {
+    const network = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const clientA = createApiClient({ fetchImpl: network as unknown as typeof fetch });
+    await expect(clientA.getEditorDocument("hinged-box")).rejects.toMatchObject({ kind: "network" });
+
+    // A 4xx whose body is NOT a parseable ApiError is "unparseable-body", not
+    // a synthesized code the commit classifier could mistake for definite.
+    const html409 = vi.fn(async () => new Response("<html>lock busy</html>", { status: 409 }));
+    const clientB = createApiClient({ fetchImpl: html409 as unknown as typeof fetch });
+    await expect(clientB.getEditorDocument("hinged-box")).rejects.toMatchObject({
+      kind: "unparseable-body",
+      status: 409
+    });
+  });
+
+  it("carries the exact ApiError and the HTTP status for the commit classifier", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ error_code: "CONFLICT", message: "stale revision" }, 409));
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const err = await client.commitEditorCommand("hinged-box", editorCommitRequestBody()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiClientError);
+    expect(err).toMatchObject({
+      kind: "http",
+      status: 409,
+      apiError: { error_code: "CONFLICT", message: "stale revision" }
     });
   });
 });
