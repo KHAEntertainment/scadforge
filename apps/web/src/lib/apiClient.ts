@@ -11,12 +11,18 @@
 // builds the real server in parallel — this app develops against the
 // protocol contract, not a running server).
 
-import { API_BASE_PATH, API_ROUTES } from "@scadforge/protocol";
+import { API_BASE_PATH, API_ROUTES, EDITOR_ROUTES, ERROR_CODES } from "@scadforge/protocol";
 import type {
   ApiError,
   BuildRequest,
   BuildResponse,
   ChatTurnRequest,
+  EditorCommitRequest,
+  EditorDocument,
+  EditorOperationResponse,
+  EditorProofResponse,
+  EditorReceipt,
+  EditorVerifyRequest,
   ExportRequest,
   ExportResponse,
   HealthResponse,
@@ -34,15 +40,40 @@ import type {
   SourceResponse,
   SourceUpdateRequest
 } from "@scadforge/protocol";
+import {
+  parseEditorDocument,
+  parseEditorOperationResponse,
+  parseEditorProofResponse,
+  parseEditorReceipt
+} from "@scadforge/protocol";
+
+/**
+ * How a request failed, for callers (S3-C C1's editor adapter) that classify
+ * transport failures without reading prose: `http` means a non-2xx response
+ * with a parseable {@link ApiError} body (see {@link isParseableApiError}),
+ * `network` means `fetch` itself rejected, `unparseable-body` means the body
+ * was not the JSON the strict contract requires (including strict-parser
+ * rejections of JSON that parses but fails the schema).
+ */
+export type ApiClientFailureKind = "http" | "network" | "unparseable-body";
 
 /** Thrown for any non-2xx response. Carries the frozen `{error_code, message}` body. */
 export class ApiClientError extends Error {
   readonly error_code: ApiError["error_code"];
+  /** The frozen `ApiError` this error was built from, so the commit classifier can pass it through unchanged (Issue #134 criterion 3). */
+  readonly apiError: ApiError;
+  /** See {@link ApiClientFailureKind}. Defaults to `"http"` for callers that predate it. */
+  readonly kind: ApiClientFailureKind;
+  /** HTTP status when one exists (`kind: "http"` or `"unparseable-body"`), else `null`. */
+  readonly status: number | null;
 
-  constructor(error: ApiError) {
+  constructor(error: ApiError, failure?: { kind?: ApiClientFailureKind; status?: number | null }) {
     super(error.message);
     this.name = "ApiClientError";
     this.error_code = error.error_code;
+    this.apiError = error;
+    this.kind = failure?.kind ?? "http";
+    this.status = failure?.status ?? null;
   }
 }
 
@@ -66,6 +97,25 @@ function fillRoute(template: string, params: Record<string, string>): string {
     }
     return encodeURIComponent(value);
   });
+}
+
+/**
+ * Strict validation of a wire `ApiError` body (Issue #134 criterion 3 keys
+ * commit definiteness on "4xx with a PARSEABLE `ApiError`"). Mirrors the
+ * inline rule the protocol's `EditorOperationResponse` parser applies to
+ * nested errors: a plain object with a closed-union `error_code` and a
+ * non-empty `message`. A body failing this is "unparseable", never a
+ * synthesized code.
+ */
+function isParseableApiError(body: unknown): body is ApiError {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
+  const record = body as Record<string, unknown>;
+  return (
+    typeof record.error_code === "string" &&
+    (ERROR_CODES as readonly string[]).includes(record.error_code) &&
+    typeof record.message === "string" &&
+    record.message.length > 0
+  );
 }
 
 /**
@@ -103,12 +153,15 @@ export function createApiClient(options: ApiClientOptions = {}) {
         }
       });
     } catch (cause) {
-      throw new ApiClientError({
-        error_code: "INTERNAL_ERROR",
-        message: `Could not reach the ScadForge API at ${url}. Is the server running? (${
-          cause instanceof Error ? cause.message : String(cause)
-        })`
-      });
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Could not reach the ScadForge API at ${url}. Is the server running? (${
+            cause instanceof Error ? cause.message : String(cause)
+          })`
+        },
+        { kind: "network" }
+      );
     }
 
     // Read the raw text first: a 200 with a non-JSON body (e.g. Vite's
@@ -129,20 +182,130 @@ export function createApiClient(options: ApiClientOptions = {}) {
 
     if (!res.ok) {
       const err = body as Partial<ApiError> | null;
-      throw new ApiClientError({
-        error_code: err?.error_code ?? "INTERNAL_ERROR",
-        message: err?.message ?? `Request failed with status ${res.status}`
-      });
+      throw new ApiClientError(
+        {
+          error_code: err?.error_code ?? "INTERNAL_ERROR",
+          message: err?.message ?? `Request failed with status ${res.status}`
+        },
+        { kind: "http", status: res.status }
+      );
     }
 
     if (parseFailed) {
-      throw new ApiClientError({
-        error_code: "INTERNAL_ERROR",
-        message: `Received a non-JSON response (status ${res.status}) from ${url}. This usually means the dev proxy isn't forwarding /api to the API server, or the wrong baseUrl is configured.`
-      });
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Received a non-JSON response (status ${res.status}) from ${url}. This usually means the dev proxy isn't forwarding /api to the API server, or the wrong baseUrl is configured.`
+        },
+        { kind: "unparseable-body", status: res.status }
+      );
     }
 
     return body as T;
+  }
+
+  /**
+   * Strict editor transport (Issue #134 criterion 1). Same URL/JSON plumbing
+   * as {@link request}, but every response body is validated before it is
+   * handed to the strict protocol parsers: a parse failure is an error, never
+   * a best-effort object, and a non-2xx body only surfaces as the frozen
+   * `ApiError` when it strict-validates as one (criterion 3 keys commit
+   * definiteness on exactly that).
+   */
+  async function requestEditor<T>(
+    path: string,
+    init: RequestInit,
+    parse: (body: unknown) => T
+  ): Promise<T> {
+    const suffix = path.startsWith("/") ? path : `/${path}`;
+    const url = join(baseUrl, `${API_BASE_PATH}${suffix}`);
+
+    let res: Response;
+    try {
+      res = await fetchImpl(url, {
+        ...init,
+        headers: {
+          ...(init.body ? { "content-type": "application/json" } : {}),
+          ...init.headers
+        }
+      });
+    } catch (cause) {
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Could not reach the ScadForge API at ${url}. Is the server running? (${
+            cause instanceof Error ? cause.message : String(cause)
+          })`
+        },
+        { kind: "network" }
+      );
+    }
+
+    const rawBody = await res.text();
+    let body: unknown = null;
+    let parseFailed = false;
+    if (rawBody.length > 0) {
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        parseFailed = true;
+      }
+    }
+
+    if (!res.ok) {
+      if (!parseFailed && isParseableApiError(body)) {
+        throw new ApiClientError(
+          { error_code: body.error_code, message: body.message },
+          { kind: "http", status: res.status }
+        );
+      }
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Received a non-JSON or malformed error body (status ${res.status}) from ${url}.`
+        },
+        { kind: "unparseable-body", status: res.status }
+      );
+    }
+
+    // F5 (fix batch 1): the editor contract answers exactly 200. Any other
+    // 2xx is not the contract-conforming answer and is surfaced as
+    // `unparseable-body`, which the commit/lookup classifier maps to AMBIGUOUS
+    // — it can never manufacture a definite outcome. Non-editor methods keep
+    // their original behaviour (`request()` below is untouched).
+    if (res.status !== 200) {
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Received an unexpected success status ${res.status} (expected exactly 200) from ${url}.`
+        },
+        { kind: "unparseable-body", status: res.status }
+      );
+    }
+
+    if (parseFailed) {
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Received a non-JSON response (status ${res.status}) from ${url}.`
+        },
+        { kind: "unparseable-body", status: res.status }
+      );
+    }
+
+    try {
+      return parse(body);
+    } catch (cause) {
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Received a response that failed strict editor parsing (status ${res.status}) from ${url}: ${
+            cause instanceof Error ? cause.message : String(cause)
+          }`
+        },
+        { kind: "unparseable-body", status: res.status }
+      );
+    }
   }
 
   return {
@@ -293,6 +456,45 @@ export function createApiClient(options: ApiClientOptions = {}) {
         method: "POST",
         body: JSON.stringify(body)
       });
+    },
+
+    // ── Editor API (S3-B routes, Issue #134 C1) ─────────────────────────────
+
+    /** `GET /projects/:projectId/editor` — strict-parsed editor document. */
+    getEditorDocument(projectId: string): Promise<EditorDocument> {
+      return requestEditor(fillRoute(EDITOR_ROUTES.get, { projectId }), {}, parseEditorDocument);
+    },
+
+    /** `POST /projects/:projectId/editor/verify` — proof for one command, strict-parsed. */
+    verifyEditorCommand(projectId: string, body: EditorVerifyRequest): Promise<EditorProofResponse> {
+      return requestEditor(
+        fillRoute(EDITOR_ROUTES.verify, { projectId }),
+        { method: "POST", body: JSON.stringify(body) },
+        parseEditorProofResponse
+      );
+    },
+
+    /**
+     * `POST /projects/:projectId/editor/commands` — the 200 body is a BARE
+     * `EditorReceipt` (the real route does not wrap it in an
+     * `EditorOperationResponse`; Issue #134 criterion 1). Strict-parsed: a
+     * parse failure throws, never a best-effort object.
+     */
+    commitEditorCommand(projectId: string, body: EditorCommitRequest): Promise<EditorReceipt> {
+      return requestEditor(
+        fillRoute(EDITOR_ROUTES.commands, { projectId }),
+        { method: "POST", body: JSON.stringify(body) },
+        parseEditorReceipt
+      );
+    },
+
+    /** `GET /projects/:projectId/editor/operations/:operationId` — strict-parsed operation state. */
+    getEditorOperation(projectId: string, operationId: string): Promise<EditorOperationResponse> {
+      return requestEditor(
+        fillRoute(EDITOR_ROUTES.operation, { projectId, operationId }),
+        {},
+        parseEditorOperationResponse
+      );
     },
 
     /** Fetches an exported file (e.g. the 3MF) as a `Blob` for client-side download. */
