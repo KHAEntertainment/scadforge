@@ -21,10 +21,13 @@
 // polls, fresh only after a definite answer) as further specified by the
 // Tech-Lead's R1–R4 rulings on Issue #113.
 
-import type { EditorCommitRequest, EditorProofResponse } from "@scadforge/protocol";
+import type { EditorCommitRequest, EditorProofResponse, EditorReceipt } from "@scadforge/protocol";
 import { resolvingBackoffDelayMs } from "./backoff.js";
 import { SecondTabDetector } from "./broadcastChannel.js";
+import { sharedPendingReceipts, type PendingReceiptRecord } from "./pendingReceipts.js";
 import { TransactionPort, type TransactionPortWriter } from "./port.js";
+import { SessionLog, type EntryDraft, type SessionHistory } from "./sessionLog.js";
+import { canonicalJson, cloneFrozen, deriveTraversalCommand } from "./traversalCommand.js";
 import type {
   BeginInput,
   BeginResult,
@@ -36,10 +39,16 @@ import type {
   EditorCommand,
   EditorIntent,
   EditorTraversal,
+  FinalizeRefusalReason,
   FinalizeResult,
   GuardInputsSnapshot,
+  PendingReconciliation,
+  PrepareTraversalResult,
+  PreparedTraversal,
   ProposeResult,
-  TransactionControllerDeps
+  SubmitContext,
+  TransactionControllerDeps,
+  TraversalDirection
 } from "./types.js";
 
 type ActiveGestureState = Extract<
@@ -68,6 +77,19 @@ interface ActiveCommit {
   operationId: string;
   resolveFinalize: (result: FinalizeResult) => void;
   aborted: boolean;
+  /** Snapshots taken when the commit was sent — the log is built from these, never from caller-owned objects. */
+  intent: EditorIntent;
+  traversal: EditorTraversal | null;
+  draft: EntryDraft | null;
+}
+
+/** Snapshot of the caller-supplied inputs of a `finalize`/`submitVerified` call, taken before any wait. */
+interface CommitInputs {
+  command: EditorCommand;
+  proof: EditorProofResponse;
+  intent: EditorIntent;
+  traversal: EditorTraversal | null;
+  context: SubmitContext | null;
 }
 
 export class TransactionController {
@@ -86,13 +108,21 @@ export class TransactionController {
   private activeCommit: ActiveCommit | null = null;
   private resolvingTimerHandle: number | null = null;
 
+  private readonly log = new SessionLog();
+  private readonly pendingReceipts: NonNullable<TransactionControllerDeps["pendingReceipts"]>;
+  private readonly reconcileTimers = new Set<number>();
+  private reconciling = false;
+
   constructor(private readonly deps: TransactionControllerDeps) {
+    this.pendingReceipts = deps.pendingReceipts ?? sharedPendingReceipts;
     this.secondTabDetector = new SecondTabDetector(
       deps.broadcastChannelFactory,
       deps.projectId,
       deps.onPeerCommitted
     );
     this.unsubscribePort = this.port.subscribe(() => this.handlePortChange());
+    // Returning to a project: look up anything recorded when we last left it.
+    void this.reconcilePending();
   }
 
   // ── observation ────────────────────────────────────────────────────────
@@ -106,6 +136,15 @@ export class TransactionController {
     return () => this.listeners.delete(listener);
   }
 
+  /**
+   * The session log read surface (spec §5): immutable, with a stable
+   * reference until something changes, so a host can bind it to
+   * `useSyncExternalStore` through `subscribe`.
+   */
+  history(): SessionHistory {
+    return this.log.history();
+  }
+
   /** The writer half C4's preview adapter writes samples to. */
   get portWriter(): TransactionPortWriter {
     return this.port;
@@ -115,7 +154,12 @@ export class TransactionController {
 
   setGuardInputs(inputs: GuardInputsSnapshot): void {
     if (this.disposed) return;
+    const wasUnsettled = this.guardInputs?.externalWriteUnsettled ?? false;
     this.guardInputs = inputs;
+    // C1's `invalidate()` (an external write): entries become stale and redo
+    // is cleared at once, whatever the transaction is doing — the server's
+    // own revision check still governs an in-flight commit.
+    if (inputs.externalWriteUnsettled && !wasUnsettled && this.log.invalidate()) this.emit();
     // R4: an external write invalidates an active direct edit mid-gesture —
     // zero network, no log entry, no seventh CancelReason. In committing/
     // resolving the server's own revision check governs instead (a stale
@@ -132,6 +176,9 @@ export class TransactionController {
     // document coherence (R3); otherwise there is nothing to recover from.
     if (this.current.kind !== "committing" || !this.current.receipt) return;
     this.displayRecovering = true;
+    // Spec §5.3: the cursor already moved from the receipt; redo is cleared
+    // for the next gesture and recovery does not resurrect it.
+    this.log.clearRedo();
     this.setState({ kind: "idle" });
     this.recomputeIdleDisabled();
   }
@@ -143,17 +190,35 @@ export class TransactionController {
   }
 
   /**
-   * The host's document cache reports a coherent read at `editorRevision`
-   * (R3). If the controller is `committing` awaiting exactly this revision,
-   * it is now safe to go `idle` — going idle on the receipt alone would let
-   * the next `begin` capture a stale `baseEditorRevision` (a pointless 409).
+   * The host's document cache reports a completed read at `editorRevision`
+   * (R3), and optionally that read's sidecar digest. Two jobs:
+   *
+   * - While `committing` with a receipt, any read AFTER the receipt makes it
+   *   safe to go `idle` — going idle on the receipt alone would let the next
+   *   `begin` capture a stale `baseEditorRevision`. The read normally equals
+   *   the receipt's revision; if another tab wrote in between it is a
+   *   different one, and nothing waits for the document to equal the
+   *   receipt (spec criterion 5). Only a read equal to the receipt's
+   *   `baseEditorRevision` is ignored: that is a read that started before the
+   *   commit landed.
+   * - A revision that differs from the last receipt applied to the log is an
+   *   external write: entries go stale and redo is cleared. Reads delivered
+   *   while a commit is still in flight are ignored, since one may already
+   *   show that commit's own result.
    */
-  notifyDocumentRevision(editorRevision: string): void {
+  notifyDocumentRevision(editorRevision: string, sidecarDigest?: string): void {
     if (this.disposed) return;
-    if (this.current.kind !== "committing" || !this.current.receipt) return;
-    if (this.current.receipt.editorRevision !== editorRevision) return;
-    this.setState({ kind: "idle" });
-    this.recomputeIdleDisabled();
+    const current = this.current;
+    if (current.kind === "committing" || current.kind === "resolving") {
+      const receipt = current.kind === "committing" ? current.receipt : null;
+      if (!receipt) return;
+      if (editorRevision === receipt.baseEditorRevision && editorRevision !== receipt.editorRevision) return;
+      this.log.reconcileRevision(editorRevision, sidecarDigest);
+      this.setState({ kind: "idle" });
+      this.recomputeIdleDisabled();
+      return;
+    }
+    if (this.log.reconcileRevision(editorRevision, sidecarDigest)) this.emit();
   }
 
   private computeDisabledReason(): DisabledReason | null {
@@ -330,14 +395,25 @@ export class TransactionController {
    * The drag/typed path: commits the current gesture's candidate as a
    * `set-value` command. Waits on the port if still `preview-pending`
    * (fixes Failure A/B — driven by port state, not status events).
+   *
+   * A second call while the first is still waiting on the port is refused
+   * (`{ kind: "refused", reason: "finalize-pending" }`); the first wait is
+   * untouched and still settles through the port, `cancel`, `detach` or
+   * `dispose`.
    */
   async finalize(proof: EditorProofResponse): Promise<FinalizeResult> {
+    if (this.pendingCommit) return { kind: "refused", reason: "finalize-pending" };
     if (this.current.kind === "preview-ok") {
-      return this.sendCommit(this.buildSetValueCommand(this.current.begin, this.current.candidate.value), proof, "edit", null);
+      const begin = this.current.begin;
+      return this.sendCommit(
+        this.snapshotInputs(this.buildSetValueCommand(begin, this.current.candidate.value), proof, "edit", null, { beforeValue: begin.baseValue })
+      );
     }
     if (this.current.kind === "preview-pending") {
       const begin = this.current.begin;
       const candidateValue = this.current.candidate.value;
+      // Taken now, before the wait: the caller may mutate or reuse `proof`.
+      const inputs = this.snapshotInputs(this.buildSetValueCommand(begin, candidateValue), proof, "edit", null, { beforeValue: begin.baseValue });
       return new Promise<FinalizeResult>((resolve) => {
         this.pendingCommit = {
           resolve,
@@ -350,7 +426,7 @@ export class TransactionController {
               resolve({ kind: "cancelled" });
               return;
             }
-            this.sendCommit(this.buildSetValueCommand(begin, candidateValue), proof, "edit", null).then(resolve);
+            this.sendCommit(inputs).then(resolve);
           }
         };
       });
@@ -360,20 +436,29 @@ export class TransactionController {
 
   /**
    * The direct-command path: `intent`/`traversal` default to a plain edit
-   * (typed entry's usual call). C3 passes `intent: "undo"|"redo"` with a
-   * traversal for cursor navigation; S4-A passes `intent: "setup"` for
-   * `put-feature`/`remove-feature`. Usable from `idle` (undo/redo/setup have
-   * no drag gesture) or from an active gesture, waiting on the port the same
-   * way `finalize` does.
+   * (typed entry's usual call). Undo/redo go through `prepareTraversal` +
+   * `submitTraversal`; S4-A passes `intent: "setup"` for `put-feature`/
+   * `remove-feature`, with `context.beforeFeature` so the log can rebuild the
+   * exact inverse later. Usable from `idle` (undo/redo/setup have no drag
+   * gesture) or from an active gesture, waiting on the port the same way
+   * `finalize` does.
+   *
+   * An `undo`/`redo` intent is validated locally against the log first: it
+   * must name the entry at the cursor, in that direction, and never an
+   * accepted undo/redo (Q5). Anything else is refused with no request sent.
    */
   async submitVerified(
     command: EditorCommand,
     proof: EditorProofResponse,
     intent: EditorIntent = "edit",
-    traversal: EditorTraversal | null = null
+    traversal: EditorTraversal | null = null,
+    context: SubmitContext | null = null
   ): Promise<FinalizeResult> {
+    if (this.pendingCommit) return { kind: "refused", reason: "finalize-pending" };
+    const inputs = this.snapshotInputs(command, proof, intent, traversal, context);
+    if (inputs.intent === "undo" || inputs.intent === "redo") return this.submitTraversalCommand(inputs);
     if (this.current.kind === "idle" || this.current.kind === "preview-ok") {
-      return this.sendCommit(command, proof, intent, traversal);
+      return this.sendCommit(inputs);
     }
     if (this.current.kind === "preview-pending") {
       return new Promise<FinalizeResult>((resolve) => {
@@ -387,7 +472,7 @@ export class TransactionController {
               resolve({ kind: "cancelled" });
               return;
             }
-            this.sendCommit(command, proof, intent, traversal).then(resolve);
+            this.sendCommit(inputs).then(resolve);
           }
         };
       });
@@ -399,12 +484,94 @@ export class TransactionController {
     return { kind: "set-value", featureId: begin.featureId, bindingVersion: begin.bindingVersion, value };
   }
 
-  private async sendCommit(
+  /** Deep-copies everything a caller owns, so later mutation can neither change what is sent nor what is logged. */
+  private snapshotInputs(
     command: EditorCommand,
     proof: EditorProofResponse,
     intent: EditorIntent,
-    traversal: EditorTraversal | null
-  ): Promise<FinalizeResult> {
+    traversal: EditorTraversal | null,
+    context: SubmitContext | null
+  ): CommitInputs {
+    return {
+      command: cloneFrozen(command),
+      proof: cloneFrozen(proof),
+      intent,
+      traversal: traversal ? cloneFrozen(traversal) : null,
+      context: context ? cloneFrozen(context) : null
+    };
+  }
+
+  // ── undo / redo (spec §5.4: server commands, never local rewinds) ────────
+
+  /**
+   * Builds the complete verify request for undoing/redoing the entry at the
+   * cursor. The host passes `result.request` unchanged to
+   * `verifyEditorCommand`, then hands the proof and this result back to
+   * `submitTraversal`. Nothing is sent and nothing changes here.
+   */
+  prepareTraversal(direction: TraversalDirection): PrepareTraversalResult {
+    if (this.disposed) return { ok: false, reason: "not-idle" };
+    if (this.current.kind === "disabled") return { ok: false, reason: "disabled" };
+    if (this.current.kind !== "idle") return { ok: false, reason: "not-idle" };
+    const target = this.log.target(direction);
+    if (!target) return { ok: false, reason: direction === "undo" ? "nothing-to-undo" : "nothing-to-redo" };
+    const baseEditorRevision = this.log.tip;
+    if (target.stale || baseEditorRevision === null) return { ok: false, reason: "stale-log" };
+    const command = deriveTraversalCommand(target.entry, direction);
+    if (!command) return { ok: false, reason: "not-traversable" };
+    return {
+      ok: true,
+      request: cloneFrozen({
+        version: 1 as const,
+        baseEditorRevision,
+        command,
+        intent: direction,
+        traversal: { operationId: target.entry.operationId, direction }
+      })
+    };
+  }
+
+  /**
+   * Commits a previously prepared traversal with the host's proof. The host
+   * awaited between `prepareTraversal` and here, so the request is derived
+   * again now and refused (`target-changed`, nothing sent) unless it equals
+   * the verified one by value.
+   */
+  async submitTraversal(prepared: PreparedTraversal, proof: EditorProofResponse): Promise<FinalizeResult> {
+    if (this.pendingCommit) return { kind: "refused", reason: "finalize-pending" };
+    const verified = prepared.request;
+    if (verified.intent !== "undo" && verified.intent !== "redo") return { kind: "refused", reason: "unknown-traversal-target" };
+    const again = this.prepareTraversal(verified.intent);
+    if (!again.ok) {
+      if (again.reason === "not-idle" || again.reason === "disabled") return { kind: "refused", reason: again.reason };
+      return { kind: "refused", reason: "target-changed" };
+    }
+    if (canonicalJson(again.request) !== canonicalJson(verified) || proof.baseEditorRevision !== again.request.baseEditorRevision) {
+      return { kind: "refused", reason: "target-changed" };
+    }
+    return this.sendCommit(this.snapshotInputs(again.request.command, proof, again.request.intent, again.request.traversal, null));
+  }
+
+  /** `submitVerified`'s undo/redo branch: local validation, then the one commit path. */
+  private submitTraversalCommand(inputs: CommitInputs): Promise<FinalizeResult> | FinalizeResult {
+    if (this.current.kind === "disabled") return { kind: "refused", reason: "disabled" };
+    if (this.current.kind !== "idle") return { kind: "refused", reason: "not-idle" };
+    const refusal = this.traversalRefusal(inputs);
+    if (refusal) return { kind: "refused", reason: refusal };
+    return this.sendCommit(inputs);
+  }
+
+  private traversalRefusal(inputs: CommitInputs): FinalizeRefusalReason | null {
+    const traversal = inputs.traversal;
+    if (!traversal || traversal.direction !== inputs.intent) return "unknown-traversal-target";
+    if (this.log.isTraversalOperation(traversal.operationId)) return "traversal-of-traversal";
+    const target = this.log.target(traversal.direction);
+    if (!target || target.entry.operationId !== traversal.operationId) return "unknown-traversal-target";
+    return null;
+  }
+
+  private async sendCommit(inputs: CommitInputs): Promise<FinalizeResult> {
+    const { command, proof, intent, traversal } = inputs;
     // Operation-ID ruling: minted once per commit attempt, at `finalize`
     // (i.e. here), reused verbatim for every poll, never derived from the
     // request. A fresh one is minted only on the NEXT call, after this
@@ -420,15 +587,45 @@ export class TransactionController {
       proofId: proof.proofId
     };
     const beginForState = this.current.kind === "preview-ok" ? this.current.begin : null;
+    const draft = this.buildDraft(inputs, operationId, beginForState);
     this.setState({ kind: "committing", begin: beginForState, operationId, receipt: null });
 
     return new Promise<FinalizeResult>((resolve) => {
-      const record: ActiveCommit = { operationId, resolveFinalize: resolve, aborted: false };
+      const record: ActiveCommit = { operationId, resolveFinalize: resolve, aborted: false, intent, traversal, draft };
       this.activeCommit = record;
       this.deps.client.commit(this.deps.projectId, request).then((outcome) => {
         this.handleCommitOutcome(record, outcome);
       });
     });
+  }
+
+  /** The log entry an accepted `edit`/`setup` receipt will append. `null` for undo/redo — those never append (Q5). */
+  private buildDraft(inputs: CommitInputs, operationId: string, begin: BeginInput | null): EntryDraft | null {
+    if (inputs.intent !== "edit" && inputs.intent !== "setup") return null;
+    const { command, context } = inputs;
+    const common = { operationId, intent: inputs.intent, command, ...(context && "beforeFeature" in context ? { beforeFeature: context.beforeFeature } : {}) };
+    switch (command.kind) {
+      case "set-value": {
+        const fromBegin = begin && begin.featureId === command.featureId ? begin.baseValue : null;
+        return {
+          ...common,
+          featureId: command.featureId,
+          bindingVersion: command.bindingVersion,
+          beforeValue: context?.beforeValue ?? fromBegin,
+          afterValue: command.value
+        };
+      }
+      case "put-feature":
+        return {
+          ...common,
+          featureId: command.feature.featureId,
+          bindingVersion: command.feature.bindingVersion,
+          beforeValue: null,
+          afterValue: null
+        };
+      case "remove-feature":
+        return { ...common, featureId: command.featureId, bindingVersion: command.bindingVersion, beforeValue: null, afterValue: null };
+    }
   }
 
   private handleCommitOutcome(record: ActiveCommit, outcome: CommitOutcome): void {
@@ -461,10 +658,16 @@ export class TransactionController {
   }
 
   private settleDefinite(record: ActiveCommit, outcome: Extract<CommitOutcome, { kind: "definite" }>): void {
-    if (record.aborted) return;
-    if (this.activeCommit === record) this.activeCommit = null;
+    // A late callback must belong to this controller and to the commit that is
+    // still current: disposed, detached or already-settled records do nothing.
+    if (record.aborted || this.disposed || this.activeCommit !== record) return;
+    this.activeCommit = null;
     const response = outcome.response;
     if (response.state === "committed") {
+      // The ONLY place the session log changes for a commit: exactly once, on
+      // the accepted receipt (spec §5.3). Rejections, ambiguity, detach and
+      // cancel never reach here.
+      this.applyReceiptToLog(record, response.receipt);
       // R3: stay `committing`, port locked, until the host confirms a
       // coherent read at this exact `editorRevision` — see
       // `notifyDocumentRevision`/`notifyDisplayFailure`. `finalize` still
@@ -477,6 +680,65 @@ export class TransactionController {
     this.setState({ kind: "idle" });
     this.recomputeIdleDisabled();
     record.resolveFinalize({ kind: "rejected", reason: response.reason, error: response.error });
+  }
+
+  /** Edit/setup receipts append; undo/redo receipts only move the cursor. */
+  private applyReceiptToLog(record: ActiveCommit, receipt: EditorReceipt): void {
+    if (record.intent === "undo" || record.intent === "redo") {
+      if (record.traversal) this.log.applyTraversal(record.traversal, receipt);
+      return;
+    }
+    if (record.draft) this.log.appendFresh(record.draft, receipt, new Date(this.deps.clock()).toISOString());
+  }
+
+  // ── navigation receipts (spec §5.5) ──────────────────────────────────────
+
+  /**
+   * Looks up every operation recorded for THIS project when it was last left
+   * mid-commit. Runs once at construction; idempotent while running. Results
+   * go to `onPendingReconciled` only — never into this controller's state or
+   * log, and never to another project (the store is keyed by project and the
+   * lookup uses this controller's own `projectId`).
+   */
+  async reconcilePending(): Promise<void> {
+    if (this.disposed || this.reconciling) return;
+    const records = this.pendingReceipts.list(this.deps.projectId);
+    if (records.length === 0) return;
+    this.reconciling = true;
+    try {
+      await Promise.all(records.map((record) => this.reconcileOne(record, 1)));
+    } finally {
+      this.reconciling = false;
+    }
+  }
+
+  private async reconcileOne(record: PendingReceiptRecord, attempt: number): Promise<void> {
+    let outcome: CommitOutcome;
+    try {
+      outcome = await this.deps.client.lookupOperation(this.deps.projectId, record.operationId);
+    } catch {
+      outcome = { kind: "ambiguous", cause: "network-error" };
+    }
+    // Re-validated after the await: disposed, or someone else already settled it.
+    if (this.disposed || !this.pendingReceipts.has(this.deps.projectId, record.operationId)) return;
+    if (outcome.kind === "ambiguous") {
+      // Still unknown: never treated as rejected, never dropped. Keep polling.
+      await new Promise<void>((resolve) => {
+        const handle = this.deps.timer.setTimeout(() => {
+          this.reconcileTimers.delete(handle);
+          resolve();
+        }, resolvingBackoffDelayMs(attempt));
+        this.reconcileTimers.add(handle);
+      });
+      return this.reconcileOne(record, attempt + 1);
+    }
+    this.pendingReceipts.remove(this.deps.projectId, record.operationId);
+    const response = outcome.response;
+    const reconciliation: PendingReconciliation =
+      response.state === "committed"
+        ? { operationId: record.operationId, outcome: "committed", receipt: response.receipt }
+        : { operationId: record.operationId, outcome: "not-committed", reason: response.reason };
+    this.deps.onPendingReconciled?.(reconciliation);
   }
 
   // ── detach / dispose (R2) ─────────────────────────────────────────────────
@@ -501,6 +763,10 @@ export class TransactionController {
       pending.resolve({ kind: "cancelled" });
     }
 
+    // Navigation discards the in-memory log (Q2, spec §5.3); history stays
+    // available through revert.
+    if (this.log.reset()) this.emit();
+
     const record = this.activeCommit;
     if (!record) return null;
     record.aborted = true;
@@ -511,6 +777,14 @@ export class TransactionController {
     }
     this.setState({ kind: "idle" });
     this.recomputeIdleDisabled();
+    // Spec §5.5: remember the in-flight operation for this project so a later
+    // controller for it can reconcile instead of losing the receipt.
+    this.pendingReceipts.record({
+      projectId: this.deps.projectId,
+      operationId: record.operationId,
+      intent: record.intent,
+      traversal: record.traversal
+    });
     record.resolveFinalize({ kind: "detached", operationId: record.operationId });
     return record.operationId;
   }
@@ -521,6 +795,8 @@ export class TransactionController {
     this.detach();
     this.disposed = true;
     this.unsubscribePort();
+    for (const handle of this.reconcileTimers) this.deps.timer.clearTimeout(handle);
+    this.reconcileTimers.clear();
     this.secondTabDetector.close();
     this.listeners.clear();
   }
@@ -529,6 +805,10 @@ export class TransactionController {
 
   private setState(next: ControllerState): void {
     this.current = next;
+    this.emit();
+  }
+
+  private emit(): void {
     for (const listener of this.listeners) listener();
   }
 }

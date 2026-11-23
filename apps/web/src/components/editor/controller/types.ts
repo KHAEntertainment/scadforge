@@ -16,13 +16,16 @@ import type {
   EditorCommand,
   EditorCommitRequest,
   EditorEligibility,
+  EditorFeature,
   EditorIntent,
   EditorOperationResponse,
   EditorProofResponse,
   EditorReceipt,
   EditorSidecarStatus,
-  EditorTraversal
+  EditorTraversal,
+  EditorVerifyRequest
 } from "@scadforge/protocol";
+import type { PendingReceiptStore } from "./pendingReceipts.js";
 
 // ═════════════════════════════════════════════════════════════════════════
 // States (spec §3.1)
@@ -168,7 +171,26 @@ export type FinalizeResult =
    * when the transaction was cancelled or invalidated (spec §2.3 external
    * write) before a sample ever confirmed. No command was sent.
    */
-  | { kind: "cancelled" };
+  | { kind: "cancelled" }
+  /**
+   * The call was refused locally; no command was sent, no state changed, and
+   * any earlier wait is untouched. `finalize-pending` mirrors `propose`'s
+   * refusal of the same name (a second `finalize`/`submitVerified` while the
+   * first is still waiting on the port); the rest are undo/redo refusals
+   * (spec §5.4, Q5).
+   */
+  | { kind: "refused"; reason: FinalizeRefusalReason };
+
+export type FinalizeRefusalReason =
+  | "finalize-pending"
+  /** An undo/redo whose traversal names no entry at the cursor (or whose direction disagrees with its intent). */
+  | "unknown-traversal-target"
+  /** An undo/redo naming an accepted undo/redo — Q5: no undo of an undo. */
+  | "traversal-of-traversal"
+  /** `submitTraversal` re-derived a different request than the one the host verified. */
+  | "target-changed"
+  | "not-idle"
+  | "disabled";
 
 // ═════════════════════════════════════════════════════════════════════════
 // Injected dependencies (design hint: plain class, injected client/clock/
@@ -208,6 +230,48 @@ export interface EditorClient {
   lookupOperation(projectId: string, operationId: string): Promise<LookupOutcome>;
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// Session log, traversal and navigation receipts (C3, spec §5)
+// ═════════════════════════════════════════════════════════════════════════
+
+/**
+ * What a caller knows about the state a command replaces, which the log
+ * needs to rebuild an exact inverse (the server's traversal check is by
+ * canonical JSON). `finalize` derives `beforeValue` from `begin.baseValue`;
+ * `submitVerified` takes it from here.
+ */
+export interface SubmitContext {
+  beforeValue?: number | null;
+  /** The feature as it was before: `null` when the command creates it. */
+  beforeFeature?: EditorFeature | null;
+}
+
+export type TraversalDirection = EditorTraversal["direction"];
+
+export type TraversalRefusalReason =
+  | "nothing-to-undo"
+  | "nothing-to-redo"
+  | "not-idle"
+  | "disabled"
+  /** The cursor entry was invalidated by an external write, or the controller has no known tip revision. */
+  | "stale-log"
+  /** The cursor entry lacks the recorded before/after data needed to build the exact inverse. */
+  | "not-traversable";
+
+/** The complete verify request the host passes unchanged to `verifyEditorCommand`. */
+export interface PreparedTraversal {
+  request: EditorVerifyRequest;
+}
+
+export type PrepareTraversalResult =
+  | { ok: true; request: EditorVerifyRequest }
+  | { ok: false; reason: TraversalRefusalReason };
+
+/** Reported when a recorded navigation receipt is looked up on return to its project. */
+export type PendingReconciliation =
+  | { operationId: string; outcome: "committed"; receipt: EditorReceipt }
+  | { operationId: string; outcome: "not-committed"; reason: "unclaimed" | "rejected" | "aborted" };
+
 /** Injectable UUIDv4 source — swapped for a deterministic sequence in tests. */
 export type UuidSource = () => string;
 
@@ -239,6 +303,19 @@ export interface TransactionControllerDeps {
   broadcastChannelFactory: BroadcastChannelFactory;
   /** Invoked when a peer tab's `committed` broadcast arrives (Q4). */
   onPeerCommitted: () => void;
+  /**
+   * Per-project pending navigation receipts (spec §5.5). Defaults to the
+   * page-lifetime `sharedPendingReceipts`; the host owns its lifetime. Tests
+   * inject a fresh store.
+   */
+  pendingReceipts?: PendingReceiptStore;
+  /**
+   * Called once a navigation-pending operation is reconciled on return to
+   * this controller's project (never after `dispose()`), so the host can
+   * re-read the document. The result is not painted anywhere by the
+   * controller.
+   */
+  onPendingReconciled?: (reconciliation: PendingReconciliation) => void;
 }
 
 export type {
@@ -246,9 +323,11 @@ export type {
   EditorCommand,
   EditorCommitRequest,
   EditorEligibility,
+  EditorFeature,
   EditorIntent,
   EditorProofResponse,
   EditorReceipt,
   EditorSidecarStatus,
-  EditorTraversal
+  EditorTraversal,
+  EditorVerifyRequest
 };
