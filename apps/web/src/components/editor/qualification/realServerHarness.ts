@@ -28,6 +28,7 @@
 // Issue #137 Stage 1, conditions 4, 6 and 8.
 
 import { type ChildProcess, spawn } from "node:child_process";
+import { get as httpGet } from "node:http";
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
@@ -62,6 +63,25 @@ export const SERVER_DIST_ENTRY = join(REPO_ROOT, "apps", "server", "dist", "inde
 
 /** The env var the server reads its project root from (server's `project-paths.ts`). */
 export const PROJECTS_DIR_ENV_VAR = "SCADFORGE_PROJECTS_DIR";
+
+/**
+ * F1: the START BUDGET — the whole time `startServerChild` may take, and
+ * therefore the floor for any hook that starts a server child.
+ *
+ * `attempts x readyTimeoutMs` plus the per-attempt overhead. A test file's
+ * `beforeEach` MUST use a hook timeout larger than this (see
+ * {@link HOOK_TIMEOUT_MS}), so a slow start can never outlive its hook and
+ * leave a start loop running past teardown.
+ */
+export const SERVER_START_ATTEMPTS = 3;
+export const SERVER_READY_TIMEOUT_MS = 20_000;
+export const SERVER_START_BUDGET_MS = SERVER_START_ATTEMPTS * SERVER_READY_TIMEOUT_MS;
+
+/** The hook timeout every test file uses for `beforeEach`/`afterEach`: the start budget plus a 30 s margin. */
+export const HOOK_TIMEOUT_MS = SERVER_START_BUDGET_MS + 30_000;
+
+/** F1: the health probe's own deadline — one hung connection cannot outlast the ready timeout. */
+export const HEALTH_PROBE_TIMEOUT_MS = 2_000;
 
 // ── build precondition ──────────────────────────────────────────────────────
 
@@ -136,26 +156,75 @@ export async function killChild(child: ChildProcess): Promise<void> {
 }
 
 export interface ChildTracker {
+  /**
+   * Tracks a child. After {@link ChildTracker.killAll} has run this KILLS the
+   * child and throws — a child started after teardown must never survive.
+   */
   track(child: ChildProcess): ChildProcess;
+  /** The captured stdout/stderr of a tracked child. */
+  outputOf(child: ChildProcess): ChildOutput;
   /** Kills every tracked child, awaits each, then throws if any of THOSE children is still running. */
   killAll(): Promise<void>;
+  /** True once {@link ChildTracker.killAll} has run: nothing may be spawned or tracked any more. */
+  readonly closed: boolean;
+}
+
+interface TrackedChild {
+  child: ChildProcess;
+  output: ChildOutput;
 }
 
 export function createChildTracker(): ChildTracker {
-  const children: ChildProcess[] = [];
+  const children: TrackedChild[] = [];
+  let closed = false;
   return {
+    get closed() {
+      return closed;
+    },
     track(child) {
-      children.push(child);
+      if (closed) {
+        // F1: after teardown nothing may be spawned or tracked. The child is
+        // killed at once so it cannot outlive the test, and the call fails.
+        child.kill("SIGKILL");
+        throw new Error(
+          "c5-qualification: a server child was tracked after killAll() ran — it was killed and NOT tracked"
+        );
+      }
+      const entry: TrackedChild = { child, output: captureOutput(child) };
+      children.push(entry);
       return child;
     },
+    outputOf(child) {
+      const entry = children.find((candidate) => candidate.child === child);
+      if (!entry) {
+        throw new Error("c5-qualification: outputOf() was called for a child that is not tracked");
+      }
+      return entry.output;
+    },
     async killAll() {
+      closed = true;
       const snapshot = children.splice(0);
-      await Promise.all(snapshot.map((child) => killChild(child)));
-      const stillRunning = snapshot.filter(isRunning);
+      await Promise.all(snapshot.map((entry) => killChild(entry.child)));
+      const stillRunning = snapshot.filter((entry) => isRunning(entry.child));
       if (stillRunning.length > 0) {
         throw new Error(
           `c5-qualification: ${stillRunning.length} child process(es) still running after killAll ` +
-            `(pid(s): ${stillRunning.map((c) => c.pid).join(", ")})`
+            `(pid(s): ${stillRunning.map((entry) => entry.child.pid).join(", ")})`
+        );
+      }
+      // A1: a child that had ALREADY exited with a non-zero code is a
+      // failure worth reporting, with its captured stderr.
+      const failed = snapshot.filter((entry) => entry.child.exitCode !== null && entry.child.exitCode !== 0);
+      if (failed.length > 0) {
+        throw new Error(
+          `c5-qualification: ${failed.length} tracked child process(es) exited with a non-zero code:\n` +
+            failed
+              .map(
+                (entry) =>
+                  `pid=${entry.child.pid} code=${entry.child.exitCode} signal=${entry.child.signalCode}\n` +
+                  `--- child stdout ---\n${entry.output.stdout()}\n--- child stderr ---\n${entry.output.stderr()}`
+              )
+              .join("\n")
         );
       }
     }
@@ -241,10 +310,18 @@ export async function startServerChild(
   options: StartServerChildOptions = {}
 ): Promise<ServerChildHandle> {
   await assertServerBuilt();
-  const attempts = options.startAttempts ?? 3;
+  const attempts = options.startAttempts ?? SERVER_START_ATTEMPTS;
+  const readyTimeoutMs = options.readyTimeoutMs ?? SERVER_READY_TIMEOUT_MS;
   const failures: string[] = [];
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // F1: after teardown nothing may be spawned. A start loop that is still
+    // running stops here instead of retrying on a drained tracker.
+    if (tracker.closed) {
+      throw new Error(
+        "c5-qualification: the tracker was closed (killAll ran) while the server child was starting — no child was started"
+      );
+    }
     const port = await reserveFreePort();
     const baseUrl = `http://127.0.0.1:${port}`;
     const child = tracker.track(
@@ -257,9 +334,9 @@ export async function startServerChild(
         stdio: ["ignore", "pipe", "pipe"]
       })
     );
-    const output = captureOutput(child);
+    const output = tracker.outputOf(child);
 
-    const failure = await waitForReady(child, baseUrl, output, options.readyTimeoutMs ?? 20_000);
+    const failure = await waitForReady(child, baseUrl, output, readyTimeoutMs);
     if (failure === null) return { child, baseUrl, port, output };
 
     failures.push(`attempt ${attempt} (port ${port}): ${failure}`);
@@ -269,6 +346,36 @@ export async function startServerChild(
   throw new Error(
     `c5-qualification: the server child did not become ready after ${attempts} attempt(s):\n${failures.join("\n")}`
   );
+}
+
+/**
+ * ONE bounded health probe: a raw HTTP GET whose own socket timeout bounds
+ * it, so one hung connection can never outlast the probe (F1).
+ *
+ * `node:http` rather than `fetch`: the jsdom test environment's global
+ * `AbortController` belongs to a different realm than Node's `fetch`, and
+ * undici rejects a foreign signal outright — so a `fetch` carrying a signal
+ * fails in every test file. A raw request with its own socket timeout is
+ * realm-proof and bounds the probe exactly as required.
+ */
+function probeHealth(baseUrl: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (healthy: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolve(healthy);
+    };
+    const request = httpGet(`${baseUrl}/api/health`, (res) => {
+      res.resume(); // drain the body so the socket can close
+      settle(res.statusCode === 200);
+    });
+    request.setTimeout(timeoutMs, () => {
+      request.destroy();
+      settle(false);
+    });
+    request.on("error", () => settle(false));
+  });
 }
 
 async function waitForReady(
@@ -286,10 +393,12 @@ async function waitForReady(
       );
     }
     try {
-      const res = await fetch(`${baseUrl}/api/health`);
-      if (res.ok) return null;
+      // F1: every probe is bounded on its OWN, so one hung connection can
+      // never outlast the ready timeout.
+      if (await probeHealth(baseUrl, HEALTH_PROBE_TIMEOUT_MS)) return null;
     } catch {
-      // ECONNREFUSED while the server is still starting — keep polling.
+      // A probe that failed for any reason (the server is still starting) —
+      // keep polling.
     }
     if (Date.now() >= deadline) {
       return (
@@ -315,6 +424,12 @@ export interface FetchCall {
   error: string | null;
   /** The parsed `{error_code, message}` body, when the response carried one. */
   errorBody: { error_code: string; message: string } | null;
+  /**
+   * The parsed JSON response body, when the response carried one. Recorded
+   * for EVERY response, so a case can assert what the server really answered
+   * (a receipt, an operation state) without re-reading the wire.
+   */
+  responseBody: unknown;
 }
 
 export interface FetchHold {
@@ -367,36 +482,49 @@ export function createInterceptedFetch(): InterceptedFetch {
     return rules.splice(index, 1)[0];
   }
 
-  function recordBody(call: FetchCall, res: Response): void {
-    if (res.ok) return;
-    void res
-      .clone()
-      .text()
-      .then((text) => {
-        if (text.length === 0) return;
-        try {
-          const parsed: unknown = JSON.parse(text);
-          if (parsed !== null && typeof parsed === "object") {
-            const record = parsed as Record<string, unknown>;
-            call.errorBody = {
-              error_code: typeof record.error_code === "string" ? record.error_code : "UNKNOWN",
-              message: typeof record.message === "string" ? record.message : ""
-            };
-          }
-        } catch {
-          // A non-JSON error body is not an ApiError; the record keeps a null errorBody.
-        }
-      })
-      .catch(() => {
-        // Reading the body for the record must never affect the caller.
-      });
+  /**
+   * Reads the response's body from a CLONE, so the body the caller receives
+   * is untouched.
+   *
+   * F6: the record is COMPLETED before it is published — the status and the
+   * parsed body are written together, only after the body has been read. A
+   * waiter can therefore never observe a call's `status` while its body
+   * record is still pending.
+   */
+  async function readResponseBody(
+    res: Response
+  ): Promise<{ parsed: unknown; errorBody: { error_code: string; message: string } | null }> {
+    let text = "";
+    try {
+      text = await res.clone().text();
+    } catch {
+      return { parsed: null, errorBody: null };
+    }
+    if (text.length === 0) return { parsed: null, errorBody: null };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // A non-JSON body is not a JSON record; it is not an ApiError either.
+      return { parsed: null, errorBody: null };
+    }
+    if (parsed === null || typeof parsed !== "object") return { parsed, errorBody: null };
+    const record = parsed as Record<string, unknown>;
+    if (res.ok) return { parsed, errorBody: null };
+    return {
+      parsed,
+      errorBody: {
+        error_code: typeof record.error_code === "string" ? record.error_code : "UNKNOWN",
+        message: typeof record.message === "string" ? record.message : ""
+      }
+    };
   }
 
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = (init?.method ?? "GET").toUpperCase();
     const body = typeof init?.body === "string" ? init.body : null;
-    const call: FetchCall = { method, url, body, status: null, error: null, errorBody: null };
+    const call: FetchCall = { method, url, body, status: null, error: null, errorBody: null, responseBody: null };
     calls.push(call);
     const rule = takeRule(url, method);
 
@@ -407,8 +535,11 @@ export function createInterceptedFetch(): InterceptedFetch {
         rule.markForwarded?.();
       }
       const res = await fetch(input as RequestInfo, init);
+      // F6: complete the record BEFORE publishing any of it.
+      const { parsed, errorBody } = await readResponseBody(res);
       call.status = res.status;
-      recordBody(call, res);
+      call.responseBody = parsed;
+      call.errorBody = errorBody;
       if (rule?.kind === "delay" && rule.gate) await rule.gate;
       if (rule?.kind === "drop") {
         throw new Error("c5-qualification: the response was lost after the request was sent");
@@ -518,6 +649,11 @@ export async function readEditorDocument(api: ApiClient, projectId: string): Pro
 /** The real snapshot count, read straight from the production store. */
 export async function snapshotCountOf(dir: string): Promise<number> {
   return (await listSnapshots(dir)).length;
+}
+
+/** The real snapshot ids, OLDEST FIRST (the store's own order). */
+export async function snapshotIdsOf(dir: string): Promise<string[]> {
+  return (await listSnapshots(dir)).map((manifest) => manifest.id);
 }
 
 /**
