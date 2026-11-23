@@ -615,6 +615,25 @@ describe("Edit surface — PR #140 fix batch 1", () => {
     // The revision changed under the log: nothing of ours is left to undo.
     expect(screen.getByRole("button", { name: "Undo" })).toBeDisabled();
   });
+
+  it("F3: after switching to a project with identical source and values, a save there completes", async () => {
+    server = seedServer("p1", "p2");
+    vi.stubGlobal("fetch", server.fetch);
+    render(<App />);
+    await openEdit();
+    await waitFor(() => expect(engine.result.status).toBe("ok"), { timeout: 3000 });
+    const requestsBefore = engine.requests.length;
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "p2" } });
+    await waitFor(() => expect(server.log).toContain("GET /projects/p2/editor"), { timeout: 3000 });
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."), { timeout: 3000 });
+    // p2's display render is p1's geometry: nothing new was asked of the engine.
+    expect(engine.requests.length).toBe(requestsBefore);
+
+    await saveWall("4");
+    expect(server.values("p2")).toEqual({ wall: 4 });
+    expect(server.values("p1")).toEqual({ wall: 2 });
+  });
 });
 
 async function saveWallWithoutWaiting(value: string): Promise<void> {

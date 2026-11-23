@@ -20,6 +20,12 @@
 // engine only once the previous one settled; the newest wanted render waits
 // and older wants are dropped (latest wins).
 //
+// Never wait for a render that was not requested: the engine only re-renders
+// when its scad or params change, so `awaiting` is set only when `pump()`
+// hands it different geometry (or a fresh engine after a reset). A want whose
+// geometry equals the current input, differing only in its project/revision
+// tag, re-tags that input and its result instead (the geometry is the same).
+//
 // Framework-free; `usePreviewAdapter.ts` is the React binding.
 
 import type { ParamValues } from "@scadforge/protocol";
@@ -98,6 +104,11 @@ export function paramsKey(params: ParamValues): string {
   return JSON.stringify(params);
 }
 
+/** What the engine re-renders on: the source and the params, never the tag. */
+function sameGeometry(input: EngineInput, want: WantedRender): boolean {
+  return input.scad === want.scad && input.paramsKey === paramsKey(want.params);
+}
+
 function isActiveGesture(state: ControllerState): state is Extract<ControllerState, { begin: BeginInput }> & {
   kind: "gesture" | "preview-pending" | "preview-ok" | "preview-failed";
 } {
@@ -159,15 +170,15 @@ export class PreviewAdapter {
       settled &&
       !settled.ok &&
       !this.awaiting &&
-      this.matchesWant(settled.input, this.want) &&
-      settled.input.generation !== this.want.sample.generation
+      sameGeometry(settled.input, this.want) &&
+      (settled.input.generation !== this.want.sample.generation || settled.input.tag.projectId !== this.want.tag.projectId)
     ) {
       this.reissue();
       this.onRestart();
       return;
     }
-    this.deliver();
     this.pump();
+    this.deliver();
     this.refreshView();
   }
 
@@ -316,8 +327,8 @@ export class PreviewAdapter {
     this.awaiting = null;
     this.settled = result;
     if (result.ok) this.lastShown = result;
-    this.deliver();
     this.pump();
+    this.deliver();
     this.refreshView();
   }
 
@@ -337,8 +348,14 @@ export class PreviewAdapter {
   /** Issues the current want to the engine if nothing is in flight and the engine is not already on it. */
   private pump(): void {
     const want = this.want;
-    if (!want || this.awaiting) return;
-    if (this.input && this.matchesWant(this.input, want)) return;
+    if (!want) return;
+    const input = this.input;
+    if (input && sameGeometry(input, want)) {
+      // The engine already has (or is rendering) exactly this geometry.
+      if (input.tag.projectId !== want.tag.projectId || input.tag.editorRevision !== want.tag.editorRevision) this.retag(input, want);
+      return;
+    }
+    if (this.awaiting) return;
     this.input = {
       scad: want.scad,
       params: want.params,
@@ -346,12 +363,21 @@ export class PreviewAdapter {
       tag: want.tag,
       generation: want.sample ? want.sample.generation : null
     };
+    // The engine's scad/params change here (or it starts fresh after a reset), so a render follows.
     this.awaiting = { baselineUrl: this.lastUrl, identityAtIssue: this.lastIdentity };
     this.onChange();
   }
 
+  /** Same geometry, new project/revision: the input and its results now answer `want`. */
+  private retag(input: EngineInput, want: WantedRender): void {
+    const next: EngineInput = { ...input, tag: { ...want.tag }, generation: want.sample ? want.sample.generation : input.generation };
+    if (this.settled?.input === input) this.settled = { ...this.settled, input: next };
+    if (this.lastShown?.input === input) this.lastShown = { ...this.lastShown, input: next };
+    this.input = next;
+  }
+
   private matchesWant(input: EngineInput, want: WantedRender): boolean {
-    return input.scad === want.scad && input.paramsKey === paramsKey(want.params) && input.tag.projectId === want.tag.projectId;
+    return sameGeometry(input, want) && input.tag.projectId === want.tag.projectId;
   }
 
   private refreshView(): void {

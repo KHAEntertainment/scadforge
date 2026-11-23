@@ -192,4 +192,30 @@ describe("PreviewAdapter", () => {
     adapter.engineUpdate(engineEvent("ok", "blob:wall-3"));
     expect(write).not.toHaveBeenCalled();
   });
+
+  it("never waits for a render it did not request: identical geometry for another project reuses the settled render (F3)", () => {
+    const { controller, adapter } = setup();
+    const display = (projectId: string): WantedRender => ({ scad: SCAD, params: { wall: 2 }, tag: { projectId, editorRevision: REV }, sample: null });
+    adapter.setWant(display("pA"));
+    const issued = adapter.engineInput();
+    adapter.engineUpdate(engineEvent("pending", null));
+    adapter.engineUpdate(engineEvent("ok", "blob:wall-2"));
+    expect(adapter.previewView().status).toBe("ok");
+
+    // Same source and params, another project: the engine would see no change and never render.
+    adapter.setWant(display("pB"));
+    expect(adapter.engineInput()?.scad).toBe(issued?.scad);
+    expect(adapter.engineInput()?.paramsKey).toBe(issued?.paramsKey);
+    expect(adapter.engineInput()?.tag.projectId).toBe("pB");
+    expect(adapter.previewView()).toMatchObject({ status: "ok", tag: { projectId: "pB" }, shown: { objectUrl: "blob:wall-2", tag: { projectId: "pB" } } });
+
+    // The next candidate is not queued behind a phantom render.
+    begin(controller);
+    const want = { ...propose(controller, 3), tag: { projectId: "pB", editorRevision: REV } };
+    adapter.setWant(want);
+    expect(adapter.engineInput()?.params).toEqual({ wall: 3 });
+    adapter.engineUpdate(engineEvent("pending", "blob:wall-2"));
+    adapter.engineUpdate(engineEvent("ok", "blob:wall-3"));
+    expect(controller.state().kind).toBe("preview-ok");
+  });
 });
