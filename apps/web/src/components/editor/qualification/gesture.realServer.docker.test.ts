@@ -39,6 +39,7 @@ import {
   createInterceptedFetch,
   createProjectsDir,
   disposeHost,
+  HOOK_TIMEOUT_MS,
   eligibilityOf,
   readEditorDocument,
   seedSidecar,
@@ -112,12 +113,12 @@ beforeEach(async () => {
   projects = await createProjectsDir();
   server = await startServerChild(tracker, projects.dir);
   wire = createInterceptedFetch();
-});
+}, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await tracker.killAll();
   await projects.cleanup();
-});
+}, HOOK_TIMEOUT_MS);
 
 describe.skipIf(!dockerAvailable())("@docker C5 controller qualification against the real server (criterion 1, gesture cases)", () => {
   it("integration_cancel_before_submit_writes_nothing", async () => {
@@ -220,14 +221,70 @@ describe.skipIf(!dockerAvailable())("@docker C5 controller qualification against
         candidateValue: CANDIDATE
       });
 
+      // The parameter DEFINITION moves, mid-gesture, through the real source
+      // route: `pipe_dia`'s Customizer range changes its step. This is a
+      // SCHEMA change, not a value change — the definitions themselves are
+      // different afterwards.
+      const source = await host.api.getSource(project.projectId);
+      const changedSource = source.scad.replace(
+        /pipe_dia = 32;(\s*)\/\/ \[10:1:80\]/,
+        "pipe_dia = 32;$1// [10:2:80]"
+      );
+      expect(changedSource).not.toBe(source.scad);
+      await host.api.updateSource(project.projectId, { scad: changedSource, base_revision: source.revision });
+
+      const afterChange = await readEditorDocument(host.api, project.projectId);
+      // The definitions really changed.
+      expect(afterChange.parameters).not.toEqual(document.parameters);
+      expect(document.parameters.find((p) => p.name === "pipe_dia")?.step).toBe(1);
+      expect(afterChange.parameters.find((p) => p.name === "pipe_dia")?.step).toBe(2);
+      // The gesture's own parameter did not move.
+      expect(afterChange.values.wall).toBe(CLAMP_PARAMS.wall);
+      expect(afterChange.sourceRevision).not.toBe(document.sourceRevision);
+
+      const before = await snapshotCountOf(project.dir);
+
+      writePreviewSample(host.controller, CANDIDATE);
+      const result = await host.controller.finalize(proof);
+
+      expect(result.kind).toBe("rejected");
+      if (result.kind !== "rejected") throw new Error("unreachable");
+      expect(result.error?.error_code).toBe("CONFLICT");
+      expect(host.conflicts).toEqual([project.projectId]);
+      expect(host.controller.state().kind).toBe("idle");
+      expect(host.controller.history().entries).toHaveLength(0);
+      expect(await snapshotCountOf(project.dir)).toBe(before);
+    } finally {
+      disposeHost(host);
+    }
+  }, 120000);
+
+  it("integration_params_value_change_mid_gesture_invalidates_controller", async () => {
+    const project = await createClampProject(server.baseUrl, projects.dir, "c5-params-value-change");
+
+    const host = createHost({ baseUrl: server.baseUrl, projectId: project.projectId, fetchImpl: wire.fetchImpl });
+    try {
+      await seedSidecar(project.dir, [clampWallFeature(project.projectId)]);
+      const document = await readEditorDocument(host.api, project.projectId);
+      const proof = await beginTypedGesture(host, {
+        featureId: CLAMP_WALL_FEATURE_ID,
+        bindingVersion: 1,
+        baseValue: CLAMP_PARAMS.wall,
+        candidateValue: CANDIDATE
+      });
+
       // The AUTHORITATIVE PARAMETER SET moves, mid-gesture, through the real
       // params route. (`width`, not the parameter the gesture touches: the
-      // authority moved, the gesture's own subject did not.)
+      // authority moved, the gesture's own subject did not.) This is a VALUE
+      // change — the parameter definitions are untouched; the schema change
+      // is its own case above.
       await host.api.updateParams(project.projectId, { values: { width: CLAMP_PARAMS.width + 1 } });
       const afterChange = await readEditorDocument(host.api, project.projectId);
       expect(afterChange.sourceRevision).not.toBe(document.sourceRevision);
       expect(afterChange.values.width).toBe(CLAMP_PARAMS.width + 1);
       expect(afterChange.values.wall).toBe(CLAMP_PARAMS.wall);
+      // The definitions did NOT change — this is the other case.
+      expect(afterChange.parameters).toEqual(document.parameters);
 
       const before = await snapshotCountOf(project.dir);
 
@@ -335,14 +392,25 @@ describe.skipIf(!dockerAvailable())("@docker C5 controller qualification against
         value: 9
       });
       const postsBeforeExternal = wire.callsMatching((url, method) => method === "POST" && url.includes("/editor/commands")).length;
+      const snapshotsBeforeExternal = await snapshotCountOf(project.dir);
       const writerResult = await writer.controller.submitVerified(
         { kind: "set-value", featureId: CLAMP_WALL_FEATURE_ID, bindingVersion: 1, value: 9 },
         writerProof,
         "edit",
         null,
-        { beforeValue: 7 }
+        // The store holds 5 here: the second edit took it to 7 and the undo
+        // above brought it back to 5.
+        { beforeValue: 5 }
       );
       expect(writerResult.kind).toBe("committed");
+      if (writerResult.kind !== "committed") throw new Error("unreachable");
+
+      // F5: the store, after the second writer's commit — the stored value,
+      // exactly one more snapshot, and the head being the second writer's.
+      const storeAfterExternal = await readEditorDocument(host.api, project.projectId);
+      expect(storeAfterExternal.values.wall).toBe(9);
+      expect(await snapshotCountOf(project.dir)).toBe(snapshotsBeforeExternal + 1);
+      expect(storeAfterExternal.head).toBe(writerResult.receipt.snapshotId);
 
       // The peer-committed signal reached the first controller.
       expect(host.peerCommitted).toBeGreaterThanOrEqual(1);
