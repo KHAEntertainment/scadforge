@@ -110,6 +110,26 @@ describe("SessionLog", () => {
     expect(log.history().entries).toHaveLength(1);
   });
 
+  it("invalidate marks every entry stale WITHOUT removing any, so an in-flight traversal still finds its target", () => {
+    const log = new SessionLog();
+    appended(log, "op-1", rev("a"), rev("b"));
+    appended(log, "op-2", rev("b"), rev("c"));
+    log.applyTraversal({ operationId: "op-2", direction: "undo" }, receipt("op-3", rev("c"), rev("d"))); // redo available
+
+    expect(log.invalidate()).toBe(true);
+
+    expect(log.history()).toMatchObject({ cursor: 1, canUndo: false, canRedo: false, undoTarget: null, redoTarget: null });
+    expect(log.history().entries).toHaveLength(2);
+    expect(log.history().entries.every((e) => e.stale)).toBe(true);
+    expect(log.invalidate()).toBe(false);
+    // The redo accepted afterwards still moves the cursor, and the next fresh append drops the stale redo side.
+    expect(log.applyTraversal({ operationId: "op-2", direction: "redo" }, receipt("op-4", rev("d"), rev("e")))).toBe(true);
+    expect(log.history().cursor).toBe(2);
+    log.applyTraversal({ operationId: "op-2", direction: "undo" }, receipt("op-5", rev("e"), rev("f")));
+    appended(log, "op-6", rev("f"), rev("1"));
+    expect(log.history().entries.map((e) => e.entry.operationId)).toEqual(["op-1", "op-6"]);
+  });
+
   it("reconcileRevision: baseline, equal revision and a different revision (external write)", () => {
     const log = new SessionLog();
     expect(log.reconcileRevision(rev("a"))).toBe(false); // first read sets the baseline
@@ -152,6 +172,7 @@ describe("SessionLog", () => {
     expect(Object.isFrozen(h)).toBe(true);
     expect(Object.isFrozen(h.entries)).toBe(true);
     expect(Object.isFrozen(h.entries[0].entry)).toBe(true);
+    expect(Object.isFrozen(h.entries[0])).toBe(true); // the { entry, stale } wrapper too
     log.clearRedo(); // nothing to clear
     expect(log.history()).toBe(h);
   });

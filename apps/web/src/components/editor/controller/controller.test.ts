@@ -1084,13 +1084,13 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
     controller.setGuardInputs(idleGuardInputs({ externalWriteUnsettled: true }));
 
     // Redo is gone, every remaining entry is stale, undo is unavailable.
-    expect(summary(controller)).toEqual({ cursor: 1, entries: 1, canUndo: false, canRedo: false, stale: 1 });
+    expect(summary(controller)).toEqual({ cursor: 1, entries: 2, canUndo: false, canRedo: false, stale: 2 });
     expect(controller.history().undoTarget).toBeNull();
     expect(controller.prepareTraversal("undo")).toEqual({ ok: false, reason: "disabled" }); // external-write-unsettled disables the gesture
 
     controller.setGuardInputs(idleGuardInputs());
     expect(controller.prepareTraversal("undo")).toEqual({ ok: false, reason: "stale-log" });
-    expect(controller.prepareTraversal("redo")).toEqual({ ok: false, reason: "nothing-to-redo" });
+    expect(controller.prepareTraversal("redo")).toEqual({ ok: false, reason: "stale-log" }); // stale, never traversable
   });
 
   it("a re-read showing a revision other than the last receipt's invalidates the same way", async () => {
@@ -1098,7 +1098,7 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
 
     controller.notifyDocumentRevision(R4); // R3 was our last receipt
 
-    expect(summary(controller)).toEqual({ cursor: 1, entries: 1, canUndo: false, canRedo: false, stale: 1 });
+    expect(summary(controller)).toEqual({ cursor: 1, entries: 2, canUndo: false, canRedo: false, stale: 2 });
   });
 
   it("controller_undo_submits_traversal_command_with_original_operationId", async () => {
@@ -1294,7 +1294,7 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
         await c.finalize(makeProof({ baseEditorRevision: R3 }));
         c.notifyDocumentRevision(R4); // the refreshed authority differs from our last receipt
       },
-      expected: { cursor: 1, entries: 1, canUndo: false, canRedo: false, stale: 1 }
+      expected: { cursor: 1, entries: 2, canUndo: false, canRedo: false, stale: 2 }
     },
     {
       row: "ambiguous response: frozen while resolving, moves exactly once on the accepted receipt",
@@ -1343,7 +1343,7 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
       act: async (c) => {
         c.setGuardInputs(idleGuardInputs({ externalWriteUnsettled: true }));
       },
-      expected: { cursor: 1, entries: 1, canUndo: false, canRedo: false, stale: 1 }
+      expected: { cursor: 1, entries: 2, canUndo: false, canRedo: false, stale: 2 }
     }
   ];
 
@@ -1534,22 +1534,53 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
     expect(summary(controller)).toEqual({ cursor: 1, entries: 1, canUndo: true, canRedo: false, stale: 0 });
   });
 
-  it("an undo accepted after an external write invalidated the log leaves the cursor where it was but follows the receipt's revision", async () => {
+  it("F1: an undo accepted after an external write invalidated the log still moves the cursor once, from the receipt", async () => {
     const { deps, client } = makeDeps();
     const controller = new TransactionController(deps);
     await commitEdit(controller, client, { from: 40, to: 43, base: HEX64_A, revision: R1 });
     await commitEdit(controller, client, { from: 43, to: 46, base: R1, revision: R2 });
     const prepared = controller.prepareTraversal("undo");
     if (!prepared.ok) throw new Error("expected a traversal");
-    client.queueCommitOutcome(definiteCommitted(nextReceipt(client, R2, R3)));
+    const respond = client.queueDeferredCommit(); // the undo's response is held
     const sending = controller.submitTraversal(prepared, makeProof({ baseEditorRevision: R2 }));
-    // An external write lands while the undo is in flight.
-    controller.setGuardInputs(idleGuardInputs({ externalWriteUnsettled: true }));
-    await sending;
+    await flushMicrotasks();
+    expect(controller.state().kind).toBe("committing");
 
-    expect(controller.history().entries.every((e) => e.stale)).toBe(true);
-    expect(controller.history().canUndo).toBe(false);
-    expect(controller.history().canRedo).toBe(false);
+    // An external write lands while the undo is in flight; then the accepted receipt arrives.
+    controller.setGuardInputs(idleGuardInputs({ externalWriteUnsettled: true }));
+    respond(definiteCommitted(nextReceipt(client, R2, R3)));
+    const result = await sending;
+
+    expect(result.kind).toBe("committed");
+    expect(summary(controller)).toEqual({ cursor: 1, entries: 2, canUndo: false, canRedo: false, stale: 2 });
+  });
+
+  it("F1: a redo accepted after an external write invalidated the log still moves the cursor once, from the receipt", async () => {
+    const { controller, client } = await makeUndoneSession(); // cursor 1 of 2, redo available
+    const prepared = controller.prepareTraversal("redo");
+    if (!prepared.ok) throw new Error("expected a traversal");
+    const respond = client.queueDeferredCommit(); // the redo's response is held
+    const sending = controller.submitTraversal(prepared, makeProof({ baseEditorRevision: R3 }));
+    await flushMicrotasks();
+    expect(controller.state().kind).toBe("committing");
+
+    controller.setGuardInputs(idleGuardInputs({ externalWriteUnsettled: true }));
+    respond(definiteCommitted(nextReceipt(client, R3, R4)));
+    const result = await sending;
+
+    expect(result.kind).toBe("committed");
+    // The redo's target survived the invalidation: the cursor advanced exactly once, and nothing is traversable.
+    expect(summary(controller)).toEqual({ cursor: 2, entries: 2, canUndo: false, canRedo: false, stale: 2 });
+  });
+
+  it("F1: a re-read showing another revision, delivered after the accepted redo, leaves the cursor where the receipt put it", async () => {
+    const { controller, client } = await makeUndoneSession();
+    await traverse(controller, client, "redo", R4);
+    expect(summary(controller).cursor).toBe(2);
+
+    controller.notifyDocumentRevision(REV("5"));
+
+    expect(summary(controller)).toEqual({ cursor: 2, entries: 2, canUndo: false, canRedo: false, stale: 2 });
   });
 
   // ── prepare / submit traversal (the host's await in between) ─────────────
@@ -1695,6 +1726,70 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
     controller.cancel("escape");
 
     expect(await first).toEqual({ kind: "cancelled" });
+  });
+
+  it("F2: leaving mid-commit and returning before the POST settles — an ambiguous lookup keeps the record and reports nothing; a later committed answer reconciles exactly once", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, client } = makeDeps();
+      const store = deps.pendingReceipts!;
+      const left = new TransactionController(deps);
+      left.begin(makeBeginInput());
+      reachPreviewOk(left, 43);
+      client.queueDeferredCommit(); // the POST is still outstanding
+      const leaving = left.finalize(makeProof());
+      await vi.advanceTimersByTimeAsync(0);
+      expect(left.detach()).toBe("op-1");
+      await leaving;
+      left.dispose();
+
+      // Back on the project: the client cannot yet prove either way (the POST is still in flight).
+      const receipt = makeReceipt({ operationId: "op-1" });
+      client.queueLookupOutcome({ kind: "ambiguous", cause: "server-unknown" });
+      client.queueLookupOutcome(definiteCommitted(receipt));
+      const onPendingReconciled = vi.fn();
+      new TransactionController({ ...deps, onPendingReconciled });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(client.lookups).toHaveLength(1);
+      expect(onPendingReconciled).not.toHaveBeenCalled();
+      expect(store.has("project-1", "op-1")).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(RESOLVING_MAX_DELAY_MS);
+
+      expect(client.lookups).toHaveLength(2);
+      expect(onPendingReconciled).toHaveBeenCalledTimes(1);
+      expect(onPendingReconciled).toHaveBeenCalledWith({ operationId: "op-1", outcome: "committed", receipt });
+      expect(store.has("project-1", "op-1")).toBe(false);
+      await vi.advanceTimersByTimeAsync(RESOLVING_MAX_DELAY_MS * 4);
+      expect(onPendingReconciled).toHaveBeenCalledTimes(1); // exactly once
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("F3: an awaited reconcilePending() settles across dispose() and performs no further lookup", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, client } = makeDeps();
+      deps.pendingReceipts!.record({ projectId: "project-1", operationId: "op-1", intent: "edit", traversal: null });
+      client.queueLookupOutcome({ kind: "ambiguous", cause: "server-unknown" });
+      const controller = new TransactionController(deps);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(client.lookups).toHaveLength(1); // now waiting out a backoff
+
+      const settled = vi.fn();
+      void controller.reconcilePending().then(settled);
+      controller.dispose();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(RESOLVING_MAX_DELAY_MS * 4);
+      expect(client.lookups).toHaveLength(1);
+      expect(deps.pendingReceipts!.has("project-1", "op-1")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ── C2 QA gaps (criterion 11) ────────────────────────────────────────────

@@ -110,8 +110,9 @@ export class TransactionController {
 
   private readonly log = new SessionLog();
   private readonly pendingReceipts: NonNullable<TransactionControllerDeps["pendingReceipts"]>;
-  private readonly reconcileTimers = new Set<number>();
-  private reconciling = false;
+  /** Pending reconciliation backoff waits: timer handle -> the resolver of the promise awaiting it. */
+  private readonly reconcileWaits = new Map<number, () => void>();
+  private reconcileRun: Promise<void> | null = null;
 
   constructor(private readonly deps: TransactionControllerDeps) {
     this.pendingReceipts = deps.pendingReceipts ?? sharedPendingReceipts;
@@ -700,19 +701,20 @@ export class TransactionController {
    * log, and never to another project (the store is keyed by project and the
    * lookup uses this controller's own `projectId`).
    */
-  async reconcilePending(): Promise<void> {
-    if (this.disposed || this.reconciling) return;
+  reconcilePending(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    if (this.reconcileRun) return this.reconcileRun;
     const records = this.pendingReceipts.list(this.deps.projectId);
-    if (records.length === 0) return;
-    this.reconciling = true;
-    try {
-      await Promise.all(records.map((record) => this.reconcileOne(record, 1)));
-    } finally {
-      this.reconciling = false;
-    }
+    if (records.length === 0) return Promise.resolve();
+    const run = Promise.all(records.map((record) => this.reconcileOne(record, 1))).then(() => {
+      if (this.reconcileRun === run) this.reconcileRun = null;
+    });
+    this.reconcileRun = run;
+    return run;
   }
 
   private async reconcileOne(record: PendingReceiptRecord, attempt: number): Promise<void> {
+    if (this.disposed) return; // re-checked before every lookup, including after a backoff wait
     let outcome: CommitOutcome;
     try {
       outcome = await this.deps.client.lookupOperation(this.deps.projectId, record.operationId);
@@ -725,10 +727,10 @@ export class TransactionController {
       // Still unknown: never treated as rejected, never dropped. Keep polling.
       await new Promise<void>((resolve) => {
         const handle = this.deps.timer.setTimeout(() => {
-          this.reconcileTimers.delete(handle);
+          this.reconcileWaits.delete(handle);
           resolve();
         }, resolvingBackoffDelayMs(attempt));
-        this.reconcileTimers.add(handle);
+        this.reconcileWaits.set(handle, resolve);
       });
       return this.reconcileOne(record, attempt + 1);
     }
@@ -795,8 +797,14 @@ export class TransactionController {
     this.detach();
     this.disposed = true;
     this.unsubscribePort();
-    for (const handle of this.reconcileTimers) this.deps.timer.clearTimeout(handle);
-    this.reconcileTimers.clear();
+    // Cancel the backoff timers AND settle the promises awaiting them, so an
+    // awaited `reconcilePending()` completes; `reconcileOne` then sees
+    // `disposed` and performs no further lookup.
+    for (const [handle, settle] of this.reconcileWaits) {
+      this.deps.timer.clearTimeout(handle);
+      settle();
+    }
+    this.reconcileWaits.clear();
     this.secondTabDetector.close();
     this.listeners.clear();
   }

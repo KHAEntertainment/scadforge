@@ -118,7 +118,7 @@ export class SessionLog {
       snapshotId: receipt.snapshotId,
       acceptedAt
     });
-    this.entries = [...this.entries.slice(0, this.cursor), { entry, stale: false }];
+    this.entries = [...this.entries.slice(0, this.cursor), Object.freeze({ entry, stale: false })];
     this.cursor = this.entries.length;
     this.adoptTip(receipt);
     this.cached = null;
@@ -144,7 +144,13 @@ export class SessionLog {
     return moved;
   }
 
-  /** Drop the redo stack (display failure; accepted fresh edit does this implicitly). */
+  /**
+   * Drop the redo stack (display failure). Truncating is safe HERE and only
+   * here: the controller calls this only while `committing` with a receipt
+   * already applied, i.e. no commit (so no traversal) is in flight, and a
+   * traversal can only start from `idle`. Invalidation by an external write
+   * (below) must NOT truncate, because there a traversal may be in flight.
+   */
   clearRedo(): void {
     if (this.cursor >= this.entries.length) return;
     this.entries = this.entries.slice(0, this.cursor);
@@ -154,8 +160,8 @@ export class SessionLog {
   /**
    * The document cache reports a completed read at `revision`. A revision
    * different from the last receipt's means somebody else wrote: every entry
-   * is stale (undo's server-side precondition can no longer hold) and redo is
-   * cleared. Returns whether the tip moved (the host-visible history may have).
+   * is stale (undo's server-side precondition can no longer hold), which also
+   * makes redo unavailable. Returns whether the tip moved (the host-visible history may have).
    */
   reconcileRevision(revision: string, sidecarDigest?: string): boolean {
     if (this.tipRevision === null) {
@@ -177,12 +183,16 @@ export class SessionLog {
     return true;
   }
 
-  /** External write: mark every entry stale and clear redo. Returns whether anything changed. */
+  /**
+   * External write: mark every entry stale (never traversable, so undo and
+   * redo are both unavailable) WITHOUT removing any. An undo/redo already in
+   * flight may still be accepted, and its receipt must find its target entry
+   * to move the cursor; the stale redo side is truncated by the next
+   * `appendFresh`. Returns whether anything changed.
+   */
   invalidate(): boolean {
-    const hadRedo = this.cursor < this.entries.length;
-    const hadFresh = this.entries.some((e) => !e.stale);
-    if (!hadRedo && !hadFresh) return false;
-    this.entries = this.entries.slice(0, this.cursor).map((e) => (e.stale ? e : { entry: e.entry, stale: true }));
+    if (this.entries.every((e) => e.stale)) return false;
+    this.entries = this.entries.map((e) => (e.stale ? e : Object.freeze({ entry: e.entry, stale: true })));
     this.cached = null;
     return true;
   }
