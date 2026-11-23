@@ -563,3 +563,92 @@ describe("F2 (C3): a lookup for an id whose commit is still in flight is never a
     expect(calls.map((c) => c.method)).toEqual(["POST", "GET"]);
   });
 });
+
+// ── Issue #137 comment 1 (carried into C5): re-send identity + the disposed lifetime ──
+//
+// Comment 1, item 1: tighten the re-send identity regression — mutate a NESTED
+// value of the original request IN PLACE between the ambiguous answer and the
+// lookup-triggered re-send, and assert the body string is unchanged. The
+// existing edge-case-1 test replaces `request.command` wholesale, which a
+// SHALLOW copy of the request would also survive; only an in-place mutation
+// of a nested value tells a deep snapshot apart from a shallow one.
+//
+// Comment 1, item 2: the missing lifetime case — a lookup that resolves with a
+// terminal `rejected` + `CONFLICT` AFTER `dispose()` must not call
+// `onDefiniteConflict`.
+//
+// Neither case weakens or removes an existing assertion: both are additions.
+
+/** A terminal claim rejection whose frozen error code is CONFLICT. */
+function opRejectedConflict() {
+  return {
+    version: 1,
+    state: "definitely_not_committed",
+    requestDigest: "d".repeat(64),
+    reason: "rejected",
+    error: { error_code: "CONFLICT", message: "the base editor revision is stale" }
+  };
+}
+
+describe("carried from Issue #137 comment 1: re-send identity and the disposed lifetime", () => {
+  it("item 1: mutating request.command.value IN PLACE leaves the re-send's body string unchanged", async () => {
+    const { client, calls } = makeApi([
+      { kind: "throw", error: new TypeError("Failed to fetch") }, // POST #1 — network error
+      json(opUnclaimed()), // GET — unclaimed, which triggers the background re-send
+      json(receiptBody()) // POST #2 — the re-send
+    ]);
+    const adapter = createEditorClient({ client });
+    const request = commitRequest();
+
+    const first = await adapter.commit("hinged-box", request);
+    expect(first).toEqual({ kind: "ambiguous", cause: "network-error" });
+
+    // The caller mutates a NESTED value of its own request object, in place.
+    // A shallow copy of the request would let this reach the wire.
+    if (request.command.kind !== "set-value") throw new Error("unreachable");
+    request.command.value = 999;
+
+    await adapter.lookupOperation("hinged-box", OP_ID);
+    await flush();
+
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET", "POST"]);
+    // The re-send carries the ORIGINAL bytes.
+    expect(calls[2].body).toBe(calls[0].body);
+    expect(JSON.parse(calls[2].body ?? "").command.value).toBe(10);
+  });
+
+  it("item 2: a lookup resolving with a terminal rejected + CONFLICT after dispose() does not fire onDefiniteConflict", async () => {
+    // Control: the very same body DOES fire the hook while the adapter lives,
+    // so the second half of this case is not vacuous.
+    const control = makeApi([
+      { kind: "throw", error: new TypeError("Failed to fetch") },
+      { kind: "deferred" }
+    ]);
+    const controlHook = vi.fn();
+    const liveAdapter = createEditorClient({ client: control.client, onDefiniteConflict: controlHook });
+    await liveAdapter.commit("hinged-box", commitRequest());
+    const liveLookup = liveAdapter.lookupOperation("hinged-box", OP_ID);
+    await flush();
+    control.deferreds[0].resolve(rawJson(opRejectedConflict()));
+    await liveLookup;
+    expect(controlHook).toHaveBeenCalledTimes(1);
+
+    // The same race, but the adapter is disposed before the lookup settles.
+    const { client, deferreds } = makeApi([
+      { kind: "throw", error: new TypeError("Failed to fetch") },
+      { kind: "deferred" }
+    ]);
+    const onDefiniteConflict = vi.fn();
+    const adapter = createEditorClient({ client, onDefiniteConflict });
+    await adapter.commit("hinged-box", commitRequest());
+    const lookup = adapter.lookupOperation("hinged-box", OP_ID);
+    await flush();
+
+    adapter.dispose();
+
+    deferreds[0].resolve(rawJson(opRejectedConflict()));
+    await lookup;
+
+    expect(onDefiniteConflict).not.toHaveBeenCalled();
+  });
+});
