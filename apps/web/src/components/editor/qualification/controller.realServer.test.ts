@@ -223,7 +223,9 @@ describe("C5 controller qualification against the real server (criterion 1)", ()
       // wrapper's lost-response error, so the client could not have read the
       // 409 itself. (Without the drop, this case's name would be a lie: a
       // plain first-attempt 409 is definite on its own.)
-      expect(post[0].error).toContain("the response was lost after the request was sent");
+      expect(post[0].error ?? "<no error recorded>").toContain(
+        "the response was lost after the request was sent"
+      );
 
       // ...and the rejection came from a REAL terminal claim, read through
       // the real operations route for THIS operation.
