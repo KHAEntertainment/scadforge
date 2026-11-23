@@ -60,8 +60,8 @@ export class FakeEditorClient implements EditorClient {
   readonly commits: RecordedCommit[] = [];
   readonly lookups: RecordedLookup[] = [];
 
-  private commitQueue: CommitOutcome[] = [];
-  private lookupQueue: CommitOutcome[] = [];
+  private commitQueue: Array<CommitOutcome | Promise<CommitOutcome>> = [];
+  private lookupQueue: Array<CommitOutcome | Promise<CommitOutcome>> = [];
 
   queueCommitOutcome(outcome: CommitOutcome): this {
     this.commitQueue.push(outcome);
@@ -71,6 +71,31 @@ export class FakeEditorClient implements EditorClient {
   queueLookupOutcome(outcome: CommitOutcome): this {
     this.lookupQueue.push(outcome);
     return this;
+  }
+
+  /** Queues a commit whose response is held until the returned function is called (a POST still in flight). */
+  queueDeferredCommit(): (outcome: CommitOutcome) => void {
+    let resolve!: (outcome: CommitOutcome) => void;
+    this.commitQueue.push(
+      new Promise<CommitOutcome>((r) => {
+        resolve = r;
+      })
+    );
+    return resolve;
+  }
+
+  /**
+   * Queues a lookup that stays pending until the returned function is called —
+   * for asserting what a late callback does after `dispose()`.
+   */
+  queueDeferredLookup(): (outcome: CommitOutcome) => void {
+    let resolve!: (outcome: CommitOutcome) => void;
+    this.lookupQueue.push(
+      new Promise<CommitOutcome>((r) => {
+        resolve = r;
+      })
+    );
+    return resolve;
   }
 
   async commit(projectId: string, request: EditorCommitRequest): Promise<CommitOutcome> {

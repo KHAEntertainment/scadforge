@@ -308,8 +308,15 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
       winner === TIMEOUT ? { ok: false, failure: { kind: "timeout" } } : winner;
     const outcome = classifyLookupAttempt(settled, {
       // R2: the `unclaimed`-is-not-definite rule applies only to an id with a
-      // recorded ambiguous commit attempt in this adapter instance.
-      hasAmbiguousCommit: record?.ambiguousReturned ?? false
+      // record in this adapter instance (no record: the server's answer
+      // passes through). A live record with no definite outcome is an
+      // UNRESOLVED commit attempt even if nothing ambiguous has been
+      // returned yet: the POST may still be in flight (the user navigated
+      // away and came back before it settled) and can still commit, so
+      // `unclaimed` must not be read as definite. The re-send gate below
+      // stays `ambiguousReturned`, so no second POST starts while the first
+      // attempt is outstanding.
+      hasAmbiguousCommit: record !== null
     });
     if (outcome.kind === "definite") {
       if (record) {
