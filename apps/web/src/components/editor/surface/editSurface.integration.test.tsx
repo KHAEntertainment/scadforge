@@ -61,6 +61,13 @@ vi.mock("../../../wasm/index.js", () => ({
   useWasmPreview: (scad: string | null, params: ParamValues, enabled: boolean) => holder.hook!(scad, params, enabled)
 }));
 
+// The Code tab's Monaco editor, as a plain textarea (jsdom cannot run Monaco).
+vi.mock("@monaco-editor/react", () => ({
+  default: ({ value, onChange }: { value: string; onChange?: (next: string | undefined) => void }) => (
+    <textarea aria-label="OpenSCAD source" value={value} onChange={(event) => onChange?.(event.target.value)} />
+  )
+}));
+
 let engine = new FakeEngine();
 const IDLE_RESULT: EngineResult = { status: "idle", objectUrl: null, stderr: null, lastRenderMs: null, coldInit: null };
 
@@ -633,6 +640,59 @@ describe("Edit surface — PR #140 fix batch 1", () => {
     await saveWall("4");
     expect(server.values("p2")).toEqual({ wall: 4 });
     expect(server.values("p1")).toEqual({ wall: 2 });
+  });
+
+  it("F1: after an editor save, Build waits for the source re-read, then sends the post-commit source revision", async () => {
+    render(<App />);
+    await openEdit();
+    const reread = server.hold("source-get");
+    await saveWall("3");
+    await reread.arrived;
+    const header = screen.getByRole("banner");
+    const build = within(header).getByRole("button", { name: /^Build$/ });
+
+    // Pressed before the clean source editor has the post-commit revision: nothing is sent.
+    fireEvent.click(build);
+    await screen.findByText("Loading the latest source before building…");
+    expect(server.buildPosts).toHaveLength(0);
+
+    reread.release();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    fireEvent.click(build);
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].current).toBe(true);
+    await screen.findByText(/Build complete/);
+  });
+
+  it("F1: a dirty source draft typed while an editor commit is in flight survives the commit", async () => {
+    render(<App />);
+    await openEdit();
+    const hold = server.hold("commit");
+    typeWall("3");
+    clickButton("Save");
+    await hold.arrived;
+
+    fireEvent.click(screen.getByRole("tab", { name: /code/i }));
+    await screen.findByLabelText("OpenSCAD source");
+    // The lazy editor replaces its Suspense fallback; type into the one that stays.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    const source = screen.getByLabelText("OpenSCAD source") as HTMLTextAreaElement;
+    const draft = "cube([wall, 12, 10]); // my draft";
+    fireEvent.change(source, { target: { value: draft } });
+    expect((screen.getByLabelText("OpenSCAD source") as HTMLTextAreaElement).value).toBe(draft);
+    const sourceReads = server.log.filter((line) => line === "GET /projects/p1/source").length;
+
+    hold.release();
+    await waitFor(() => expect(server.acceptedCommits).toBe(1));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect((screen.getByLabelText("OpenSCAD source") as HTMLTextAreaElement).value).toBe(draft);
+    expect(server.log.filter((line) => line === "GET /projects/p1/source")).toHaveLength(sourceReads);
   });
 });
 

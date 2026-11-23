@@ -90,7 +90,7 @@ export interface Hold {
   arrived: Promise<void>;
 }
 
-type Route = "editor-get" | "verify" | "commit" | "operation" | "params-update" | "chat";
+type Route = "editor-get" | "verify" | "commit" | "operation" | "params-update" | "chat" | "source-get";
 
 const ZERO_REV = "0".repeat(64);
 
@@ -130,6 +130,8 @@ export class FakeEditorServer {
   afterCommit: ((projectId: string) => void) | null = null;
   /** The next GET /editor for these project ids answers 500. */
   readonly failEditorGet = new Set<string>();
+  /** Build POSTs received, with the base revision each sent and whether it was current. */
+  readonly buildPosts: Array<{ projectId: string; baseRevision: string; current: boolean }> = [];
   /**
    * When set, the next chat POST is a fast turn: the agent writes these values,
    * then `turn_started` and `turn_done` arrive in ONE chunk (one render), and
@@ -263,7 +265,10 @@ export class FakeEditorServer {
       this.addSnapshot(state, "params");
       return json(200, { title: state.id, parameters: state.parameters, values: state.values });
     }
-    if (rest === "/source" && method === "GET") return json(200, { ...this.projectResponse(state), revision: this.sourceRevision(state) });
+    if (rest === "/source" && method === "GET") {
+      await this.passHold("source-get");
+      return json(200, { ...this.projectResponse(state), revision: this.sourceRevision(state) });
+    }
     if (rest === "/export" && method === "POST") {
       return json(200, {
         export: { snapshot: state.snapshots[0].id, format: "3mf", file: `${state.id}.3mf`, url: `/api/projects/${state.id}/exports/${state.id}.3mf`, bytes: 3, timestamp: "2026-11-01T00:00:00.000Z" },
@@ -271,6 +276,12 @@ export class FakeEditorServer {
       });
     }
     if (rest.startsWith("/exports/")) return new Response(new Blob(["3mf"]), { status: 200 });
+    if (rest === "/build" && method === "POST") {
+      const baseRevision = (body as { base_revision: string }).base_revision;
+      const current = baseRevision === this.sourceRevision(state);
+      this.buildPosts.push({ projectId: state.id, baseRevision, current });
+      return current ? json(200, { snapshot: state.snapshots[0] }) : apiError(409, "CONFLICT", "The source changed since this revision; reload and build again.");
+    }
     if (rest === "/chat" && method === "POST") return this.chat(state);
 
     // ── editor routes ────────────────────────────────────────────────────

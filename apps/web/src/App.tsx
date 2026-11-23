@@ -75,6 +75,17 @@ export function App() {
     reportEditorWriteRef.current("params-saved");
   }, [snapshots.refresh]);
   const paramsController = useParamsController(client, projectId, workingHeadId, handleParamsSaved);
+  // F1: an accepted editor commit changes the source revision Build sends
+  // (`computeSourceRevision(head, scad, params)`). A CLEAN source editor
+  // adopts it; a dirty or saving draft is never dropped (it keeps its base
+  // and surfaces as a conflict, as for any other external write).
+  const sourceEditorRef = useRef(sourceEditor);
+  sourceEditorRef.current = sourceEditor;
+  const handleEditorCommitted = useCallback(() => {
+    snapshots.refresh();
+    const source = sourceEditorRef.current;
+    if (!source.dirty && !source.saving) source.reload();
+  }, [snapshots.refresh]);
   const editorSession = useEditorSession({
     api: client,
     projectId,
@@ -84,7 +95,7 @@ export function App() {
     paramsSaving: paramsController.saving,
     chatItems: chat.state.items,
     chatStreaming: chat.isStreaming,
-    onCommitted: snapshots.refresh
+    onCommitted: handleEditorCommitted
   });
   reportEditorWriteRef.current = editorSession.reportWrite;
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
@@ -140,6 +151,10 @@ export function App() {
   const pngUrls = useMemo<Partial<Record<ViewName, string | null>>>(() => Object.fromEntries((currentSnapshot?.renders ?? []).map((render) => [render.view, client.resolveUrl(render.url)])), [currentSnapshot, client]);
   const validation = currentSnapshot?.validation ?? null;
   const historical = selectedSnapshotId !== null && selectedSnapshotId !== workingHeadId;
+  // F1: from an edit's commit until the source editor has re-read the
+  // post-commit revision, Build would send a stale base revision (409).
+  const editorSaving = editorSession.state.kind === "committing" || editorSession.state.kind === "resolving";
+  const sourceReloading = editorSession.active && sourceEditor.loading;
   // Issue #78: every inline Build CTA (Preview's empty state, the status
   // panel's "Not validated" state) mirrors the header Build button's own
   // disabled conditions, plus one case the header doesn't have — Build
@@ -155,9 +170,13 @@ export function App() {
           ? "Saving your source edits…"
           : sourceEditor.dirty
             ? "Save or discard your source edits before building."
-            : historical
-              ? "Build validates the current head; select the head to build"
-              : null;
+            : editorSaving
+              ? "Wait for your edit to finish saving before building."
+              : sourceReloading
+                ? "Loading the latest source before building…"
+                : historical
+                  ? "Build validates the current head; select the head to build"
+                  : null;
   const buildDisabled = buildDisabledReason !== null;
   const liveSourceReady = (liveSource.projectId === undefined || liveSource.projectId === projectId)
     && (liveSource.headSnapshotId === undefined || liveSource.headSnapshotId === workingHeadId)
@@ -217,6 +236,11 @@ export function App() {
 
   async function build() {
     if (!projectId || sourceEditor.dirty || !sourceEditor.baseRevision) return;
+    // The header's Build button has its own disabled rule; this covers it too.
+    if (editorSaving || sourceReloading) {
+      setHeaderNotice(buildDisabledReason);
+      return;
+    }
     setBuildState("building");
     setHeaderNotice(null);
     try {
