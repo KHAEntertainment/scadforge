@@ -151,6 +151,26 @@ export function App() {
   const pngUrls = useMemo<Partial<Record<ViewName, string | null>>>(() => Object.fromEntries((currentSnapshot?.renders ?? []).map((render) => [render.view, client.resolveUrl(render.url)])), [currentSnapshot, client]);
   const validation = currentSnapshot?.validation ?? null;
   const historical = selectedSnapshotId !== null && selectedSnapshotId !== workingHeadId;
+  // F4: this project's last server render (the last `ready` head mesh), the
+  // edit preview's fallback while it has nothing to show. Recorded only when
+  // the mesh result itself changes, so a result left over from the previous
+  // project or a historical selection is never recorded under the new one.
+  const [lastServerRender, setLastServerRender] = useState<{ projectId: string; url: string } | null>(null);
+  const meshOwnerRef = useRef({ projectId, historical });
+  meshOwnerRef.current = { projectId, historical };
+  useEffect(() => {
+    const owner = meshOwnerRef.current;
+    if (mesh.status === "ready" && mesh.url && owner.projectId && !owner.historical) setLastServerRender({ projectId: owner.projectId, url: mesh.url });
+  }, [mesh.status, mesh.url]);
+  const fallbackUrl = lastServerRender?.projectId === projectId ? lastServerRender.url : null;
+  // G1: the local preview takes the viewer only while it is the subject (a
+  // gesture, a save, a post-receipt step) or the head has no server mesh (absent, or still being checked);
+  // otherwise the validated server mesh stays, with Inspect and Measure.
+  const editBinding = !historical && editorSession.editPreview?.projectId === projectId ? editorSession.editPreview : null;
+  const editPreview =
+    editBinding && (editBinding.inUse || mesh.status !== "ready")
+      ? { objectUrl: editBinding.objectUrl, status: editBinding.status, fallbackUrl, fallbackIsHead: fallbackUrl !== null && fallbackUrl === mesh.url }
+      : null;
   // F1: from an edit's commit until the source editor has re-read the
   // post-commit revision, Build would send a stale base revision (409).
   const editorSaving = editorSession.state.kind === "committing" || editorSession.state.kind === "resolving";
@@ -279,7 +299,7 @@ export function App() {
       {headerNotice || exportState ? <div className="studio-notice" role="status">{headerNotice ?? exportState}<button type="button" aria-label="Dismiss notice" onClick={() => { setHeaderNotice(null); setExportState(null); }}>Dismiss</button></div> : null}
       <main className="app-body">
         <Workspace
-          preview={<PreviewTab key={`preview-${projectId ?? "no-project"}`} stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} editPreview={!historical && editorSession.editPreview?.projectId === projectId ? editorSession.editPreview : null} />}
+          preview={<PreviewTab key={`preview-${projectId ?? "no-project"}`} stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} editPreview={editPreview} />}
           chat={<ChatPanel state={chat.state} isStreaming={chat.isStreaming} streamError={chat.streamError} onSend={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} onCheckConnection={() => void chat.checkConnectionResult()} onDismissConnection={chat.dismissConnectionLost} />}
           edit={<EditSurface session={editorSession} />}
           onTabChange={(tab) => {

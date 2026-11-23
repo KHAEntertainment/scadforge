@@ -68,6 +68,12 @@ vi.mock("@monaco-editor/react", () => ({
   )
 }));
 
+// The 3D viewer records the URL it is given (jsdom has no WebGL; PreviewTab's own tests stub it the same way).
+vi.mock("../../Viewer3D.js", () => ({
+  Viewer3D: ({ stlUrl, emptyMessage }: { stlUrl: string | null; emptyMessage?: string }) =>
+    stlUrl ? <div data-testid="viewer-3d" data-url={stlUrl} /> : <div data-testid="viewer-placeholder">{emptyMessage}</div>
+}));
+
 let engine = new FakeEngine();
 const IDLE_RESULT: EngineResult = { status: "idle", objectUrl: null, stderr: null, lastRenderMs: null, coldInit: null };
 
@@ -150,6 +156,11 @@ async function saveWall(value: string): Promise<void> {
 
 function editorGets(): number {
   return server.log.filter((line) => line === "GET /projects/p1/editor").length;
+}
+
+/** The URL the 3D viewer was handed, or `null` when it shows its empty placeholder. */
+function viewerUrl(): string | null {
+  return screen.queryByTestId("viewer-3d")?.getAttribute("data-url") ?? null;
 }
 
 describe("Edit surface — integration through the UI (in-memory server double)", () => {
@@ -519,7 +530,7 @@ describe("Edit surface — carried-forward acceptance (Issue #136 comments, Tech
     engine.failing = true;
     typeWall("4");
     clickButton("Preview");
-    await waitFor(() => expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("failed — showing the last server render"));
+    await waitFor(() => expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("The local edit preview failed. There is no server render of this project to show"));
     expect(screen.queryByTestId("viewer-3d")).toBeNull();
     clickButton("Cancel");
     engine.failing = false;
@@ -693,6 +704,70 @@ describe("Edit surface — PR #140 fix batch 1", () => {
     });
     expect((screen.getByLabelText("OpenSCAD source") as HTMLTextAreaElement).value).toBe(draft);
     expect(server.log.filter((line) => line === "GET /projects/p1/source")).toHaveLength(sourceReads);
+  });
+
+  it("G1 + F4: on a built head the server mesh keeps the viewer until a preview; while it renders the server mesh shows; Cancel gives it back", async () => {
+    const headMesh = server.buildMesh("p1");
+    render(<App />);
+    await openEdit();
+    // Before any edit: the validated server mesh, with Inspect and Measure.
+    await waitFor(() => expect(viewerUrl()).toBe(headMesh), { timeout: 3000 });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(viewerUrl()).toBe(headMesh);
+    expect(screen.queryByTestId("edit-preview-status")).toBeNull();
+    expect(screen.getByTestId("inspect-toggle")).toBeEnabled();
+    expect(screen.getByTestId("measure-toggle")).toBeEnabled();
+
+    // During a preview: the server mesh (labelled as predating the edit) until the local render exists.
+    engine.mode = "manual";
+    typeWall("4");
+    clickButton("Preview");
+    await waitFor(() => expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("showing the last server render, from before this edit."));
+    expect(viewerUrl()).toBe(headMesh);
+    expect(screen.getByTestId("inspect-toggle")).toBeDisabled();
+    act(() => engine.finish(true));
+    await waitFor(() => expect(viewerUrl()).toMatch(/^blob:fake-mesh-/));
+    expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("Local edit preview — not built or validated.");
+    expect(screen.getByTestId("inspect-toggle")).toBeDisabled();
+
+    // Cancel: the server mesh again.
+    engine.mode = "auto";
+    clickButton("Cancel");
+    await waitFor(() => expect(viewerUrl()).toBe(headMesh));
+    expect(screen.queryByTestId("edit-preview-status")).toBeNull();
+    expect(screen.getByTestId("inspect-toggle")).toBeEnabled();
+  });
+
+  it("F4: after a save the new head has no mesh, so its local render shows; when a display render fails, the last server render shows, labelled as older", async () => {
+    const firstMesh = server.buildMesh("p1");
+    render(<App />);
+    await openEdit();
+    await waitFor(() => expect(viewerUrl()).toBe(firstMesh), { timeout: 3000 });
+
+    await saveWall("3");
+    await waitFor(() => expect(viewerUrl()).toMatch(/^blob:fake-mesh-/), { timeout: 3000 });
+    expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("Local edit preview — not built or validated.");
+
+    engine.failing = true;
+    clickButton("Undo");
+    await waitFor(() => expect(status()).toHaveTextContent("could not be updated"), { timeout: 3000 });
+    expect(viewerUrl()).toBe(firstMesh);
+    expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("The local edit preview failed — showing the last server render, from before your saved edits.");
+  });
+
+  it("F4: with a historical snapshot selected, the viewer shows that snapshot's server mesh and no edit preview", async () => {
+    const firstMesh = server.buildMesh("p1");
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    fireEvent.click(screen.getByRole("tab", { name: /history/i }));
+    await screen.findAllByTestId("snapshot-row");
+    fireEvent.click(screen.getAllByTestId("snapshot-row").at(-1)!);
+    await screen.findByText(/Viewing historical snapshot/);
+    await waitFor(() => expect(viewerUrl()).toBe(firstMesh), { timeout: 3000 });
+    expect(screen.queryByTestId("edit-preview-status")).toBeNull();
   });
 });
 

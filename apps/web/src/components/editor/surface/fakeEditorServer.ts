@@ -94,6 +94,9 @@ type Route = "editor-get" | "verify" | "commit" | "operation" | "params-update" 
 
 const ZERO_REV = "0".repeat(64);
 
+/** A valid one-facet ASCII STL: the body a built snapshot's mesh route serves. */
+export const FIXTURE_STL = ["solid fixture", "facet normal 0 0 1", "outer loop", "vertex 0 0 0", "vertex 10 0 0", "vertex 0 10 0", "endloop", "endfacet", "endsolid fixture", ""].join("\n");
+
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
@@ -132,6 +135,8 @@ export class FakeEditorServer {
   readonly failEditorGet = new Set<string>();
   /** Build POSTs received, with the base revision each sent and whether it was current. */
   readonly buildPosts: Array<{ projectId: string; baseRevision: string; current: boolean }> = [];
+  /** Snapshots with a built mesh, as `projectId/snapshotId`. */
+  private readonly meshes = new Set<string>();
   /**
    * When set, the next chat POST is a fast turn: the agent writes these values,
    * then `turn_started` and `turn_done` arrive in ONE chunk (one render), and
@@ -222,6 +227,13 @@ export class FakeEditorServer {
     this.addSnapshot(state, "external write");
   }
 
+  /** Builds the project's current head: its mesh route now serves `FIXTURE_STL`. Returns that route. */
+  buildMesh(projectId: string): string {
+    const head = this.state(projectId).snapshots[0];
+    this.meshes.add(`${projectId}/${head.id}`);
+    return `/api/projects/${projectId}/snapshots/${head.id}/mesh`;
+  }
+
   /** Opens nothing by itself: the next chat POST streams `turn_started` and stays open until `dropChat()`. */
   dropChat(): void {
     this.chatController?.close();
@@ -247,7 +259,11 @@ export class FakeEditorServer {
 
     if (rest === "" && method === "GET") return json(200, this.projectResponse(state));
     if (rest === "/snapshots" && method === "GET") return json(200, { snapshots: state.snapshots });
-    if (/^\/snapshots\/[^/]+\/mesh$/.test(rest)) return new Response(null, { status: 404 });
+    const mesh = /^\/snapshots\/([^/]+)\/mesh$/.exec(rest);
+    if (mesh) {
+      if (!this.meshes.has(`${projectId}/${mesh[1]}`)) return new Response(null, { status: 404 });
+      return new Response(method === "HEAD" ? null : FIXTURE_STL, { status: 200, headers: { "content-type": "model/stl" } });
+    }
     const diff = /^\/snapshots\/([^/]+)\/diff$/.exec(rest);
     if (diff) return json(200, { id: diff[1], parent: null, diff: "" });
     const revert = /^\/snapshots\/([^/]+)\/revert$/.exec(rest);
@@ -280,6 +296,7 @@ export class FakeEditorServer {
       const baseRevision = (body as { base_revision: string }).base_revision;
       const current = baseRevision === this.sourceRevision(state);
       this.buildPosts.push({ projectId: state.id, baseRevision, current });
+      if (current) this.buildMesh(state.id);
       return current ? json(200, { snapshot: state.snapshots[0] }) : apiError(409, "CONFLICT", "The source changed since this revision; reload and build again.");
     }
     if (rest === "/chat" && method === "POST") return this.chat(state);

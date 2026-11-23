@@ -19,6 +19,14 @@ const PREVIEW_VIEW_BUTTONS: ViewName[] = VIEW_NAMES.filter(
 export interface EditPreviewDisplay {
   objectUrl: string | null;
   status: "pending" | "ok" | "failed";
+  /**
+   * The last server render of this project (a plain server mesh URL, cleared
+   * on a project switch), shown while the local preview has nothing to show.
+   * `null` when the project has none: the viewer is then empty and the copy says so.
+   */
+  fallbackUrl: string | null;
+  /** True when `fallbackUrl` is the current head's own mesh (the edit is unsaved); false when it predates saved edits. */
+  fallbackIsHead: boolean;
 }
 
 export interface PreviewTabProps {
@@ -66,6 +74,15 @@ const EDIT_PREVIEW_LABEL: Record<EditPreviewDisplay["status"], string> = {
   ok: "Local edit preview — not built or validated. Build to validate it.",
   failed: "The local edit preview failed — showing the last server render."
 };
+
+/** Never claims a server render the viewport is not showing, and says that the one shown predates the edit. */
+function editPreviewLabel(preview: EditPreviewDisplay): string {
+  if (preview.objectUrl) return EDIT_PREVIEW_LABEL[preview.status === "ok" ? "ok" : "pending"];
+  const lead = preview.status === "failed" ? "The local edit preview failed" : "Rendering a local edit preview — not built or validated";
+  if (!preview.fallbackUrl) return `${lead}. There is no server render of this project to show; Build to render it.`;
+  const age = preview.fallbackIsHead ? "from before this edit" : "from before your saved edits";
+  return `${lead} — showing the last server render, ${age}.`;
+}
 
 /** Explains an empty 3D viewport in terms of what actually happened (Issue #41). */
 function meshPlaceholderMessage(status: SnapshotMeshStatus, snapshotId: string | null): string {
@@ -235,8 +252,9 @@ function PreviewTabBody({
    * its URL avoids the churn entirely.
    */
   const serverOrLiveUrl = mode === "live" ? (isStale ? stlUrl : wasm.objectUrl) : stlUrl;
-  // S3-C C4: the edit preview replaces the URL only in 3D/Live, and only once it has a render; otherwise the server render stays (rule 6).
-  const viewerUrl = editPreview?.objectUrl && (mode === "orbit" || mode === "live") ? editPreview.objectUrl : serverOrLiveUrl;
+  // S3-C C4: while an edit preview is up, 3D/Live show its render, or else this
+  // project's last server render (never the current head's missing mesh), per rule 6.
+  const viewerUrl = editPreview && (mode === "orbit" || mode === "live") ? editPreview.objectUrl ?? editPreview.fallbackUrl : serverOrLiveUrl;
   const measuredSizes = measuredBBox ? bboxSize(measuredBBox) : null;
 
   return (
@@ -323,7 +341,7 @@ function PreviewTabBody({
 
       {editPreview ? (
         <div className={`live-status live-status--${editPreview.status === "failed" ? "stale" : "live"}`} role="status" data-testid="edit-preview-status">
-          {EDIT_PREVIEW_LABEL[editPreview.status]}
+          {editPreviewLabel(editPreview)}
         </div>
       ) : null}
 

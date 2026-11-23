@@ -75,6 +75,12 @@ export interface EditPreviewBinding {
   status: PreviewStatus;
   /** `null` unless a render for this project/revision is ready; the viewer then shows the server render. */
   objectUrl: string | null;
+  /**
+   * True while the local preview is the subject: a gesture is active, a save is
+   * in flight, or a post-receipt step is pending. Otherwise it is only a
+   * background pre-render and the server mesh keeps the viewer (G1).
+   */
+  inUse: boolean;
 }
 
 export interface EditorSession {
@@ -498,14 +504,11 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
   const editPreview = useMemo<EditPreviewBinding | null>(() => {
     if (!engineEnabled || !projectId || !view.tag || view.tag.projectId !== projectId) return null;
     const shown = view.shown;
-    let objectUrl: string | null = null;
-    if (shown && shown.tag.projectId === projectId && view.status !== "failed") {
-      if (view.status === "ok" ? shown.paramsKey === view.paramsKey : shown.tag.editorRevision === view.tag.editorRevision) {
-        objectUrl = shown.objectUrl;
-      }
-    }
-    return { projectId, editorRevision: view.tag.editorRevision, status: view.status, objectUrl };
-  }, [engineEnabled, projectId, view]);
+    // Only a finished render of exactly what is wanted; while pending or failed the host shows its server fallback (F4).
+    const objectUrl = view.status === "ok" && shown && shown.tag.projectId === projectId && shown.paramsKey === view.paramsKey ? shown.objectUrl : null;
+    const inUse = step !== null || isActiveGesture(state) || state.kind === "committing" || state.kind === "resolving";
+    return { projectId, editorRevision: view.tag.editorRevision, status: view.status, objectUrl, inUse };
+  }, [engineEnabled, projectId, view, step, state]);
 
   return {
     active,
