@@ -40,6 +40,7 @@ import {
   createProject,
   createProjectsDir,
   disposeHost,
+  HOOK_TIMEOUT_MS,
   mintRemoveFeatureProof,
   readEditorDocument,
   seedSidecar,
@@ -83,12 +84,12 @@ beforeEach(async () => {
   projects = await createProjectsDir();
   server = await startServerChild(tracker, projects.dir);
   wire = createInterceptedFetch();
-});
+}, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await tracker.killAll();
   await projects.cleanup();
-});
+}, HOOK_TIMEOUT_MS);
 
 describe("C5 the real server refuses a traversal whose command is not the exact inverse", () => {
   it("integration_remove_feature_undo_with_a_wrong_inverse_is_refused_by_the_server", async () => {

@@ -44,6 +44,7 @@ import {
   createInterceptedFetch,
   createProjectsDir,
   disposeHost,
+  HOOK_TIMEOUT_MS,
   readEditorDocument,
   seedSidecar,
   snapshotCountOf,
@@ -158,12 +159,12 @@ beforeEach(async () => {
   projects = await createProjectsDir();
   server = await startServerChild(tracker, projects.dir);
   wire = createInterceptedFetch();
-});
+}, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await tracker.killAll();
   await projects.cleanup();
-});
+}, HOOK_TIMEOUT_MS);
 
 describe.skipIf(!dockerAvailable())("@docker C5 client/server undo-redo inverse agreement (carried comment 2)", () => {
   it("integration_set_value_undo_inverse_agrees_with_server", async () => {
