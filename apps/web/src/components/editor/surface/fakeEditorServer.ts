@@ -59,6 +59,8 @@ export interface FakeProjectSeed {
   features?: Array<Pick<EditorFeature, "featureId" | "label" | "binding"> & Partial<EditorFeature>>;
   sidecarStatus?: EditorSidecarStatus;
   eligibility?: EditorEligibility[];
+  /** Seed no snapshot: the project has no head yet. */
+  withoutSnapshot?: boolean;
 }
 
 interface Claim {
@@ -90,7 +92,7 @@ export interface Hold {
   arrived: Promise<void>;
 }
 
-type Route = "editor-get" | "verify" | "commit" | "operation" | "params-update" | "chat" | "source-get" | "mesh" | "snapshots-list";
+type Route = "editor-get" | "verify" | "commit" | "operation" | "params-update" | "chat" | "source-get" | "mesh" | "snapshots-list" | "revert";
 
 const ZERO_REV = "0".repeat(64);
 
@@ -137,6 +139,8 @@ export class FakeEditorServer {
   readonly failSourceGet = new Set<string>();
   /** The next GET /snapshots for these project ids answers 500. */
   readonly failSnapshotsList = new Set<string>();
+  /** When set and it returns a list, GET /snapshots answers that list instead of the real one (a stale read). */
+  snapshotListOverride: ((projectId: string) => SnapshotManifest[] | null) | null = null;
   /** Build POSTs received, with the base revision each sent and whether it was current. */
   readonly buildPosts: Array<{ projectId: string; baseRevision: string; current: boolean }> = [];
   /** Snapshots with a built mesh, as `projectId/snapshotId`. */
@@ -181,7 +185,7 @@ export class FakeEditorServer {
       proofs: new Map()
     };
     this.projects.set(seed.id, state);
-    this.addSnapshot(state, "seed");
+    if (!seed.withoutSnapshot) this.addSnapshot(state, "seed");
   }
 
   /** Holds the next request on `route` until released. */
@@ -269,7 +273,7 @@ export class FakeEditorServer {
     if (rest === "/snapshots" && method === "GET") {
       await this.passHold("snapshots-list");
       if (this.failSnapshotsList.delete(projectId)) return apiError(500, "INTERNAL_ERROR", "snapshot list failed (test fault)");
-      return json(200, { snapshots: state.snapshots });
+      return json(200, { snapshots: this.snapshotListOverride?.(projectId) ?? state.snapshots });
     }
     const mesh = /^\/snapshots\/([^/]+)\/mesh$/.exec(rest);
     if (mesh) {
@@ -280,7 +284,10 @@ export class FakeEditorServer {
     const diff = /^\/snapshots\/([^/]+)\/diff$/.exec(rest);
     if (diff) return json(200, { id: diff[1], parent: null, diff: "" });
     const revert = /^\/snapshots\/([^/]+)\/revert$/.exec(rest);
-    if (revert && method === "POST") return this.revert(state, revert[1]);
+    if (revert && method === "POST") {
+      await this.passHold("revert");
+      return this.revert(state, revert[1]);
+    }
     const snapshot = /^\/snapshots\/([^/]+)$/.exec(rest);
     if (snapshot) {
       const found = state.snapshots.find((s) => s.id === snapshot[1]);

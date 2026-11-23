@@ -960,6 +960,122 @@ describe("Edit surface — PR #140 fix batch 2", () => {
   });
 });
 
+describe("Edit surface — PR #140 fix batch 3", () => {
+  async function settle(ms = 30): Promise<void> {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    });
+  }
+
+  function headerBuild(): HTMLElement {
+    return within(screen.getByRole("banner")).getByRole("button", { name: /^Build$/ });
+  }
+
+  it("F7: a project with no snapshot shows the first-run text, not 'Loading model…', and the Edit preview claims no check", async () => {
+    server = new FakeEditorServer([{ id: "p1", values: { wall: 2 }, features: [WALL_FEATURE], withoutSnapshot: true }]);
+    vi.stubGlobal("fetch", server.fetch);
+    render(<App />);
+    await waitFor(() => expect(server.log).toContain("GET /projects/p1/snapshots"), { timeout: 3000 });
+    await settle(50);
+    expect(screen.getByText("No render yet. Send a message to generate the first model.")).toBeInTheDocument();
+    expect(screen.queryByText("Loading model…")).toBeNull();
+
+    // Edit tab: the local preview fails, and there is no head whose server render could be "being checked".
+    engine.failing = true;
+    await openEdit();
+    await waitFor(() => expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("The local edit preview failed"));
+    await settle();
+    expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("There is no server render of this project to show");
+    expect(screen.getByTestId("edit-preview-status")).not.toHaveTextContent("Checking for a server render");
+  });
+
+  it("L4: after saves H1 then H2, a list whose head is H1 (with a server mesh) does not end the wait; a list containing H2 does", async () => {
+    server.buildMesh("p1");
+    render(<App />);
+    await openEdit();
+    const first = server.hold("snapshots-list");
+    await saveWall("3");
+    await first.arrived;
+    const second = server.hold("snapshots-list");
+    await saveWall("4");
+    await second.arrived;
+    const [h2, h1] = server.projects.get("p1")!.snapshots;
+    const h1Mesh = server.buildSnapshotMesh("p1", h1.id);
+
+    // The applied list read is stale: its head is H1, and H1 has a server mesh.
+    server.snapshotListOverride = (projectId) => (projectId === "p1" ? server.projects.get("p1")!.snapshots.filter((s) => s.id !== h2.id) : null);
+    const logged = viewer.log.length;
+    first.release();
+    second.release();
+    await settle(50);
+    expect(viewer.log.slice(logged)).not.toContain(h1Mesh);
+    expect(screen.getByTestId("edit-preview-notice")).toBeInTheDocument();
+    expect(screen.getByTestId("inspect-toggle")).toBeDisabled();
+
+    // A list containing H2 ends the wait.
+    server.snapshotListOverride = null;
+    fireEvent.click(within(screen.getByTestId("edit-preview-notice")).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByTestId("edit-preview-notice")).toBeNull(), { timeout: 3000 });
+    expect(viewer.log.slice(logged)).not.toContain(h1Mesh);
+  });
+
+  it("F8: a revert started in project A that completes after a switch to B does nothing to B's session or selection", async () => {
+    server = seedServer("p1", "p2");
+    vi.stubGlobal("fetch", server.fetch);
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    fireEvent.click(screen.getByRole("tab", { name: /history/i }));
+    await screen.findAllByTestId("snapshot-row");
+    fireEvent.click(screen.getAllByTestId("snapshot-row").at(-1)!);
+    const lateRevert = server.hold("revert");
+    fireEvent.click(await screen.findByTestId("revert-trigger"));
+    fireEvent.click(await screen.findByTestId("revert-confirm-yes"));
+    await lateRevert.arrived;
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "p2" } });
+    await waitFor(() => expect(server.log).toContain("GET /projects/p2/editor"), { timeout: 3000 });
+    fireEvent.click(screen.getByRole("tab", { name: "Edit" }));
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."), { timeout: 3000 });
+    await saveWall("4");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled());
+    typeWall("5");
+    clickButton("Preview");
+    await waitFor(() => expect(status()).toHaveTextContent("Preview ready."), { timeout: 3000 });
+    const p2Reads = server.log.filter((line) => line === "GET /projects/p2/editor").length;
+
+    lateRevert.release();
+    await settle(50);
+    expect(status()).toHaveTextContent("Preview ready.");
+    expect(server.log.filter((line) => line === "GET /projects/p2/editor")).toHaveLength(p2Reads);
+    expect(screen.queryByText(/Viewing historical snapshot/)).toBeNull();
+    clickButton("Cancel");
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."));
+    expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
+  });
+
+  it("Build: after a switch, while B's source read is out, Build sends nothing and says why; then it posts B's revision", async () => {
+    server = seedServer("p1", "p2");
+    vi.stubGlobal("fetch", server.fetch);
+    render(<App />);
+    await waitFor(() => expect(server.log).toContain("GET /projects/p1/source"), { timeout: 3000 });
+    await settle(50);
+    const read = server.hold("source-get");
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "p2" } });
+    await read.arrived;
+
+    fireEvent.click(headerBuild());
+    await screen.findByText("Loading the latest source before building…");
+    expect(server.buildPosts).toHaveLength(0);
+
+    read.release();
+    await settle(50);
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0]).toMatchObject({ projectId: "p2", current: true });
+  });
+});
+
 async function saveWallWithoutWaiting(value: string): Promise<void> {
   typeWall(value);
   clickButton("Save");

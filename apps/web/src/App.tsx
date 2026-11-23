@@ -58,6 +58,9 @@ export function App() {
   const previousProjectIdForHeadRef = useRef(projectId);
   const switchingProjects = previousProjectIdForHeadRef.current !== projectId;
   previousProjectIdForHeadRef.current = projectId;
+  // F8: this ref also holds the latest rendered project, so a History callback
+  // (rendered for `projectId` in its closure) that completes after a switch
+  // can tell it no longer belongs to the current project.
   const workingHead = useMemo<SnapshotManifest | null>(() => {
     const listedHead = snapshots.snapshots[0] ?? null;
     const chatHead = switchingProjects ? null : chat.state.headSnapshot;
@@ -137,6 +140,8 @@ export function App() {
     },
     [snapshots.refresh]
   );
+  // L4: the session ends its wait for a saved edit's snapshot only once this list contains it.
+  const listedSnapshotIds = useMemo(() => snapshots.snapshots.map((snapshot) => snapshot.id), [snapshots.snapshots]);
   const editorSession = useEditorSession({
     api: client,
     projectId,
@@ -146,7 +151,7 @@ export function App() {
     paramsSaving: paramsController.saving,
     chatItems: chat.state.items,
     chatStreaming: chat.isStreaming,
-    headSnapshotId: workingHeadId,
+    listedSnapshotIds,
     onCommitted: handleEditorCommitted
   });
   reportEditorWriteRef.current = editorSession.reportWrite;
@@ -232,8 +237,17 @@ export function App() {
   const headMeshReady = headMesh !== null && headMesh.status === "ready" && headMesh.url !== null;
   // The viewer's own server URL obeys the same rule for the displayed snapshot.
   // A result without identity fields (a test stand-in) is used as before.
+  // Otherwise (F7): nothing to request (no project or no displayed snapshot)
+  // is `idle`; a result for the current identity is used; anything else is a
+  // request that has not started yet, `checking`.
   const viewMesh =
-    mesh.projectId === undefined || (mesh.projectId === projectId && mesh.snapshotId === currentSnapshotId) ? mesh : { url: null, status: "checking" as const };
+    mesh.projectId === undefined
+      ? mesh
+      : !projectId || !currentSnapshotId
+        ? { url: null, status: "idle" as const }
+        : mesh.projectId === projectId && mesh.snapshotId === currentSnapshotId
+          ? mesh
+          : { url: null, status: "checking" as const };
   // This project's last server render (the last `ready` head mesh), the edit
   // preview's fallback while it has nothing to show.
   const [lastServerRender, setLastServerRender] = useState<{ projectId: string; snapshotId: string; url: string } | null>(null);
@@ -255,7 +269,8 @@ export function App() {
           status: editBinding.status,
           fallbackUrl: fallback?.url ?? null,
           fallbackIsHead: fallback !== null && fallback.snapshotId === workingHeadId && !editBinding.headStale,
-          checking: !(headMesh !== null && headMesh.status === "absent"),
+          // F7: a head that does not exist is not being checked.
+          checking: projectId !== null && workingHeadId !== null && !(headMesh !== null && headMesh.status === "absent"),
           // L4: why the pre-commit mesh is not shown yet, with a way out if the list refresh failed or hangs.
           notice: editBinding.headStale
             ? {
@@ -292,7 +307,9 @@ export function App() {
                 ? sourceStaleHere.failed
                   ? SOURCE_RETRY_REASON
                   : "Loading the latest source before building…"
-                : historical
+                : sourceEditor.loading
+                  ? "Loading the latest source before building…"
+                  : historical
                   ? "Build validates the current head; select the head to build"
                   : null;
   // A failed source re-read keeps Build pressable: pressing it retries the re-read.
@@ -369,7 +386,7 @@ export function App() {
       setHeaderNotice("Still loading the latest source; trying again. Press Build once it has loaded.");
       return;
     }
-    if (editorSaving || sourceStaleHere) {
+    if (editorSaving || sourceStaleHere || sourceEditor.loading) {
       setHeaderNotice(buildDisabledReason);
       return;
     }
@@ -419,7 +436,7 @@ export function App() {
           }}
           params={<ParamsTab controller={paramsController} onAskAgent={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           code={<CodeTab client={client} projectId={projectId} editor={sourceEditor} historicalSnapshotId={selectedSnapshotId} isHistorical={historical} />}
-          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onReverted={() => editorSession.reportWrite("reverted")} onSelectSnapshot={(id) => setSelectedSnapshotId(id)} />}
+          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onReverted={() => { if (projectId === previousProjectIdForHeadRef.current) editorSession.reportWrite("reverted"); }} onSelectSnapshot={(id) => { if (projectId === previousProjectIdForHeadRef.current) setSelectedSnapshotId(id); }} />}
         />
       </main>
       {projectError ? <p className="app-error" role="alert">{projectError}</p> : null}

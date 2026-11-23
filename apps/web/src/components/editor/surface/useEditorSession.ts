@@ -60,11 +60,11 @@ export interface EditorSessionOptions {
   chatItems: readonly ChatItem[];
   chatStreaming: boolean;
   /**
-   * The head snapshot the host shows as current. After an accepted receipt the
+   * The ids in the host's snapshot list. After an accepted receipt the
    * pre-commit head's server mesh is not the document any more; until this
-   * moves off that snapshot the local preview stays in use (L4).
+   * list contains the receipt's snapshot the local preview stays in use (L4).
    */
-  headSnapshotId?: string | null;
+  listedSnapshotIds?: readonly string[];
   /** Called once per accepted receipt (App refreshes the snapshot list and re-reads the source). */
   onCommitted?: (receipt: EditorReceipt) => void;
   /** Test seams; production leaves them unset. */
@@ -381,8 +381,8 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
   stepRef.current = step;
   const handledOperationRef = useRef<string | null>(null);
   const lastForwardedSeqRef = useRef(0);
-  // L4: the head the host showed when a receipt was accepted, while it still shows it.
-  const [awaitingHead, setAwaitingHead] = useState<{ preHead: string | null; snapshotId: string } | null>(null);
+  // L4: an accepted receipt's snapshot the host's snapshot list does not contain yet.
+  const [awaitingHead, setAwaitingHead] = useState<{ snapshotId: string } | null>(null);
 
   // A new controller (project switch, activation) starts clean.
   useEffect(() => {
@@ -397,18 +397,18 @@ export function useEditorSession(options: EditorSessionOptions): EditorSession {
     if (handledOperationRef.current === state.receipt.operationId) return;
     handledOperationRef.current = state.receipt.operationId;
     setStep({ operationId: state.receipt.operationId, receipt: state.receipt, afterSeq: readSeqRef.current, doc: null, failed: false, recovering: false });
-    const preHead = latest.current.headSnapshotId ?? null;
-    setAwaitingHead(preHead === state.receipt.snapshotId ? null : { preHead, snapshotId: state.receipt.snapshotId });
+    const listed = latest.current.listedSnapshotIds ?? [];
+    setAwaitingHead(listed.includes(state.receipt.snapshotId) ? null : { snapshotId: state.receipt.snapshotId });
     // Our own re-read: never raises `externalWriteUnsettled` (comment 3 item 1).
     cacheRef.current.refresh();
     latest.current.onCommitted?.(state.receipt);
   }, [controller, state]);
 
-  // L4: the head moved off the pre-commit snapshot (to the receipt's, or past it).
-  const headSnapshotId = options.headSnapshotId ?? null;
+  // L4: the wait ends only when the list contains the receipt's snapshot (as the head or behind it).
+  const listedSnapshotIds = options.listedSnapshotIds;
   useEffect(() => {
-    if (awaitingHead && headSnapshotId !== awaitingHead.preHead) setAwaitingHead(null);
-  }, [awaitingHead, headSnapshotId]);
+    if (awaitingHead && listedSnapshotIds?.includes(awaitingHead.snapshotId)) setAwaitingHead(null);
+  }, [awaitingHead, listedSnapshotIds]);
 
   const failStep = useCallback((current: ReceiptStep) => {
     if (!current.recovering) controllerRef.current?.notifyDisplayFailure();
