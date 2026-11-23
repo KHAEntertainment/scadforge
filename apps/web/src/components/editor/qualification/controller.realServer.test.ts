@@ -41,6 +41,7 @@ import {
   createProject,
   createProjectsDir,
   disposeHost,
+  HOOK_TIMEOUT_MS,
   mintRemoveFeatureProof,
   readEditorDocument,
   seedSidecar,
@@ -91,12 +92,12 @@ beforeEach(async () => {
   projects = await createProjectsDir();
   server = await startServerChild(tracker, projects.dir);
   wire = createInterceptedFetch();
-});
+}, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
   await tracker.killAll();
   await projects.cleanup();
-});
+}, HOOK_TIMEOUT_MS);
 
 describe("C5 controller qualification against the real server (criterion 1)", () => {
   it("integration_ambiguous_receipt_resolves_to_committed_on_poll", async () => {
@@ -217,6 +218,22 @@ describe("C5 controller qualification against the real server (criterion 1)", ()
       expect(post).toHaveLength(1);
       expect(post[0].status).toBe(409);
       expect(post[0].errorBody?.error_code).toBe("CONFLICT");
+
+      // F4(a): the response really WAS lost — the recorded call carries the
+      // wrapper's lost-response error, so the client could not have read the
+      // 409 itself. (Without the drop, this case's name would be a lie: a
+      // plain first-attempt 409 is definite on its own.)
+      expect(post[0].error).toContain("the response was lost after the request was sent");
+
+      // ...and the rejection came from a REAL terminal claim, read through
+      // the real operations route for THIS operation.
+      const lookups = wire.callsMatching((url, method) => method === "GET" && url.includes("/editor/operations/"));
+      expect(lookups.length).toBeGreaterThanOrEqual(1);
+      const postedOperationId = (JSON.parse(post[0].body ?? "{}") as { operationId?: string }).operationId;
+      expect(postedOperationId).toBeTruthy();
+      expect(lookups[0].url).toContain(`/editor/operations/${postedOperationId}`);
+      expect(lookups[0].status).toBe(200);
+      expect(lookups[0].responseBody).toMatchObject({ state: "definitely_not_committed", reason: "rejected" });
     } finally {
       disposeHost(host);
     }
