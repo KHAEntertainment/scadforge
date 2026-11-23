@@ -1950,4 +1950,46 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
     expect(store.has("project-1", "op-1")).toBe(true);
     expect(controller.history().entries).toHaveLength(0);
   });
+
+  // ── C4 D1: a disposed controller never sends ─────────────────────────────
+
+  it("D1: finalize() after dispose() is refused, settles, and sends nothing", async () => {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+    controller.begin(makeBeginInput());
+    reachPreviewOk(controller, 43);
+    controller.dispose();
+
+    await expect(controller.finalize(makeProof())).resolves.toEqual({ kind: "refused", reason: "not-idle" });
+    expect(client.commits).toHaveLength(0);
+  });
+
+  it("D1: submitVerified(..., \"edit\") after dispose() is refused, settles, and sends nothing", async () => {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+    controller.dispose();
+
+    await expect(
+      controller.submitVerified({ kind: "set-value", featureId: "feature-1", bindingVersion: 1, value: 43 }, makeProof(), "edit", null, {
+        beforeValue: 40
+      })
+    ).resolves.toEqual({ kind: "refused", reason: "not-idle" });
+    expect(client.commits).toHaveLength(0);
+  });
+
+  it("D1: submitTraversal() after dispose() is refused, settles, and sends nothing", async () => {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+    await commitEdit(controller, client, { from: 40, to: 43, base: HEX64_A, revision: R1 });
+    const prepared = controller.prepareTraversal("undo");
+    if (!prepared.ok) throw new Error(`prepareTraversal refused: ${prepared.reason}`);
+    const commitsBefore = client.commits.length;
+    controller.dispose();
+
+    await expect(controller.submitTraversal(prepared, makeProof({ baseEditorRevision: R1 }))).resolves.toEqual({
+      kind: "refused",
+      reason: "not-idle"
+    });
+    expect(client.commits).toHaveLength(commitsBefore);
+  });
 });

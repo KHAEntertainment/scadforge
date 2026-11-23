@@ -15,6 +15,24 @@ const PREVIEW_VIEW_BUTTONS: ViewName[] = VIEW_NAMES.filter(
   (view): view is Exclude<ViewName, "section"> => view !== "section"
 );
 
+/** S3-C C4: a local WASM preview of an in-progress edit. `objectUrl` is null until a render for the current project and revision is ready. */
+export interface EditPreviewDisplay {
+  objectUrl: string | null;
+  status: "pending" | "ok" | "failed";
+  /**
+   * The last server render of this project (a plain server mesh URL, cleared
+   * on a project switch), shown while the local preview has nothing to show.
+   * `null` when the project has none: the viewer is then empty and the copy says so.
+   */
+  fallbackUrl: string | null;
+  /** True when `fallbackUrl` is the current head's own mesh (the edit is unsaved); false when it predates saved edits. */
+  fallbackIsHead: boolean;
+  /** True while the head's server render is still being looked for (or not known yet); false once it is known to be absent. */
+  checking: boolean;
+  /** Why the shown state may persist, with a way out (L4: the snapshot list could not be refreshed). */
+  notice?: { text: string; actionLabel: string; onAction: () => void } | null;
+}
+
 export interface PreviewTabProps {
   /** Server-authoritative mesh URL (PROJECT_CONTEXT.md "Render authority"). */
   stlUrl: string | null;
@@ -40,6 +58,8 @@ export interface PreviewTabProps {
   buildDisabled?: boolean;
   /** Why the action is disabled right now, shown as each button's tooltip. Null/undefined when enabled. */
   buildDisabledReason?: string | null;
+  /** While set, the viewer shows the Edit surface's local preview (falling back to the server render) and Inspect/Measure are off. */
+  editPreview?: EditPreviewDisplay | null;
 }
 
 type PreviewMode = "orbit" | "live" | ViewName;
@@ -52,6 +72,25 @@ const LIVE_STATUS_LABEL: Record<string, string> = {
   timeout: "Live preview timed out — showing last server render.",
   fatal: "Live preview crashed — showing last server render."
 };
+
+const EDIT_PREVIEW_LABEL: Record<EditPreviewDisplay["status"], string> = {
+  pending: "Rendering a local edit preview — not built or validated.",
+  ok: "Local edit preview — not built or validated. Build to validate it.",
+  failed: "The local edit preview failed — showing the last server render."
+};
+
+/** Never claims a server render the viewport is not showing, and says that the one shown predates the edit. */
+function editPreviewLabel(preview: EditPreviewDisplay): string {
+  if (preview.objectUrl) return EDIT_PREVIEW_LABEL[preview.status === "ok" ? "ok" : "pending"];
+  const lead = preview.status === "failed" ? "The local edit preview failed" : "Rendering a local edit preview — not built or validated";
+  if (!preview.fallbackUrl) {
+    return preview.checking
+      ? `${lead}. Checking for a server render of this project…`
+      : `${lead}. There is no server render of this project to show; Build to render it.`;
+  }
+  const age = preview.fallbackIsHead ? "from before this edit" : "from before your saved edits";
+  return `${lead} — showing the last server render, ${age}.`;
+}
 
 /** Explains an empty 3D viewport in terms of what actually happened (Issue #41). */
 function meshPlaceholderMessage(status: SnapshotMeshStatus, snapshotId: string | null): string {
@@ -87,7 +126,8 @@ export function PreviewTab({
   onBuild,
   building = false,
   buildDisabled = false,
-  buildDisabledReason = null
+  buildDisabledReason = null,
+  editPreview = null
 }: PreviewTabProps) {
   const [mode, setMode] = useState<PreviewMode>("orbit");
 
@@ -128,6 +168,7 @@ export function PreviewTab({
         building={building}
         buildDisabled={buildDisabled}
         buildDisabledReason={buildDisabledReason}
+        editPreview={editPreview}
         mode={mode}
         onModeChange={setMode}
       />
@@ -156,6 +197,7 @@ function PreviewTabBody({
   building,
   buildDisabled,
   buildDisabledReason,
+  editPreview,
   mode,
   onModeChange
 }: Required<Pick<PreviewTabProps, "stlUrl" | "meshStatus" | "snapshotId" | "validation" | "pngUrls" | "liveScad" | "liveParams">> & {
@@ -167,15 +209,17 @@ function PreviewTabBody({
   building: boolean;
   buildDisabled: boolean;
   buildDisabledReason: string | null;
+  editPreview: EditPreviewDisplay | null;
 }) {
   const isLive = mode === "live";
+  const editing = editPreview !== null;
   const [showGrid, setShowGrid] = useState(true);
   const [measure, setMeasure] = useState(false);
   const [measureAxis, setMeasureAxis] = useState<MeasureFocus>("all");
   const [measuredBBox, setMeasuredBBox] = useState<BBox | null>(null);
   const [inspectEnabled, setInspectEnabled] = useState(false);
   const [inspectOutcome, setInspectOutcome] = useState<InspectionOutcome | null>(null);
-  const inspectDisabled = mode !== "orbit" || stlUrl === null;
+  const inspectDisabled = mode !== "orbit" || stlUrl === null || editing;
 
   // Nothing here relies on Viewer3D's own clearing (S2-4): a stlUrl/snapshotId
   // change covers a project switch or a History selection, a mode change
@@ -195,7 +239,8 @@ function PreviewTabBody({
 
   // `enabled: isLive` — the worker is only spawned while the Live tab is
   // actually selected, not on every project/param change.
-  const wasm = useWasmPreview(liveScad, liveParams, isLive);
+  // While an edit preview shows, Live's own worker is off: one view, one renderer.
+  const wasm = useWasmPreview(liveScad, liveParams, isLive && !editing);
   const isStale = wasm.status !== "ok"; // AC: server-authority fallback + stale indicator, never blank
 
   const showPng = mode !== "orbit" && mode !== "live";
@@ -214,7 +259,10 @@ function PreviewTabBody({
    * Keeping a single canvas mounted for the life of the tab and swapping only
    * its URL avoids the churn entirely.
    */
-  const viewerUrl = mode === "live" ? (isStale ? stlUrl : wasm.objectUrl) : stlUrl;
+  const serverOrLiveUrl = mode === "live" ? (isStale ? stlUrl : wasm.objectUrl) : stlUrl;
+  // S3-C C4: while an edit preview is up, 3D/Live show its render, or else this
+  // project's last server render (never the current head's missing mesh), per rule 6.
+  const viewerUrl = editPreview && (mode === "orbit" || mode === "live") ? editPreview.objectUrl ?? editPreview.fallbackUrl : serverOrLiveUrl;
   const measuredSizes = measuredBBox ? bboxSize(measuredBBox) : null;
 
   return (
@@ -252,6 +300,8 @@ function PreviewTabBody({
           onClick={() => setMeasure((value) => !value)}
           aria-pressed={measure}
           data-testid="measure-toggle"
+          disabled={editing}
+          title={editing ? "Measurement uses the server render; it is off while an edit preview shows." : undefined}
         >
           Measure
         </button>
@@ -262,14 +312,14 @@ function PreviewTabBody({
           aria-pressed={inspectEnabled}
           data-testid="inspect-toggle"
           disabled={inspectDisabled}
-          title={inspectDisabled ? "Inspection uses the server render, available in 3D view." : undefined}
+          title={inspectDisabled ? (editing ? "Inspection uses the server render; it is off while an edit preview shows." : "Inspection uses the server render, available in 3D view.") : undefined}
         >
           Inspect
         </button>
         <button type="button" onClick={() => onModeChange("orbit")}>Fit</button>
       </div>
 
-      {measure ? (
+      {measure && !editing ? (
         <div className="measure-controls" role="group" aria-label="Measurement axis">
           <span className="measure-controls-label">Face-to-face:</span>
           {(["all", ...AXES] as const).map((axis) => (
@@ -297,7 +347,22 @@ function PreviewTabBody({
         </div>
       ) : null}
 
-      {mode === "live" ? (
+      {editPreview ? (
+        <div className={`live-status live-status--${editPreview.status === "failed" ? "stale" : "live"}`} role="status" data-testid="edit-preview-status">
+          {editPreviewLabel(editPreview)}
+          {editPreview.notice ? (
+            <span data-testid="edit-preview-notice">
+              {" "}
+              {editPreview.notice.text}{" "}
+              <button type="button" className="button button--ghost" onClick={editPreview.notice.onAction}>
+                {editPreview.notice.actionLabel}
+              </button>
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {mode === "live" && !editing ? (
         // Server-authority fallback (CLAUDE.md rule 6, binding): while the
         // WASM status is not `ok`, the viewer below keeps showing the last
         // SERVER-rendered mesh — never a blank canvas — with this indicator.
@@ -318,10 +383,10 @@ function PreviewTabBody({
           <Viewer3D
             stlUrl={viewerUrl}
             emptyMessage={meshPlaceholderMessage(meshStatus, snapshotId)}
-            measure={measure}
+            measure={measure && !editing}
             measureAxis={measureAxis}
             onBoundingBox={setMeasuredBBox}
-            inspect={inspectEnabled && mode === "orbit"}
+            inspect={inspectEnabled && mode === "orbit" && !editing}
             onInspect={setInspectOutcome}
           />
           {/* Issue #78 AC1/AC5: the empty-mesh placeholder above only ever

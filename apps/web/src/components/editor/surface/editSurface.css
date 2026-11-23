@@ -1,0 +1,22 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* S3-C C4 — minimal Edit surface. Uses the app's tokens and button classes; S4-A replaces it. */
+
+.edit-surface { overflow-y: auto; padding: 16px; }
+.edit-surface-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.edit-surface-header h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.edit-surface-history { display: flex; gap: 8px; }
+.edit-surface-status { margin: 0 0 12px; padding: 10px 12px; border-left: 3px solid var(--blue); background: var(--surface); line-height: 1.4; }
+.edit-surface-status--success { border-left-color: var(--success); }
+.edit-surface-status--error { border-left-color: var(--danger); }
+.edit-surface-retry { margin: 0 0 12px; }
+.edit-surface-empty { color: var(--muted); }
+.edit-feature-list { margin: 0; padding: 0; list-style: none; }
+.edit-feature { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.edit-feature-form { display: flex; flex-direction: column; gap: 8px; }
+.edit-feature-label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-weight: 600; }
+.edit-feature-meta { color: var(--muted); font-size: 12px; font-weight: 400; }
+.edit-feature-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+.edit-feature-controls input { min-width: 0; flex: 1 1 96px; height: 36px; padding: 0 10px; border: 0; border-bottom: 1px solid #8d8d8d; background: var(--surface); }
+.edit-feature-controls input:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+.edit-feature-controls input:disabled { color: var(--muted); }
+.edit-feature-hint { margin: 0; color: var(--muted); font-size: 12px; }

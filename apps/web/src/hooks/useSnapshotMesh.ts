@@ -12,6 +12,14 @@ export interface UseSnapshotMeshResult {
   /** URL to hand `<Viewer3D stlUrl>`; null unless a mesh actually exists. */
   url: string | null;
   status: SnapshotMeshStatus;
+  /**
+   * The project and snapshot this result was requested for (`null` while idle),
+   * set in the same update as `url`/`status`, so a caller can tell a result
+   * left over from a previous project or selection from the current one.
+   * Optional so existing stand-ins without them still type-check.
+   */
+  projectId?: string | null;
+  snapshotId?: string | null;
 }
 
 /**
@@ -33,18 +41,18 @@ export function useSnapshotMesh(
   projectId: string | null,
   snapshotId: string | null
 ): UseSnapshotMeshResult {
-  const [result, setResult] = useState<UseSnapshotMeshResult>({ url: null, status: "idle" });
+  const [result, setResult] = useState<UseSnapshotMeshResult>({ url: null, status: "idle", projectId: null, snapshotId: null });
 
   useEffect(() => {
     if (!projectId || !snapshotId) {
-      setResult({ url: null, status: "idle" });
+      setResult({ url: null, status: "idle", projectId: null, snapshotId: null });
       return;
     }
 
     let cancelled = false;
     const path = meshPath(projectId, snapshotId);
     const url = client.resolveUrl(path);
-    setResult({ url: null, status: "checking" });
+    setResult({ url: null, status: "checking", projectId, snapshotId });
 
     // `HEAD` so a rapid click through History never pulls several multi-MB
     // STL bodies down just to discover which snapshots have one. The GET that
@@ -57,11 +65,11 @@ export function useSnapshotMesh(
         // snapshots quickly can land an older probe after a newer one, and
         // without this the viewer would settle on the wrong snapshot's answer.
         if (cancelled) return;
-        setResult(ok ? { url, status: "ready" } : { url: null, status: "absent" });
+        setResult(ok ? { url, status: "ready", projectId, snapshotId } : { url: null, status: "absent", projectId, snapshotId });
       })
       .catch(() => {
         if (cancelled) return;
-        setResult({ url: null, status: "absent" });
+        setResult({ url: null, status: "absent", projectId, snapshotId });
       });
 
     return () => {

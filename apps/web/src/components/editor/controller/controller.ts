@@ -403,6 +403,8 @@ export class TransactionController {
    * `dispose`.
    */
   async finalize(proof: EditorProofResponse): Promise<FinalizeResult> {
+    // D1: a disposed controller never sends (mirrors `begin`).
+    if (this.disposed) return { kind: "refused", reason: "not-idle" };
     if (this.pendingCommit) return { kind: "refused", reason: "finalize-pending" };
     if (this.current.kind === "preview-ok") {
       const begin = this.current.begin;
@@ -455,6 +457,8 @@ export class TransactionController {
     traversal: EditorTraversal | null = null,
     context: SubmitContext | null = null
   ): Promise<FinalizeResult> {
+    // D1: a disposed controller never sends (mirrors `begin`).
+    if (this.disposed) return { kind: "refused", reason: "not-idle" };
     if (this.pendingCommit) return { kind: "refused", reason: "finalize-pending" };
     const inputs = this.snapshotInputs(command, proof, intent, traversal, context);
     if (inputs.intent === "undo" || inputs.intent === "redo") return this.submitTraversalCommand(inputs);
