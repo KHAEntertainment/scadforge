@@ -514,3 +514,52 @@ describe("F5: a non-200 2xx never yields a definite outcome", () => {
     expect(calls.map((c) => c.method)).toEqual(["POST", "GET"]);
   });
 });
+
+// ── PR #139 fix batch 1, F2: a lookup while the original POST is still in flight ──
+
+describe("F2 (C3): a lookup for an id whose commit is still in flight is never a false definite rejection", () => {
+  it("unclaimed is ambiguous with exactly one POST and the record kept; the commit then settles 200 and the next lookup answers committed without a re-send", async () => {
+    const { client, calls, deferreds } = makeApi([{ kind: "deferred" }, json(opUnclaimed()), json(opCommitted())]);
+    const adapter = createEditorClient({ client });
+    const commit = adapter.commit("hinged-box", commitRequest()); // the user leaves mid-commit; the POST is still outstanding
+    await flush();
+    expect(calls.map((c) => c.method)).toEqual(["POST"]);
+
+    // They return before it settles: the new controller's lookup is answered `unclaimed`.
+    const lookup = await adapter.lookupOperation("hinged-box", OP_ID);
+    expect(lookup).toEqual({ kind: "ambiguous", cause: "server-unknown" });
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET"]); // no second POST while the first is outstanding
+
+    // The original POST commits after all.
+    deferreds[0].resolve(rawJson(receiptBody()));
+    await expect(commit).resolves.toMatchObject({ kind: "definite", response: { state: "committed" } });
+
+    const next = await adapter.lookupOperation("hinged-box", OP_ID);
+    expect(next).toMatchObject({ kind: "definite", response: { state: "committed", receipt: receiptBody() } });
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET", "GET"]); // never relied on a re-send
+  });
+
+  it("the same start, but the commit settles with a first-attempt 409: still definitely_not_committed for the sole attempt", async () => {
+    const { client, calls, deferreds } = makeApi([{ kind: "deferred" }, json(opUnclaimed())]);
+    const onDefiniteConflict = vi.fn();
+    const adapter = createEditorClient({ client, onDefiniteConflict });
+    const commit = adapter.commit("hinged-box", commitRequest());
+    await flush();
+
+    expect((await adapter.lookupOperation("hinged-box", OP_ID)).kind).toBe("ambiguous");
+
+    deferreds[0].resolve(rawJson({ error_code: "CONFLICT", message: "stale revision" }, 409));
+    await expect(commit).resolves.toEqual({
+      kind: "definite",
+      response: {
+        version: 1,
+        state: "definitely_not_committed",
+        requestDigest: null,
+        reason: "rejected",
+        error: { error_code: "CONFLICT", message: "stale revision" }
+      }
+    });
+    expect(onDefiniteConflict).toHaveBeenCalledTimes(1);
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET"]);
+  });
+});
