@@ -107,6 +107,40 @@ Run from the worktree root, in this order. Each command must exit 0:
 - [x] libs — vendored BOSL2/MCAD + 1175-symbol lookup index (#19, PR #24)
 - [x] Integration + **Scenario A end-to-end 6/6** (#20, PR #29)
 
+### M2 Parametric + Live (integration issue #35 closed)
+- [x] Customizer parameter parser (#30, PR #38), params plumbing (#32, PR #43), params tab sliders (#33, PR #46)
+- [x] WASM preview worker with server-authority fallback (#31, PR #39)
+- [x] History tab: list, diff, revert (#34, PR #42)
+- [x] Stabilization: web/API transport (PR #37), timer binding (PR #49), snapshot mesh persistence (PR #50), immutable snapshots (PR #51), studio params and narrow-pane layout (PR #57)
+- [x] Debt closed 2026-09-10: orphaned snapshot claims (#28, PR #58), CRLF ingest (#40, PR #59), exports ledger lock (#48, PR #60), license gate hardening (#10, PR #61)
+
+### S2 Measure / Inspect
+- [x] Measurement overlay: bbox dimensions and face-to-face axis (PR #62), edge-anchored hybrid with camera-aware pick (PR #65)
+- [x] Cylindrical surface inspection with measured provenance (PR #67)
+
+### S3-A Editor contract
+- [x] Additive frozen contract: editor module, D7 agent context, disk manifests (PR #71, merged 2026-09-13)
+
+### S3-B Crash-recoverable store and editor routes (stage PR #130, merged 2026-11-22, 18 ticket PRs)
+- [x] Canonical JSON, digests and the editor revision (B1, PR #74)
+- [x] Recovery boundary and stale-lock reclaim (B2, PR #80)
+- [x] `editor.json` sidecar captured with each snapshot (B3, PR #88)
+- [x] Staged roll-forward transactions with durable operation claims (B4, PR #96)
+- [x] Proof service and verify route (B5, PR #97)
+- [x] Editor routes, command handler, undo/redo traversal (B6, PR #108)
+- [x] Agent editor context in `read_project` (B7, PR #95)
+- [x] Fault qualification crash matrix (B8, PRs #103, #112, #122)
+- [x] Contract fixes through dedicated PRs: editor `projectId` accepts project slugs (#93, PR #94); `SnapshotOrigin` gains `"editor"` (#104, PR #105)
+- [x] File-lock reclaim race found by the stage review (#128, PR #129)
+
+## S3-B store facts (binding on later work)
+- **Recovery first**: every project access goes through the recovery boundary (`withRecoveredProject`). It rolls an interrupted transaction forward before anything reads or writes.
+- **Atomic publish**: source, params, head and the `editor.json` sidecar are staged under `editor-transactions/` and publish together or not at all. Durable operation claims make a repeated commit idempotent.
+- **Upgrade in place**: the first write through an S3-B build adds `editor.json`, `editor-transactions/` and `editor_store_version: 1` in `project.json`. A build from before S3-B can still read a clean upgraded project.
+- **No downgrade with mixed writers**: a pre-S3-B build never processes `editor-transactions/` and its snapshot and revert paths ignore sidecars. Never open a project that has an interrupted transaction with an older build.
+- **File locks** (`packages/scad-core/src/store/file-lock.ts`): the published `owner.json` decides who holds a lock. Publication uses a hard link, so a filesystem without hard-link support (exFAT, some network shares) fails every lock acquisition closed. Locks are same-host only; a lock owned by another host is never reclaimed.
+- **Open advisories on the lock tests**: three settle windows and one load-sensitive "two adopters" test in `file-lock.reclaim-race.test.ts` (see the review on PR #129). Fold them into the #121 timeout sweep.
+
 ## M1 empirical findings (binding on later work)
 - **OpenSCAD CLI**: base image has NO ENTRYPOINT — always name `openscad` explicitly. `--export-format` applies to EVERY `-o` target in one invocation (a naive `-o out.3mf -o out.stl --export-format=binstl` writes STL bytes into the .3mf) — use two invocations for non-STL formats. Bare `--render` is swallowed by boost::program_options when last before the positional path — always `--render=true`. Library mount convention: libs at `/work/libs` + `OPENSCADPATH=/work/libs`.
 - **Snapshot store concurrency**: ids are claimed by atomic non-recursive `mkdir` + EEXIST retry, which is safe ACROSS PROCESSES (required for M4, where GUI server and MCP server share one `.scadforge/` tree). Typed `CONFLICT` (→409) on exhaustion; never a silent overwrite. Open edge case: #28 (SIGKILL between claim and cleanup orphans a claim dir).
@@ -120,16 +154,18 @@ Run from the worktree root, in this order. Each command must exit 0:
 - **Trusted / required / ignored reviewers**: none.
 - Revisit if the CodeRabbit plan changes or a reviewer that submits formal reviews is adopted.
 
-## Execution Routing Policy (owner decision 2026-09-13)
-- **Independent review**: `openrouter` harness, model `nvidia/nemotron-3-ultra-550b-a55b:free`, reasoning `high`. Approved by the owner per use; the free tier does not draw on the OpenRouter budget. Fallbacks in order when it is unavailable: MiniMax M3 via `opencode`, then GLM 5.3 via `openrouter` (budget-checked).
-- **Implementation**: `claude` / latest Sonnet / high (unchanged from the global guide).
-- **QA**: DeepSeek V4 Pro via `qwen` when it has balance; otherwise Kimi K3 via `kimi`; otherwise `claude` / Sonnet. Recorded because on 2026-09-13 the first two routes failed (402 insufficient balance; zero output).
+## Execution Routing Policy (revised 2026-11-23)
+- **Source of truth**: the owner's global agent selection guide (`~/.traycer/agent-selection-guide.md`, v33 on 2026-11-22). This project sets no routes of its own. Where an older note here and the guide differ, the guide wins.
+- **Routes the guide gave on 2026-11-22**, recorded as history, not as policy: independent review by Codex `gpt-6.1-sol`; difficult implementation by Claude Sonnet; standard implementation and QA by Pi `minimax/MiniMax-M3.1-Flash` at low reasoning; the reviewer is always a different model family from the author; at most three review rounds.
+- **Superseded**: the 2026-09-13 routes (Nemotron review via OpenRouter, Claude Sonnet for all implementation, DeepSeek or Kimi for QA). The DeepSeek and Kimi routes failed on first use (402 insufficient balance; zero output).
 
 ## Current Status
-- **Last updated**: 2026-09-08
-- **M0 core deliverables and M1 complete.** M0 still has license-gate debt #10. Scenario A was rerun unchanged on 2026-09-08: 6/6 assertions passed with one explicit Sonnet turn; evidence is under `evals/scenario-a/evidence/`. The baseline workspace suite passed 790 tests, including Docker suites.
-- **M2 Parametric + Live features merged**: Customizer parser (#38), WASM preview (#39), params plumbing (#43), controls (#46), History diff/revert (#42). BOSL2 source files are bundled into the preview worker at build time. Closing integration issue #35 is in progress; feature merges alone do not establish preview/server agreement.
-- **Stabilization merged**: web/API transport (#37), timer binding (#49), snapshot mesh persistence and user prompt echo (#50), immutable history and concurrent parameter updates (#51). Later render/validation artifacts live under `.scadforge/derived/<id>/`; old snapshot directories stay write-once.
-- **Next boundary**: complete M2 integration/stability, then reassess functionality and hold a dedicated UI/UX design phase. Issue #52 explicitly requires owner-led conversation/generative-UI design before implementation and before M3 annotation. Current chat uses tab-scoped sessionStorage, not a durable project transcript. M4 MCP serving remains a placeholder.
-- **Known tech debt**: #10 license-gate hardening; #28 orphaned snapshot claim dir; #40 systemic LF normalization; #48 export-index concurrency; explicit model default (see cost finding above). These are not silently included in M2 closure.
-- **Active integration work**: branch `traycer/scadforge-ripe-elk`; final review and PR CI are required before closing #35.
+- **Last updated**: 2026-11-23
+- **On `main`**: M1, M2, the studio stabilization work, S2 measure and inspect, the S3-A editor contract and the whole S3-B stage (see Completed Features). The Verification Gate at `206c616` runs 1,674 tests with no skips: mcp-server 1, protocol 128, scad-core 642, agent 274, libs 25, web 356, server 248.
+- **What S3-B means for a user**: nothing visible yet. It is the server side of direct editing. The first editor UI arrives with S3-C ticket C4.
+- **Active integration work**: branch `feat/s3-c-transaction-controller`, cut from `main` at `206c616` on 2026-11-23. S3-C is the browser transaction controller: C1 editor client, C2 controller core (#113, PR #116), C3 undo/redo, C4 minimal Edit screen, C5 qualification. C1, C3, C4 and C5 have plan artifacts but no GitHub issues yet. #70 (second-tab notice) follows C4.
+- **Open gate before S4-B**: the S0 / D1 qualification on a second device and one real user project. It needs the owner.
+- **Design gate**: #52 requires an owner-led conversation and generative-UI design session before any chat-transcript work. Chat still uses tab-scoped sessionStorage, not a durable project transcript. M4 MCP serving remains a placeholder.
+- **Known tech debt**: #83 flaky same-key slider-drag test under Docker load; #86 agent stderr chunk arriving after a turn ends; #121 timeout floor for the remaining Docker-shelling server tests; four files carry a duplicate SPDX line; a duplicated heading in the `file-lock.ts` header; explicit model default (see the cost finding above).
+- **Backlog outside the S3 / S4 line**: #63 click an edge to measure, #64 point-to-point measure, #66 feature-semantic dimensions.
+- **Removed**: the Reticle dev-tool audition (added by PR #89) was removed by PR #132. Do not re-run `reticle init` in this repo.
