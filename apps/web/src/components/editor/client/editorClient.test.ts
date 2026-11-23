@@ -386,7 +386,7 @@ describe("EDITOR_CLIENT_TIMEOUT_MS (R4)", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Fix batch 1 (PR #138 review), commit 1 of 2: F1, F2
+// Fix batch 1 (PR #138 review): F1–F5
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe("F1: the re-send is byte-identical even if the caller mutates its request object", () => {
@@ -446,3 +446,71 @@ describe("F2: overlapping commit() calls for one id never report a false definit
   });
 });
 
+describe("F3: dispose() stops late work", () => {
+  it("a lookup that resolves unclaimed after dispose() starts no POST and fires no callback", async () => {
+    const { client, calls, deferreds } = makeApi([
+      { kind: "throw", error: new TypeError("Failed to fetch") }, // POST #1 — ambiguous
+      { kind: "deferred" } // GET — resolved only after dispose()
+    ]);
+    const onDefiniteConflict = vi.fn();
+    const adapter = createEditorClient({ client, onDefiniteConflict });
+
+    await adapter.commit("hinged-box", commitRequest());
+    const lookup = adapter.lookupOperation("hinged-box", OP_ID);
+    adapter.dispose();
+
+    deferreds[0].resolve(rawJson(opUnclaimed())); // would trigger the re-send on a live adapter
+    await expect(lookup).resolves.toEqual({ kind: "ambiguous", cause: "server-unknown" });
+    await flush();
+
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET"]); // no re-send POST after dispose
+    expect(onDefiniteConflict).not.toHaveBeenCalled();
+  });
+});
+
+describe("F4: records are project-scoped", () => {
+  it("a stored receipt for project A is not returned by lookupOperation for project B", async () => {
+    const { client, calls, deferreds } = makeApi([
+      { kind: "deferred" }, // POST for proj-a (times out, then lands late)
+      json(opUnclaimed()) // GET for proj-b
+    ]);
+    const adapter = createEditorClient({ client, timeoutMs: 5 });
+
+    expect(await adapter.commit("proj-a", commitRequest())).toEqual({ kind: "ambiguous", cause: "timeout" });
+    // The late 200 receipt is stored on proj-a's record (R4).
+    deferreds[0].resolve(rawJson(receiptBody()));
+    await flush();
+
+    // The same operation id under proj-b must not share proj-a's record.
+    const outcome = await adapter.lookupOperation("proj-b", OP_ID);
+    expect(outcome).toEqual({
+      kind: "definite",
+      response: { version: 1, state: "definitely_not_committed", requestDigest: null, reason: "unclaimed", error: null }
+    });
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET"]); // proj-b consulted the lookup route
+  });
+});
+
+describe("F5: a non-200 2xx never yields a definite outcome", () => {
+  it("a parseable 201 from the lookup route is ambiguous", async () => {
+    const { client } = makeApi([{ kind: "response", make: () => rawJson(opUnknown(), 201) }]);
+    const adapter = createEditorClient({ client });
+
+    const outcome = await adapter.lookupOperation("hinged-box", OP_ID);
+    expect(outcome).toEqual({ kind: "ambiguous", cause: "unparseable-body" });
+  });
+
+  it("a late 201 from the commit route is not stored as committed", async () => {
+    const { client, calls, deferreds } = makeApi([{ kind: "deferred" }, json(opCommitted())]);
+    const adapter = createEditorClient({ client, timeoutMs: 5 });
+
+    expect(await adapter.commit("hinged-box", commitRequest())).toEqual({ kind: "ambiguous", cause: "timeout" });
+    deferreds[0].resolve(rawJson(receiptBody(), 201)); // parseable receipt, wrong status
+    await flush();
+
+    // The 201 was not stored: the lookup route is consulted (GET happens).
+    const outcome = await adapter.lookupOperation("hinged-box", OP_ID);
+    expect(outcome).toMatchObject({ kind: "definite", response: { state: "committed" } });
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET"]);
+  });
+});

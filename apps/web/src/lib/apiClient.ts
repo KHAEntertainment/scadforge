@@ -268,6 +268,21 @@ export function createApiClient(options: ApiClientOptions = {}) {
       );
     }
 
+    // F5 (fix batch 1): the editor contract answers exactly 200. Any other
+    // 2xx is not the contract-conforming answer and is surfaced as
+    // `unparseable-body`, which the commit/lookup classifier maps to AMBIGUOUS
+    // — it can never manufacture a definite outcome. Non-editor methods keep
+    // their original behaviour (`request()` below is untouched).
+    if (res.status !== 200) {
+      throw new ApiClientError(
+        {
+          error_code: "INTERNAL_ERROR",
+          message: `Received an unexpected success status ${res.status} (expected exactly 200) from ${url}.`
+        },
+        { kind: "unparseable-body", status: res.status }
+      );
+    }
+
     if (parseFailed) {
       throw new ApiClientError(
         {

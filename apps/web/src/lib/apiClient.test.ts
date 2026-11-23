@@ -356,4 +356,25 @@ describe("apiClient editor methods (Issue #134 criterion 1)", () => {
       apiError: { error_code: "CONFLICT", message: "stale revision" }
     });
   });
+
+  it.each(EDITOR_METHOD_CASES)(
+    "$name requires exactly 200 (F5): a parseable 201 is an error, never a success",
+    async ({ call, successBody }) => {
+      const fetchImpl = vi.fn(async () => jsonResponse(successBody, 201));
+      const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+      const failure = call(client);
+      await expect(failure).rejects.toBeInstanceOf(ApiClientError);
+      // `unparseable-body` maps to AMBIGUOUS in the classifier — it can never
+      // manufacture a definite outcome (fix batch 1, F5).
+      await expect(failure).rejects.toMatchObject({ kind: "unparseable-body", status: 201 });
+    }
+  );
+
+  it("F5 regression: non-editor methods keep their behaviour — any 2xx stays a success", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({ projects: [] }, 201));
+    const client = createApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.listProjects()).resolves.toEqual({ projects: [] });
+  });
 });

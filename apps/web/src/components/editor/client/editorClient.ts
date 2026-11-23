@@ -77,6 +77,8 @@ export interface DisposableEditorClient extends EditorClient {
 }
 
 interface OperationRecord {
+  /** Project-scoped map key ({@link recordKey}). Liveness is "still the map entry for this key". */
+  key: string;
   projectId: string;
   /** A PRIVATE snapshot of the request as first submitted (F1) — every send uses this object. */
   request: EditorCommitRequest;
@@ -97,6 +99,11 @@ interface OperationRecord {
 
 const TIMEOUT = Symbol("editor-client-timeout");
 
+/** Project-scoped record key: server claims are project-scoped, so two projects may use one operation id (F4). */
+function recordKey(projectId: string, operationId: string): string {
+  return `${projectId}\u0000${operationId}`;
+}
+
 export function createEditorClient(options: EditorClientOptions): DisposableEditorClient {
   const { client, onDefiniteConflict } = options;
   const timeoutMs = options.timeoutMs ?? EDITOR_CLIENT_TIMEOUT_MS;
@@ -110,6 +117,11 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
   const records = new Map<string, OperationRecord>();
   let disposed = false;
 
+  /** F3: late work may only touch a record that is STILL the live map entry for its key. */
+  function isLive(record: OperationRecord): boolean {
+    return !disposed && records.get(record.key) === record;
+  }
+
   function raceTimeout<T>(attempt: Promise<T>): Promise<T | typeof TIMEOUT> {
     return new Promise((resolve) => {
       const handle = timer.setTimeout(() => resolve(TIMEOUT), timeoutMs);
@@ -121,6 +133,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
   }
 
   function notifyDefiniteConflict(projectId: string, outcome: Extract<CommitOutcome, { kind: "definite" }>): void {
+    if (disposed) return; // F3: nothing fires after dispose()
     const response = outcome.response;
     if (response.state === "definitely_not_committed" && response.error?.error_code === "CONFLICT") {
       try {
@@ -134,7 +147,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
 
   /** R3: knowledge of a definite answer is recorded once, returned later, released on return. */
   function learn(record: OperationRecord, outcome: Extract<CommitOutcome, { kind: "definite" }>): void {
-    if (record.definite) return;
+    if (record.definite || !isLive(record)) return; // F3: no late work on dead records
     record.definite = outcome;
     notifyDefiniteConflict(record.projectId, outcome);
   }
@@ -180,7 +193,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
     classify: (settled: A) => CommitOutcome | LookupOutcome
   ): void {
     void attempt.then((settled) => {
-      if (!record || record.definite) return;
+      if (!record || record.definite || !isLive(record)) return; // F3
       const late = classify(settled);
       if (late.kind === "definite") learn(record, late);
     });
@@ -215,7 +228,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
 
   /** The criterion-3 re-send: identical bytes, one in flight per id, background. */
   function startResend(record: OperationRecord): void {
-    if (record.resendInFlight) return;
+    if (!isLive(record) || record.resendInFlight) return; // F3
     record.resendInFlight = true;
     record.sends += 1;
     const attempt = sendCommit(record);
@@ -224,7 +237,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
     // the lookup route meanwhile. Settlement is handled like a late one.
     void attempt.then((settled) => {
       record.resendInFlight = false;
-      if (record.definite) return;
+      if (record.definite || !isLive(record)) return; // F3
       const outcome = classifyCommitAttempt(settled, { retry: true });
       if (outcome.kind === "definite") learn(record, outcome);
     });
@@ -232,7 +245,8 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
 
   async function commit(projectId: string, request: EditorCommitRequest): Promise<CommitOutcome> {
     const serializedBody = JSON.stringify(request);
-    let record = records.get(request.operationId);
+    const key = recordKey(projectId, request.operationId);
+    let record = records.get(key);
     if (record) {
       if (record.serializedBody !== serializedBody) {
         // R3: the adapter never changes a recorded request. Different bytes
@@ -243,11 +257,12 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
       }
       if (record.definite) {
         const definite = record.definite;
-        records.delete(request.operationId);
+        records.delete(key);
         return definite;
       }
     } else {
       record = {
+        key,
         projectId,
         // F1: a PRIVATE snapshot of the request. The caller's object is never
         // read again — later mutation of it cannot change any attempt's bytes.
@@ -258,23 +273,24 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
         resendInFlight: false,
         definite: null
       };
-      records.set(request.operationId, record);
+      records.set(key, record);
     }
     record.sends += 1;
     const outcome = await runCommitAttempt(record);
     // R3: the record is released when a definite outcome is RETURNED to the
     // caller (here), not when it is first learned (a stored background answer
     // is released by the call that returns it).
-    if (outcome.kind === "definite") records.delete(request.operationId);
+    if (outcome.kind === "definite") records.delete(key);
     return outcome;
   }
 
   async function lookupOperation(projectId: string, operationId: string): Promise<LookupOutcome> {
-    const record = records.get(operationId) ?? null;
+    const key = recordKey(projectId, operationId);
+    const record = records.get(key) ?? null;
     if (record?.definite) {
       const definite = record.definite;
       // R3: released only now — when the definite outcome is RETURNED.
-      records.delete(operationId);
+      records.delete(key);
       return definite;
     }
     const attempt = (async (): Promise<LookupAttempt> => {
@@ -298,7 +314,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
     if (outcome.kind === "definite") {
       if (record) {
         learn(record, outcome);
-        records.delete(operationId);
+        records.delete(key);
       } else {
         notifyDefiniteConflict(projectId, outcome);
       }
@@ -316,12 +332,13 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
       settled.response.state === "definitely_not_committed" &&
       settled.response.reason === "unclaimed"
     ) {
-      startResend(record);
+      startResend(record); // F3 liveness is checked inside
     }
     return outcome;
   }
 
   function dispose(): void {
+    disposed = true; // F3: late settlements and queued re-sends become no-ops
     records.clear();
   }
 
