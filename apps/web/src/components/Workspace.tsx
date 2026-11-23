@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { CSSProperties, PointerEvent } from "react";
-import { CodeIcon, EyeOpenIcon, ClockIcon, ChatBubbleIcon, MixerHorizontalIcon } from "@radix-ui/react-icons";
+import { CodeIcon, EyeOpenIcon, ClockIcon, ChatBubbleIcon, MixerHorizontalIcon, Pencil1Icon } from "@radix-ui/react-icons";
 
-export type WorkspaceTab = "chat" | "params" | "code" | "history";
+export type WorkspaceTab = "chat" | "params" | "edit" | "code" | "history";
 
 export interface WorkspaceProps {
   preview: ReactNode;
@@ -10,6 +10,10 @@ export interface WorkspaceProps {
   params: ReactNode;
   code: ReactNode;
   history: ReactNode;
+  /** S3-C C4 Edit surface; the tab is shown only when provided. */
+  edit?: ReactNode;
+  /** Reports a tab switch before the new panel renders (S3-C C4: leaving Edit is a tool change). */
+  onTabChange?: (tab: WorkspaceTab) => void;
   initialWidth?: number;
   onWidthChange?: (width: number) => void;
 }
@@ -35,14 +39,15 @@ function clampWidth(value: number): number {
 function readTab(): WorkspaceTab {
   try {
     const value = sessionStorage.getItem(TAB_KEY);
-    return value === "chat" || value === "params" || value === "code" || value === "history" ? value : "chat";
+    return value === "chat" || value === "params" || value === "edit" || value === "code" || value === "history" ? value : "chat";
   } catch {
     return "chat";
   }
 }
 
-export function Workspace({ preview, chat, params, code, history, initialWidth = 400, onWidthChange }: WorkspaceProps) {
-  const [tab, setTab] = useState<WorkspaceTab>(readTab);
+export function Workspace({ preview, chat, params, code, history, edit, onTabChange, initialWidth = 400, onWidthChange }: WorkspaceProps) {
+  const [storedTab, setTab] = useState<WorkspaceTab>(readTab);
+  const tab: WorkspaceTab = storedTab === "edit" && edit === undefined ? "chat" : storedTab;
   const [width, setWidth] = useState(() => clampWidth(readNumber(WIDTH_KEY, initialWidth)));
   const draggingRef = useRef(false);
 
@@ -88,10 +93,16 @@ export function Workspace({ preview, chat, params, code, history, initialWidth =
     }
   }
 
-  const panels: Record<WorkspaceTab, ReactNode> = { chat, params, code, history };
+  function selectTab(next: WorkspaceTab) {
+    if (next !== tab) onTabChange?.(next);
+    setTab(next);
+  }
+
+  const panels: Record<WorkspaceTab, ReactNode> = { chat, params, edit, code, history };
   const tabs: Array<{ id: WorkspaceTab; label: string; icon: ReactNode }> = [
     { id: "chat", label: "Chat", icon: <ChatBubbleIcon /> },
     { id: "params", label: "Parameters", icon: <MixerHorizontalIcon /> },
+    ...(edit === undefined ? [] : [{ id: "edit" as const, label: "Edit", icon: <Pencil1Icon /> }]),
     { id: "code", label: "Code", icon: <CodeIcon /> },
     { id: "history", label: "History", icon: <ClockIcon /> }
   ];
@@ -99,9 +110,9 @@ export function Workspace({ preview, chat, params, code, history, initialWidth =
   return (
     <section className="workspace" aria-label="Workspace" style={{ "--tools-width": `${width}px` } as CSSProperties}>
       <aside className="workspace-tools" aria-label="Studio tools">
-        <div className="workspace-tabs" role="tablist" aria-label="Studio tools">
+        <div className="workspace-tabs" role="tablist" aria-label="Studio tools" style={{ gridTemplateColumns: `repeat(${tabs.length}, 1fr)` }}>
           {tabs.map((item) => (
-            <button key={item.id} type="button" role="tab" aria-label={item.id === "params" ? "Params" : undefined} id={`workspace-tab-${item.id}`} aria-selected={tab === item.id} aria-controls={`workspace-panel-${item.id}`} className={tab === item.id ? "active" : ""} onClick={() => setTab(item.id)}>
+            <button key={item.id} type="button" role="tab" aria-label={item.id === "params" ? "Params" : undefined} id={`workspace-tab-${item.id}`} aria-selected={tab === item.id} aria-controls={`workspace-panel-${item.id}`} className={tab === item.id ? "active" : ""} onClick={() => selectTab(item.id)}>
               {item.icon}<span>{item.label}</span>
             </button>
           ))}

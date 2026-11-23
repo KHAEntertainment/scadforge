@@ -16,6 +16,8 @@ import { HistoryTab } from "./components/HistoryTab.js";
 import { CodeTab } from "./components/CodeTab.js";
 import { ParamsTab } from "./components/params/ParamsTab.js";
 import { useParamsController } from "./components/params/useParamsController.js";
+import { EditSurface } from "./components/editor/surface/EditSurface.js";
+import { useEditorSession, type HostWriteReason } from "./components/editor/surface/useEditorSession.js";
 
 function triggerDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
@@ -61,9 +63,30 @@ export function App() {
   }, [snapshots.snapshots, chat.state.headSnapshot, switchingProjects]);
   const workingHeadId = workingHead?.id ?? null;
   const liveSource = useLiveModelSource(client, projectId, workingHeadId);
-  const sourceEditor = useSourceEditor(client, projectId, snapshots.refresh);
-  const handleParamsSaved = useCallback(() => snapshots.refresh(), [snapshots.refresh]);
+  // S3-C C4: params/source saves are external writes for the editor session (declared below).
+  const reportEditorWriteRef = useRef<(reason: HostWriteReason) => void>(() => {});
+  const handleSourceSaved = useCallback(() => {
+    snapshots.refresh();
+    reportEditorWriteRef.current("source-saved");
+  }, [snapshots.refresh]);
+  const sourceEditor = useSourceEditor(client, projectId, handleSourceSaved);
+  const handleParamsSaved = useCallback(() => {
+    snapshots.refresh();
+    reportEditorWriteRef.current("params-saved");
+  }, [snapshots.refresh]);
   const paramsController = useParamsController(client, projectId, workingHeadId, handleParamsSaved);
+  const editorSession = useEditorSession({
+    api: client,
+    projectId,
+    sourceDirty: sourceEditor.dirty,
+    sourceConflict: sourceEditor.conflict,
+    paramsDirty: paramsController.dirty.size > 0,
+    paramsSaving: paramsController.saving,
+    chatItems: chat.state.items,
+    chatStreaming: chat.isStreaming,
+    onCommitted: snapshots.refresh
+  });
+  reportEditorWriteRef.current = editorSession.reportWrite;
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
   const [headerNotice, setHeaderNotice] = useState<string | null>(null);
@@ -232,11 +255,15 @@ export function App() {
       {headerNotice || exportState ? <div className="studio-notice" role="status">{headerNotice ?? exportState}<button type="button" aria-label="Dismiss notice" onClick={() => { setHeaderNotice(null); setExportState(null); }}>Dismiss</button></div> : null}
       <main className="app-body">
         <Workspace
-          preview={<PreviewTab key={`preview-${projectId ?? "no-project"}`} stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} />}
+          preview={<PreviewTab key={`preview-${projectId ?? "no-project"}`} stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} editPreview={!historical && editorSession.editPreview?.projectId === projectId ? editorSession.editPreview : null} />}
           chat={<ChatPanel state={chat.state} isStreaming={chat.isStreaming} streamError={chat.streamError} onSend={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} onCheckConnection={() => void chat.checkConnectionResult()} onDismissConnection={chat.dismissConnectionLost} />}
+          edit={<EditSurface session={editorSession} />}
+          onTabChange={(tab) => {
+            if (tab !== "edit") editorSession.adapter.notifyToolChange();
+          }}
           params={<ParamsTab controller={paramsController} onAskAgent={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           code={<CodeTab client={client} projectId={projectId} editor={sourceEditor} historicalSnapshotId={selectedSnapshotId} isHistorical={historical} />}
-          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onSelectSnapshot={(id) => setSelectedSnapshotId(id)} />}
+          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onReverted={() => editorSession.reportWrite("reverted")} onSelectSnapshot={(id) => setSelectedSnapshotId(id)} />}
         />
       </main>
       {projectError ? <p className="app-error" role="alert">{projectError}</p> : null}

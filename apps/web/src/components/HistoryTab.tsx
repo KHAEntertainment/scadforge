@@ -10,6 +10,8 @@ export interface HistoryTabProps {
   loading: boolean;
   error: string | null;
   onExported: () => void;
+  /** Fires only after a revert (S3-C C4: a revert is an external write for the editor; an export is not). */
+  onReverted?: () => void;
   /** Reports the selected snapshot up to `App`, which previews it (Issue #41). */
   onSelectSnapshot?: (id: string) => void;
 }
@@ -28,6 +30,7 @@ export function HistoryTab({
   loading,
   error,
   onExported,
+  onReverted,
   onSelectSnapshot
 }: HistoryTabProps) {
   return (
@@ -39,7 +42,10 @@ export function HistoryTab({
         snapshots={snapshots}
         loading={loading}
         error={error}
-        onChanged={onExported}
+        onChanged={() => {
+          onExported();
+          onReverted?.();
+        }}
         onSelected={onSelectSnapshot}
       />
     </div>
