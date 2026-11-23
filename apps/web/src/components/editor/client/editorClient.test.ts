@@ -80,9 +80,12 @@ interface RecordedCall {
 function json(body: unknown, status = 200): Step {
   return {
     kind: "response",
-    make: () =>
-      new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
+    make: () => rawJson(body, status)
   };
+}
+
+function rawJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
 function makeApi(steps: Step[]) {
@@ -381,3 +384,65 @@ describe("EDITOR_CLIENT_TIMEOUT_MS (R4)", () => {
     expect(EDITOR_CLIENT_TIMEOUT_MS).toBeGreaterThan(10_000);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Fix batch 1 (PR #138 review), commit 1 of 2: F1, F2
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe("F1: the re-send is byte-identical even if the caller mutates its request object", () => {
+  it("sends the recorded snapshot: identical body string, original URL, original id and nested fields", async () => {
+    const { client, calls } = makeApi([
+      { kind: "throw", error: new TypeError("Failed to fetch") }, // POST #1 — ambiguous
+      json(opUnclaimed()), // GET — unclaimed → triggers the re-send
+      json(receiptBody()) // POST #2 — the re-send
+    ]);
+    const adapter = createEditorClient({ client });
+    const request = commitRequest();
+
+    expect(await adapter.commit("hinged-box", request)).toEqual({ kind: "ambiguous", cause: "network-error" });
+
+    // Mutate the ORIGINAL object after the first answer and before the
+    // re-send: a nested command field, proofId and operationId all change.
+    request.command = { kind: "set-value", featureId: FEATURE_ID, bindingVersion: 1, value: 999 };
+    request.proofId = "12345678-1234-4234-9234-123456789aaa";
+    request.operationId = "12345678-1234-4234-9234-123456789fff";
+
+    await adapter.lookupOperation("hinged-box", OP_ID); // triggers the re-send
+    await flush();
+
+    expect(calls.map((c) => c.method)).toEqual(["POST", "GET", "POST"]);
+    expect(calls[2].body).toBe(calls[0].body); // byte-identical body string
+    expect(calls[2].url).toBe(calls[0].url); // original route
+    const resent = JSON.parse(calls[2].body ?? "") as { operationId: string; proofId: string; command: { value: number } };
+    expect(resent.operationId).toBe(OP_ID); // original id
+    expect(resent.proofId).toBe(PROOF_ID); // original proofId
+    expect(resent.command.value).toBe(10); // original nested field
+  });
+});
+
+describe("F2: overlapping commit() calls for one id never report a false definite rejection", () => {
+  it("first settles 409 while the second is unresolved → ambiguous (no CONFLICT hook); second settles 200 → committed", async () => {
+    const { client, calls, deferreds } = makeApi([{ kind: "deferred" }, { kind: "deferred" }]);
+    const onDefiniteConflict = vi.fn();
+    const adapter = createEditorClient({ client, onDefiniteConflict });
+    const request = commitRequest();
+
+    const first = adapter.commit("hinged-box", request);
+    const second = adapter.commit("hinged-box", request); // identical body → same record, second send
+    expect(calls).toHaveLength(2); // two overlapping sends of one id
+
+    // First send hits the pre-claim lock-wait 409 while the second can still commit.
+    deferreds[0].resolve(rawJson({ error_code: "CONFLICT", message: "lock wait deadline exceeded" }, 409));
+    const firstOutcome = await first;
+    expect(firstOutcome.kind).toBe("ambiguous"); // never definitely_not_committed
+    expect(firstOutcome).toEqual({ kind: "ambiguous", cause: "server-unknown" });
+    expect(onDefiniteConflict).not.toHaveBeenCalled();
+
+    // Second send commits.
+    deferreds[1].resolve(rawJson(receiptBody()));
+    await expect(second).resolves.toMatchObject({ kind: "definite", response: { state: "committed" } });
+    expect(onDefiniteConflict).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(2);
+  });
+});
+

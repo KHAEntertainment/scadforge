@@ -78,7 +78,7 @@ export interface DisposableEditorClient extends EditorClient {
 
 interface OperationRecord {
   projectId: string;
-  /** The exact request as first submitted — re-sends pass this same object. */
+  /** A PRIVATE snapshot of the request as first submitted (F1) — every send uses this object. */
   request: EditorCommitRequest;
   /** `JSON.stringify(request)` at record creation; any later divergence is a caller bug (R3). */
   serializedBody: string;
@@ -108,6 +108,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
     clearTimeout: (handle) => clearTimeout(handle)
   };
   const records = new Map<string, OperationRecord>();
+  let disposed = false;
 
   function raceTimeout<T>(attempt: Promise<T>): Promise<T | typeof TIMEOUT> {
     return new Promise((resolve) => {
@@ -153,6 +154,11 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
   function sendCommit(record: OperationRecord): Promise<CommitAttempt> {
     return (async () => {
       try {
+        // F1: `record.request` is the private snapshot taken at record
+        // creation — every send (first attempt, explicit retry, background
+        // re-send) goes out from that snapshot, so the bytes on the wire are
+        // `record.serializedBody` exactly. The caller's object is never read
+        // again after `commit()` serialized it.
         return { ok: true, receipt: await client.commitEditorCommand(record.projectId, record.request) };
       } catch (cause) {
         return { ok: false, failure: failureFromError(cause) };
@@ -180,7 +186,7 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
     });
   }
 
-  async function runCommitAttempt(record: OperationRecord, retry: boolean): Promise<CommitOutcome> {
+  async function runCommitAttempt(record: OperationRecord): Promise<CommitOutcome> {
     const attempt = sendCommit(record);
     attachLateSettlement(record, attempt, (settled) =>
       classifyCommitAttempt(settled, { retry: true })
@@ -190,6 +196,14 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
       record.ambiguousReturned = true;
       return { kind: "ambiguous", cause: "timeout" };
     }
+    // F2: decide "sole attempt" at SETTLEMENT time, never at send time. A 4xx
+    // is definite only when exactly one send has ever been started for this id
+    // and no ambiguous outcome has been reported for it (criterion 3's first-
+    // attempt rule); anything else follows the retry rules, because a
+    // concurrent send of the same id can still commit (its 409 is a pre-claim
+    // lock-wait refusal, not proof of non-commit). The ordinary single-send
+    // case keeps the first-attempt rule exactly.
+    const retry = record.sends > 1 || record.ambiguousReturned;
     const outcome = classifyCommitAttempt(winner, { retry });
     if (outcome.kind === "definite") {
       learn(record, outcome);
@@ -235,7 +249,9 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
     } else {
       record = {
         projectId,
-        request,
+        // F1: a PRIVATE snapshot of the request. The caller's object is never
+        // read again — later mutation of it cannot change any attempt's bytes.
+        request: JSON.parse(serializedBody) as EditorCommitRequest,
         serializedBody,
         sends: 0,
         ambiguousReturned: false,
@@ -244,11 +260,8 @@ export function createEditorClient(options: EditorClientOptions): DisposableEdit
       };
       records.set(request.operationId, record);
     }
-    // R3: any send of a recorded id is classified as a retry — its 4xx can be
-    // lock contention for an attempt that will still commit.
-    const retry = record.sends > 0;
     record.sends += 1;
-    const outcome = await runCommitAttempt(record, retry);
+    const outcome = await runCommitAttempt(record);
     // R3: the record is released when a definite outcome is RETURNED to the
     // caller (here), not when it is first learned (a stored background answer
     // is released by the call that returns it).
