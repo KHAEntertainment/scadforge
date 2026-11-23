@@ -458,6 +458,8 @@ export class TransactionController {
     if (this.pendingCommit) return { kind: "refused", reason: "finalize-pending" };
     const inputs = this.snapshotInputs(command, proof, intent, traversal, context);
     if (inputs.intent === "undo" || inputs.intent === "redo") return this.submitTraversalCommand(inputs);
+    // `traversal` is mandatory for undo/redo and must be null for edit/setup (protocol).
+    if (inputs.traversal) return { kind: "refused", reason: "unknown-traversal-target" };
     if (this.current.kind === "idle" || this.current.kind === "preview-ok") {
       return this.sendCommit(inputs);
     }
@@ -514,6 +516,17 @@ export class TransactionController {
     if (this.disposed) return { ok: false, reason: "not-idle" };
     if (this.current.kind === "disabled") return { ok: false, reason: "disabled" };
     if (this.current.kind !== "idle") return { ok: false, reason: "not-idle" };
+    return this.deriveTraversalRequest(direction);
+  }
+
+  /**
+   * The ONE validity rule for any undo/redo, shared by `prepareTraversal`
+   * (and so `submitTraversal`) and the direct `submitVerified` path so the
+   * two cannot drift: the entry at the cursor must exist and be fresh (an
+   * external write makes it stale), the log must know its tip revision, and
+   * the exact inverse must be derivable from what was recorded.
+   */
+  private deriveTraversalRequest(direction: TraversalDirection): PrepareTraversalResult {
     const target = this.log.target(direction);
     if (!target) return { ok: false, reason: direction === "undo" ? "nothing-to-undo" : "nothing-to-redo" };
     const baseEditorRevision = this.log.tip;
@@ -562,12 +575,23 @@ export class TransactionController {
     return this.sendCommit(inputs);
   }
 
+  /**
+   * The direct path's refusals: identity first (Q5 and unknown targets), then
+   * the shared validity rule (a stale target is refused), then that the
+   * submitted command and the proof's base are exactly what the log derives
+   * now — the same request `prepareTraversal` would have produced.
+   */
   private traversalRefusal(inputs: CommitInputs): FinalizeRefusalReason | null {
     const traversal = inputs.traversal;
     if (!traversal || traversal.direction !== inputs.intent) return "unknown-traversal-target";
     if (this.log.isTraversalOperation(traversal.operationId)) return "traversal-of-traversal";
     const target = this.log.target(traversal.direction);
     if (!target || target.entry.operationId !== traversal.operationId) return "unknown-traversal-target";
+    const derived = this.deriveTraversalRequest(traversal.direction);
+    if (!derived.ok) return derived.reason === "stale-log" ? "stale-log" : "target-changed";
+    if (canonicalJson(inputs.command) !== canonicalJson(derived.request.command) || inputs.proof.baseEditorRevision !== derived.request.baseEditorRevision) {
+      return "target-changed";
+    }
     return null;
   }
 
@@ -706,9 +730,16 @@ export class TransactionController {
     if (this.reconcileRun) return this.reconcileRun;
     const records = this.pendingReceipts.list(this.deps.projectId);
     if (records.length === 0) return Promise.resolve();
-    const run = Promise.all(records.map((record) => this.reconcileOne(record, 1))).then(() => {
-      if (this.reconcileRun === run) this.reconcileRun = null;
-    });
+    // Cleared on fulfilment AND rejection, so one failed run never blocks the next.
+    const run = Promise.all(records.map((record) => this.reconcileOne(record, 1))).then(
+      () => {
+        if (this.reconcileRun === run) this.reconcileRun = null;
+      },
+      (cause: unknown) => {
+        if (this.reconcileRun === run) this.reconcileRun = null;
+        throw cause;
+      }
+    );
     this.reconcileRun = run;
     return run;
   }
@@ -740,7 +771,12 @@ export class TransactionController {
       response.state === "committed"
         ? { operationId: record.operationId, outcome: "committed", receipt: response.receipt }
         : { operationId: record.operationId, outcome: "not-committed", reason: response.reason };
-    this.deps.onPendingReconciled?.(reconciliation);
+    try {
+      this.deps.onPendingReconciled?.(reconciliation);
+    } catch {
+      // A host hook failure must neither reject the run nor stop the other
+      // records: the record is already reconciled and removed.
+    }
   }
 
   // ── detach / dispose (R2) ─────────────────────────────────────────────────

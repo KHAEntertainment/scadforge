@@ -187,7 +187,9 @@ export type FinalizeRefusalReason =
   | "unknown-traversal-target"
   /** An undo/redo naming an accepted undo/redo — Q5: no undo of an undo. */
   | "traversal-of-traversal"
-  /** `submitTraversal` re-derived a different request than the one the host verified. */
+  /** The entry an undo/redo targets was invalidated by an external write (the same rule as `prepareTraversal`'s `stale-log`). */
+  | "stale-log"
+  /** The submitted command or the proof's base revision is not what the log derives now (also: `submitTraversal` re-derived a different request than the one the host verified). */
   | "target-changed"
   | "not-idle"
   | "disabled";

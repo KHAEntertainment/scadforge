@@ -1778,8 +1778,15 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
       await vi.advanceTimersByTimeAsync(0);
       expect(client.lookups).toHaveLength(1); // now waiting out a backoff
 
+      // The run is still pending, and a second call returns that same run.
+      const first = controller.reconcilePending();
+      const second = controller.reconcilePending();
+      expect(second).toBe(first);
       const settled = vi.fn();
-      void controller.reconcilePending().then(settled);
+      void first.then(settled);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).not.toHaveBeenCalled();
+
       controller.dispose();
       await vi.advanceTimersByTimeAsync(0);
 
@@ -1790,6 +1797,121 @@ describe("TransactionController session log and navigation receipts (C3)", () =>
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("F7: a throwing onPendingReconciled hook neither rejects the run nor stops the other records, and a later reconcilePending() still works", async () => {
+    const { deps, client } = makeDeps();
+    const store = deps.pendingReceipts!;
+    store.record({ projectId: "project-1", operationId: "op-1", intent: "edit", traversal: null });
+    store.record({ projectId: "project-1", operationId: "op-2", intent: "edit", traversal: null });
+    client.queueLookupOutcome(definiteCommitted(makeReceipt({ operationId: "op-1" })));
+    client.queueLookupOutcome(definiteCommitted(makeReceipt({ operationId: "op-2" })));
+    const onPendingReconciled = vi.fn((r: { operationId: string }) => {
+      if (r.operationId === "op-1") throw new Error("host hook failed");
+    });
+    const controller = new TransactionController({ ...deps, onPendingReconciled });
+
+    await expect(controller.reconcilePending()).resolves.toBeUndefined();
+
+    expect(onPendingReconciled.mock.calls.map(([r]) => r.operationId)).toEqual(["op-1", "op-2"]); // op-2 still reconciled
+    expect(store.list("project-1")).toEqual([]);
+
+    // The cached run was cleared: a later pending record is reconciled by this same controller.
+    store.record({ projectId: "project-1", operationId: "op-3", intent: "edit", traversal: null });
+    client.queueLookupOutcome(definiteCommitted(makeReceipt({ operationId: "op-3" })));
+    await controller.reconcilePending();
+    expect(onPendingReconciled.mock.calls.map(([r]) => r.operationId)).toEqual(["op-1", "op-2", "op-3"]);
+  });
+
+  // ── F6: the direct submitVerified path applies the same validity rules as prepareTraversal ──
+
+  /** A settled idle session in which an external write made every entry stale. */
+  async function makeStaleSession(kind: "undo-target" | "redo-target") {
+    const session = kind === "redo-target" ? await makeUndoneSession() : await makeTwoEditSession();
+    session.controller.setGuardInputs(idleGuardInputs({ externalWriteUnsettled: true }));
+    session.controller.setGuardInputs(idleGuardInputs()); // settled again
+    expect(session.controller.state()).toEqual({ kind: "idle" });
+    return session;
+  }
+
+  async function makeTwoEditSession() {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+    await commitEdit(controller, client, { from: 40, to: 43, base: HEX64_A, revision: R1 });
+    await commitEdit(controller, client, { from: 43, to: 46, base: R1, revision: R2 });
+    return { controller, client, deps };
+  }
+
+  it("F6: a stale REDO target sent through submitVerified with a fresh current-base proof is refused and nothing is sent", async () => {
+    const { controller, client } = await makeStaleSession("redo-target"); // cursor 1 of 2; redo target op-2 is stale; tip R3
+    expect(controller.prepareTraversal("redo")).toEqual({ ok: false, reason: "stale-log" });
+    const sent = client.commits.length;
+
+    const result = await controller.submitVerified(
+      { kind: "set-value", featureId: "feature-1", bindingVersion: 1, value: 46 },
+      makeProof({ baseEditorRevision: R3 }),
+      "redo",
+      { operationId: "op-2", direction: "redo" }
+    );
+
+    expect(result).toEqual({ kind: "refused", reason: "stale-log" });
+    expect(client.commits).toHaveLength(sent);
+    expect(controller.state()).toEqual({ kind: "idle" });
+  });
+
+  it("F6: a stale UNDO target sent through submitVerified with a fresh current-base proof is refused and nothing is sent", async () => {
+    const { controller, client } = await makeStaleSession("undo-target"); // cursor 2 of 2; undo target op-2 is stale; tip R2
+    expect(controller.prepareTraversal("undo")).toEqual({ ok: false, reason: "stale-log" });
+    const sent = client.commits.length;
+
+    const result = await controller.submitVerified(
+      { kind: "set-value", featureId: "feature-1", bindingVersion: 1, value: 43 },
+      makeProof({ baseEditorRevision: R2 }),
+      "undo",
+      { operationId: "op-2", direction: "undo" }
+    );
+
+    expect(result).toEqual({ kind: "refused", reason: "stale-log" });
+    expect(client.commits).toHaveLength(sent);
+  });
+
+  it("F6: a non-stale target whose proof base is not the log's tip is refused and nothing is sent; the exact request is accepted", async () => {
+    const { controller, client } = await makeUndoneSession(); // tip R3, redo target op-2 (value 46)
+    const sent = client.commits.length;
+    const redoCommand = { kind: "set-value", featureId: "feature-1", bindingVersion: 1, value: 46 } as const;
+    const target = { operationId: "op-2", direction: "redo" } as const;
+
+    expect(await controller.submitVerified(redoCommand, makeProof({ baseEditorRevision: R4 }), "redo", target)).toEqual({
+      kind: "refused",
+      reason: "target-changed"
+    });
+    // A command that is not the exact inverse the log derives is refused locally too.
+    expect(
+      await controller.submitVerified({ ...redoCommand, value: 99 }, makeProof({ baseEditorRevision: R3 }), "redo", target)
+    ).toEqual({ kind: "refused", reason: "target-changed" });
+    expect(client.commits).toHaveLength(sent);
+
+    // The positive control: the same call with the exact derived request goes through.
+    client.queueCommitOutcome(definiteCommitted(nextReceipt(client, R3, R4)));
+    const accepted = await controller.submitVerified(redoCommand, makeProof({ baseEditorRevision: R3 }), "redo", target);
+    expect(accepted.kind).toBe("committed");
+    expect(client.commits).toHaveLength(sent + 1);
+    expect(controller.history().cursor).toBe(2);
+  });
+
+  it("F6: an edit/setup intent carrying a traversal is refused locally (traversal must be null)", async () => {
+    const { deps, client } = makeDeps();
+    const controller = new TransactionController(deps);
+
+    const result = await controller.submitVerified(
+      { kind: "set-value", featureId: "feature-1", bindingVersion: 1, value: 43 },
+      makeProof(),
+      "edit",
+      { operationId: "op-1", direction: "undo" }
+    );
+
+    expect(result).toEqual({ kind: "refused", reason: "unknown-traversal-target" });
+    expect(client.commits).toHaveLength(0);
   });
 
   // ── C2 QA gaps (criterion 11) ────────────────────────────────────────────
