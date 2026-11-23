@@ -557,6 +557,44 @@ describe("Edit surface — carried-forward acceptance (Issue #136 comments, Tech
   });
 });
 
+describe("Edit surface — PR #140 fix batch 1", () => {
+  it("F2: a late verify conflict from the previous project does nothing to the current project's session", async () => {
+    server = seedServer("p1", "p2");
+    vi.stubGlobal("fetch", server.fetch);
+    render(<App />);
+    await openEdit();
+    const lateVerify = server.hold("verify");
+    typeWall("3");
+    clickButton("Save");
+    await lateVerify.arrived;
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "p2" } });
+    await waitFor(() => expect(server.log).toContain("GET /projects/p2/editor"), { timeout: 3000 });
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."), { timeout: 3000 });
+    await saveWall("4");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled());
+    typeWall("5");
+    clickButton("Preview");
+    await waitFor(() => expect(status()).toHaveTextContent("Preview ready."), { timeout: 3000 });
+    const p2Reads = server.log.filter((line) => line === "GET /projects/p2/editor").length;
+
+    // p1 changes under its held check, so the check answers 409 CONFLICT, for p1.
+    server.externalWrite("p1", { wall: 9 });
+    lateVerify.release();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(status()).toHaveTextContent("Preview ready.");
+    expect(status()).not.toHaveTextContent("The project changed");
+    expect(server.log.filter((line) => line === "GET /projects/p2/editor")).toHaveLength(p2Reads);
+    clickButton("Cancel");
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."));
+    expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
+    expect(server.commitPosts.filter((post) => post.projectId === "p1")).toHaveLength(0);
+  });
+});
+
 async function saveWallWithoutWaiting(value: string): Promise<void> {
   typeWall(value);
   clickButton("Save");

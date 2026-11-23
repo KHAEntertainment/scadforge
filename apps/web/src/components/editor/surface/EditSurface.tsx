@@ -7,10 +7,13 @@
 // second way in (Enter, a shortcut) cannot skip them:
 //  - typed save: the row's form `onSubmit` (button and Enter) → `submitValue`;
 //  - undo/redo: `runTraversal(direction)` (buttons and shortcuts).
-// After every await the surface re-checks that it is still mounted, that the
-// controller and project are the ones it started with, and (for a save) that
-// the controller still holds the same gesture; otherwise it drops the result
-// and sends nothing.
+// Each async path captures its origin (controller, project, an origin token
+// bumped on every controller/project change, and the gesture where one
+// exists) before its first await. After every await, and before ANY side
+// effect on the success path, the failure path and in `finally` (reporting a
+// write, a notice, the busy flag, a controller call), it checks that origin
+// is still live; a result from a stale origin does nothing to the current
+// session.
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { EditorCommand, EditorDocument, EditorFeature, EditorProofResponse, EditorVerifyRequest } from "@scadforge/protocol";
@@ -52,6 +55,14 @@ export interface EditSurfaceSession {
 
 type Notice = { tone: "info" | "success" | "error"; text: string };
 type Busy = null | "save" | "undo" | "redo";
+
+/** Where an async path started. `begin` is the gesture it serves, if any. */
+interface Origin {
+  token: number;
+  controller: TransactionController;
+  projectId: string;
+  begin: BeginInput | null;
+}
 
 const BEGIN_COPY: Record<Exclude<BeginRefusalReason, keyof typeof DISABLED_COPY>, string> = {
   "not-idle": "Another edit is still in progress. Finish or cancel it first.",
@@ -147,6 +158,8 @@ export function EditSurface({ session }: { session: EditSurfaceSession }) {
   const [busy, setBusyState] = useState<Busy>(null);
   const busyRef = useRef<Busy>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
+  /** Bumped on every controller/project change: results from before it are stale. */
+  const originTokenRef = useRef(0);
 
   function setBusy(next: Busy): void {
     busyRef.current = next;
@@ -172,19 +185,46 @@ export function EditSurface({ session }: { session: EditSurfaceSession }) {
     };
   }, []);
 
-  function stillCurrent(controller: TransactionController, projectId: string): boolean {
-    const current = sessionRef.current;
-    return mountedRef.current && current.controller === controller && current.projectId === projectId;
+  // A new controller or project is a new origin: the previous one's pending
+  // work no longer owns the busy flag or the notice line.
+  useEffect(() => {
+    originTokenRef.current += 1;
+    setBusy(null);
+    if (mountedRef.current) setNotice(null);
+  }, [session.controller, session.projectId]);
+
+  function originOf(controller: TransactionController, projectId: string, begin: BeginInput | null): Origin {
+    return { token: originTokenRef.current, controller, projectId, begin };
   }
 
-  async function verify(projectId: string, request: EditorVerifyRequest): Promise<EditorProofResponse | null> {
+  /**
+   * `project`: same mount, same origin token, same controller and project.
+   * `gesture`: also, where the origin has a gesture, the controller still holds it.
+   */
+  function live(origin: Origin, scope: "project" | "gesture"): boolean {
+    const current = sessionRef.current;
+    if (!mountedRef.current || originTokenRef.current !== origin.token) return false;
+    if (current.controller !== origin.controller || current.projectId !== origin.projectId) return false;
+    if (scope === "project" || origin.begin === null) return true;
+    const state = origin.controller.state();
+    return isActiveGesture(state) && state.begin === origin.begin;
+  }
+
+  /** `finally`: only the origin that set the busy flag clears it. */
+  function releaseBusy(origin: Origin): void {
+    if (originTokenRef.current === origin.token) setBusy(null);
+  }
+
+  async function verify(origin: Origin, request: EditorVerifyRequest): Promise<EditorProofResponse | null> {
     try {
-      return await sessionRef.current.api.verifyEditorCommand(projectId, request);
+      return await sessionRef.current.api.verifyEditorCommand(origin.projectId, request);
     } catch (cause) {
+      // A stale origin's failure says nothing about the current session.
+      if (!live(origin, "project")) return null;
       if (cause instanceof ApiClientError && cause.error_code === "CONFLICT") {
         sessionRef.current.reportWrite("conflict");
-        show({ tone: "error", text: "The project changed since this value was loaded. It is reloading; try again once it has." });
-      } else {
+        if (live(origin, "gesture")) show({ tone: "error", text: "The project changed since this value was loaded. It is reloading; try again once it has." });
+      } else if (live(origin, "gesture")) {
         show({ tone: "error", text: `The change could not be checked: ${cause instanceof Error ? cause.message : "unknown error"}.` });
       }
       return null;
@@ -219,9 +259,10 @@ export function EditSurface({ session }: { session: EditSurfaceSession }) {
           show({ tone: "error", text: PROPOSE_COPY["non-finite-candidate"] });
           return;
         }
+        const origin = originOf(controller, projectId, null);
         setBusy("save");
         try {
-          proofInHand = await verify(projectId, {
+          proofInHand = await verify(origin, {
             version: 1,
             baseEditorRevision: document.editorRevision,
             command: { kind: "set-value", featureId: feature.featureId, bindingVersion: feature.bindingVersion, value: paramValue },
@@ -229,12 +270,12 @@ export function EditSurface({ session }: { session: EditSurfaceSession }) {
             traversal: null
           });
         } finally {
-          setBusy(null);
+          releaseBusy(origin);
         }
-        // Re-checked after the await: same controller and project, still idle, same document revision.
+        // Re-checked after the await: same origin, still idle, same document revision.
         if (
           !proofInHand ||
-          !stillCurrent(controller, projectId) ||
+          !live(origin, "project") ||
           controller.state().kind !== "idle" ||
           sessionRef.current.document?.editorRevision !== document.editorRevision
         ) {
@@ -275,19 +316,20 @@ export function EditSurface({ session }: { session: EditSurfaceSession }) {
     if (mode === "preview") return;
 
     const command: EditorCommand = { kind: "set-value", featureId: begin.featureId, bindingVersion: begin.bindingVersion, value: paramValue };
+    const origin = originOf(controller, projectId, begin);
     setBusy("save");
     try {
       const proof =
-        proofInHand ?? (await verify(projectId, { version: 1, baseEditorRevision: begin.baseEditorRevision, command, intent: "edit", traversal: null }));
-      if (!proof || !stillCurrent(controller, projectId)) return;
+        proofInHand ?? (await verify(origin, { version: 1, baseEditorRevision: begin.baseEditorRevision, command, intent: "edit", traversal: null }));
+      if (!proof || !live(origin, "gesture")) return;
       const now = controller.state();
       const sameGesture =
         (now.kind === "preview-pending" || now.kind === "preview-ok") && now.begin === begin && now.candidate.value === paramValue;
       if (!sameGesture) return;
       const result = await controller.submitVerified(command, proof, "edit", null, { beforeValue: begin.baseValue });
-      show(describeResult(result, "save"));
+      if (live(origin, "project")) show(describeResult(result, "save"));
     } finally {
-      setBusy(null);
+      releaseBusy(origin);
     }
   }
 
@@ -299,14 +341,15 @@ export function EditSurface({ session }: { session: EditSurfaceSession }) {
     const prepared = controller.prepareTraversal(direction);
     if (!prepared.ok) return; // nothing to do right now; not an error
     if (mountedRef.current) setNotice(null);
+    const origin = originOf(controller, projectId, null);
     setBusy(direction);
     try {
-      const proof = await verify(projectId, prepared.request);
-      if (!proof || !stillCurrent(controller, projectId)) return;
+      const proof = await verify(origin, prepared.request);
+      if (!proof || !live(origin, "project")) return;
       const result = await controller.submitTraversal({ request: prepared.request }, proof);
-      show(describeResult(result, direction));
+      if (live(origin, "project")) show(describeResult(result, direction));
     } finally {
-      setBusy(null);
+      releaseBusy(origin);
     }
   }
 
