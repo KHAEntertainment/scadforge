@@ -307,6 +307,8 @@ export function App() {
                 ? sourceStaleHere.failed
                   ? SOURCE_RETRY_REASON
                   : "Loading the latest source before building…"
+                : sourceEditor.loadError && sourceEditor.baseRevision
+                  ? SOURCE_RETRY_REASON
                 : sourceEditor.loading
                   ? "Loading the latest source before building…"
                   : historical
@@ -384,6 +386,12 @@ export function App() {
       setSourceStale({ ...sourceStaleHere, requestedSeq: sourceSeqRef.current });
       sourceEditor.reload();
       setHeaderNotice("Still loading the latest source; trying again. Press Build once it has loaded.");
+      return;
+    }
+    if (sourceEditor.loadError && !sourceStaleHere && !editorSaving) {
+      // This project's source read failed: the base revision may be another project's. Pressing Build retries the read.
+      sourceEditor.reload();
+      setHeaderNotice("The latest source could not be loaded; trying again. Press Build once it has loaded.");
       return;
     }
     if (editorSaving || sourceStaleHere || sourceEditor.loading) {

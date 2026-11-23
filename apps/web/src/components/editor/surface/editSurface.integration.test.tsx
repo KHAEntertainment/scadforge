@@ -1074,6 +1074,30 @@ describe("Edit surface — PR #140 fix batch 3", () => {
     await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
     expect(server.buildPosts[0]).toMatchObject({ projectId: "p2", current: true });
   });
+
+  it("Build: after a switch, a failed read of B's source keeps Build from posting; Build retries the read, then posts B's revision", async () => {
+    server = seedServer("p1", "p2");
+    vi.stubGlobal("fetch", server.fetch);
+    const p2Reads = () => server.log.filter((line) => line === "GET /projects/p2/source").length;
+    render(<App />);
+    await waitFor(() => expect(server.log).toContain("GET /projects/p1/source"), { timeout: 3000 });
+    await settle(50);
+    server.failSourceGet.add("p2");
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "p2" } });
+    await waitFor(() => expect(p2Reads()).toBe(1), { timeout: 3000 });
+    await settle(50);
+    expect(screen.getByTestId("preview-build-button")).toHaveAttribute("title", "The latest source could not be loaded. Press Build to try loading it again.");
+
+    fireEvent.click(headerBuild());
+    await screen.findByText(/The latest source could not be loaded; trying again/);
+    expect(server.buildPosts).toHaveLength(0);
+    await waitFor(() => expect(p2Reads()).toBe(2), { timeout: 3000 });
+    await settle(50);
+
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0]).toMatchObject({ projectId: "p2", current: true });
+  });
 });
 
 async function saveWallWithoutWaiting(value: string): Promise<void> {
