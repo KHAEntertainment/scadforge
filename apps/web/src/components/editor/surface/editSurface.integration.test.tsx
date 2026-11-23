@@ -69,10 +69,30 @@ vi.mock("@monaco-editor/react", () => ({
 }));
 
 // The 3D viewer records the URL it is given (jsdom has no WebGL; PreviewTab's own tests stub it the same way).
+const viewer = vi.hoisted(() => ({ log: [] as string[] }));
 vi.mock("../../Viewer3D.js", () => ({
-  Viewer3D: ({ stlUrl, emptyMessage }: { stlUrl: string | null; emptyMessage?: string }) =>
-    stlUrl ? <div data-testid="viewer-3d" data-url={stlUrl} /> : <div data-testid="viewer-placeholder">{emptyMessage}</div>
+  Viewer3D: ({ stlUrl, emptyMessage }: { stlUrl: string | null; emptyMessage?: string }) => {
+    if (stlUrl) viewer.log.push(stlUrl);
+    return stlUrl ? <div data-testid="viewer-3d" data-url={stlUrl} /> : <div data-testid="viewer-placeholder">{emptyMessage}</div>;
+  }
 }));
+
+// A pass-through around the real `useSnapshotMesh`. React flushes a discrete
+// click (a project switch, "Return to current") in a microtask, before any
+// network result, so jsdom cannot land a mesh result in the same render as the
+// click; F4's tests inject that render's inputs here instead.
+type MeshResult = { url: string | null; status: "idle" | "checking" | "ready" | "absent"; projectId?: string | null; snapshotId?: string | null };
+const meshOverride = vi.hoisted(() => ({ fn: null as null | ((real: MeshResult, projectId: string | null, snapshotId: string | null) => MeshResult) }));
+vi.mock("../../../hooks/useSnapshotMesh.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../hooks/useSnapshotMesh.js")>();
+  return {
+    ...actual,
+    useSnapshotMesh: (client: Parameters<typeof actual.useSnapshotMesh>[0], projectId: string | null, snapshotId: string | null) => {
+      const real = actual.useSnapshotMesh(client, projectId, snapshotId);
+      return meshOverride.fn ? meshOverride.fn(real, projectId, snapshotId) : real;
+    }
+  };
+});
 
 let engine = new FakeEngine();
 const IDLE_RESULT: EngineResult = { status: "idle", objectUrl: null, stderr: null, lastRenderMs: null, coldInit: null };
@@ -116,6 +136,8 @@ beforeEach(() => {
   } catch {
     /* storage optional */
   }
+  viewer.log.length = 0;
+  meshOverride.fn = null;
   engine = new FakeEngine();
   server = seedServer();
   vi.stubGlobal("fetch", server.fetch);
@@ -662,9 +684,9 @@ describe("Edit surface — PR #140 fix batch 1", () => {
     const header = screen.getByRole("banner");
     const build = within(header).getByRole("button", { name: /^Build$/ });
 
-    // Pressed before the clean source editor has the post-commit revision: nothing is sent.
+    // Pressed before the clean source editor has the post-commit revision: nothing is sent (the press restarts the re-read).
     fireEvent.click(build);
-    await screen.findByText("Loading the latest source before building…");
+    await screen.findByText("Still loading the latest source; trying again. Press Build once it has loaded.");
     expect(server.buildPosts).toHaveLength(0);
 
     reread.release();
@@ -768,6 +790,173 @@ describe("Edit surface — PR #140 fix batch 1", () => {
     await screen.findByText(/Viewing historical snapshot/);
     await waitFor(() => expect(viewerUrl()).toBe(firstMesh), { timeout: 3000 });
     expect(screen.queryByTestId("edit-preview-status")).toBeNull();
+  });
+});
+
+describe("Edit surface — PR #140 fix batch 2", () => {
+  function sourceReads(): number {
+    return server.log.filter((line) => line === "GET /projects/p1/source").length;
+  }
+
+  function headerBuild(): HTMLElement {
+    return within(screen.getByRole("banner")).getByRole("button", { name: /^Build$/ });
+  }
+
+  async function settle(ms = 30): Promise<void> {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    });
+  }
+
+  it("F1(a): a failed post-commit source re-read keeps Build refused with a reason; Build retries it, then sends the post-commit revision", async () => {
+    render(<App />);
+    await openEdit();
+    server.failSourceGet.add("p1");
+    const readsBefore = sourceReads();
+    await saveWall("3");
+    await waitFor(() => expect(sourceReads()).toBe(readsBefore + 1), { timeout: 3000 });
+    await settle();
+    expect(screen.getByTestId("preview-build-button")).toHaveAttribute("title", "The latest source could not be loaded. Press Build to try loading it again.");
+
+    fireEvent.click(headerBuild());
+    await screen.findByText(/The latest source could not be loaded; trying again/);
+    expect(server.buildPosts).toHaveLength(0);
+    await waitFor(() => expect(sourceReads()).toBe(readsBefore + 2), { timeout: 3000 });
+    await settle();
+
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].current).toBe(true);
+  });
+
+  it("F1(b): a draft dirty at the receipt, then discarded, triggers the re-read; Build then sends the post-commit revision", async () => {
+    render(<App />);
+    await openEdit();
+    const hold = server.hold("commit");
+    typeWall("3");
+    clickButton("Save");
+    await hold.arrived;
+    fireEvent.click(screen.getByRole("tab", { name: /code/i }));
+    await screen.findByLabelText("OpenSCAD source");
+    await settle(20);
+    fireEvent.change(screen.getByLabelText("OpenSCAD source"), { target: { value: "cube([wall, 12, 10]); // draft" } });
+    hold.release();
+    await waitFor(() => expect(server.acceptedCommits).toBe(1));
+    await settle(50);
+    const readsBefore = sourceReads();
+
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(sourceReads()).toBe(readsBefore + 1), { timeout: 3000 });
+    await settle();
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].current).toBe(true);
+  });
+
+  it("F4: a mesh result for project A, rendered with project B current, is never shown or kept for B", async () => {
+    server = seedServer("p1", "p2");
+    vi.stubGlobal("fetch", server.fetch);
+    const meshA = server.buildMesh("p1");
+    const headA = server.projects.get("p1")!.snapshots[0].id;
+    render(<App />);
+    await openEdit();
+    await waitFor(() => expect(viewerUrl()).toBe(meshA), { timeout: 3000 });
+
+    // The render the review describes: project B current, A's `ready` result still in hand.
+    const resultForA: MeshResult = { url: meshA, status: "ready", projectId: "p1", snapshotId: headA };
+    meshOverride.fn = (real, projectId) => (projectId === "p2" ? resultForA : real);
+    const logged = viewer.log.length;
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "p2" } });
+    await waitFor(() => expect(server.log).toContain("GET /projects/p2/editor"), { timeout: 3000 });
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."), { timeout: 3000 });
+    // B's preview fails: the fallback must not be A's mesh, and nothing may claim a server render.
+    engine.failing = true;
+    typeWall("4");
+    clickButton("Preview");
+    await waitFor(() => expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("The local edit preview failed"));
+    await settle();
+    expect(viewer.log.slice(logged)).not.toContain(meshA);
+    expect(screen.getByTestId("edit-preview-status")).not.toHaveTextContent("showing the last server render");
+  });
+
+  it("F4: a historical snapshot's mesh result, rendered with the head selected again, is never shown or kept as the head's", async () => {
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    const older = server.projects.get("p1")!.snapshots.at(-1)!.id;
+    const olderMesh = server.buildSnapshotMesh("p1", older);
+    fireEvent.click(screen.getByRole("tab", { name: /history/i }));
+    await screen.findAllByTestId("snapshot-row");
+    fireEvent.click(screen.getAllByTestId("snapshot-row").at(-1)!);
+    await screen.findByText(/Viewing historical snapshot/);
+    await waitFor(() => expect(viewerUrl()).toBe(olderMesh), { timeout: 3000 });
+
+    // The head is selected again while the historical snapshot's `ready` result is still in hand.
+    const resultForOlder: MeshResult = { url: olderMesh, status: "ready", projectId: "p1", snapshotId: older };
+    meshOverride.fn = (real, _projectId, snapshotId) => (snapshotId !== older ? resultForOlder : real);
+    const logged = viewer.log.length;
+    fireEvent.click(screen.getByRole("button", { name: "Return to current" }));
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: "Edit" }));
+    await waitFor(() => expect(status()).toHaveTextContent("Ready."), { timeout: 3000 });
+    engine.failing = true;
+    typeWall("5");
+    clickButton("Preview");
+    await waitFor(() => expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("The local edit preview failed"));
+    await settle();
+    expect(viewer.log.slice(logged)).not.toContain(olderMesh);
+  });
+
+  it("L4: until the head moves off the pre-commit snapshot, its mesh is not shown as current and Inspect stays off", async () => {
+    const preCommitMesh = server.buildMesh("p1");
+    render(<App />);
+    await openEdit();
+    await waitFor(() => expect(viewerUrl()).toBe(preCommitMesh), { timeout: 3000 });
+
+    const list = server.hold("snapshots-list");
+    await saveWall("3");
+    await list.arrived;
+    await settle(50);
+    expect(screen.getByTestId("edit-preview-status")).toBeInTheDocument();
+    expect(viewerUrl()).toMatch(/^blob:fake-mesh-/);
+    expect(screen.getByTestId("inspect-toggle")).toBeDisabled();
+
+    // The new head gets a mesh; the list catches up and the state resolves to it.
+    const newHeadMesh = server.buildMesh("p1");
+    list.release();
+    await waitFor(() => expect(viewerUrl()).toBe(newHeadMesh), { timeout: 3000 });
+    expect(screen.queryByTestId("edit-preview-status")).toBeNull();
+    expect(screen.getByTestId("inspect-toggle")).toBeEnabled();
+  });
+
+  it("L4: when the snapshot list refresh fails, the edit preview says why and Retry recovers", async () => {
+    const preCommitMesh = server.buildMesh("p1");
+    render(<App />);
+    await openEdit();
+    await waitFor(() => expect(viewerUrl()).toBe(preCommitMesh), { timeout: 3000 });
+
+    server.failSnapshotsList.add("p1");
+    await saveWall("3");
+    await screen.findByTestId("edit-preview-notice");
+    expect(viewerUrl()).not.toBe(preCommitMesh);
+    expect(screen.getByTestId("inspect-toggle")).toBeDisabled();
+
+    fireEvent.click(within(screen.getByTestId("edit-preview-notice")).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByTestId("edit-preview-notice")).toBeNull(), { timeout: 3000 });
+    // The new head has no mesh: the local preview keeps the viewer, labelled.
+    expect(viewerUrl()).toMatch(/^blob:fake-mesh-/);
+  });
+
+  it("while the head's mesh is still being checked, the label says so instead of claiming there is none", async () => {
+    server.buildMesh("p1");
+    const probe = server.hold("mesh");
+    engine.mode = "manual";
+    render(<App />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Edit" }));
+    await probe.arrived;
+    await waitFor(() => expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("Checking for a server render of this project"), { timeout: 3000 });
+    expect(screen.getByTestId("edit-preview-status")).not.toHaveTextContent("There is no server render");
+    probe.release();
   });
 });
 

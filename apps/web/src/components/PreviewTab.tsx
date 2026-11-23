@@ -27,6 +27,10 @@ export interface EditPreviewDisplay {
   fallbackUrl: string | null;
   /** True when `fallbackUrl` is the current head's own mesh (the edit is unsaved); false when it predates saved edits. */
   fallbackIsHead: boolean;
+  /** True while the head's server render is still being looked for (or not known yet); false once it is known to be absent. */
+  checking: boolean;
+  /** Why the shown state may persist, with a way out (L4: the snapshot list could not be refreshed). */
+  notice?: { text: string; actionLabel: string; onAction: () => void } | null;
 }
 
 export interface PreviewTabProps {
@@ -79,7 +83,11 @@ const EDIT_PREVIEW_LABEL: Record<EditPreviewDisplay["status"], string> = {
 function editPreviewLabel(preview: EditPreviewDisplay): string {
   if (preview.objectUrl) return EDIT_PREVIEW_LABEL[preview.status === "ok" ? "ok" : "pending"];
   const lead = preview.status === "failed" ? "The local edit preview failed" : "Rendering a local edit preview — not built or validated";
-  if (!preview.fallbackUrl) return `${lead}. There is no server render of this project to show; Build to render it.`;
+  if (!preview.fallbackUrl) {
+    return preview.checking
+      ? `${lead}. Checking for a server render of this project…`
+      : `${lead}. There is no server render of this project to show; Build to render it.`;
+  }
   const age = preview.fallbackIsHead ? "from before this edit" : "from before your saved edits";
   return `${lead} — showing the last server render, ${age}.`;
 }
@@ -342,6 +350,15 @@ function PreviewTabBody({
       {editPreview ? (
         <div className={`live-status live-status--${editPreview.status === "failed" ? "stale" : "live"}`} role="status" data-testid="edit-preview-status">
           {editPreviewLabel(editPreview)}
+          {editPreview.notice ? (
+            <span data-testid="edit-preview-notice">
+              {" "}
+              {editPreview.notice.text}{" "}
+              <button type="button" className="button button--ghost" onClick={editPreview.notice.onAction}>
+                {editPreview.notice.actionLabel}
+              </button>
+            </span>
+          ) : null}
         </div>
       ) : null}
 

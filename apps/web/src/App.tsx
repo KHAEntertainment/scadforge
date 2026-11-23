@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { SnapshotManifest, ViewName } from "@scadforge/protocol";
-import { createApiClient } from "./lib/apiClient.js";
+import type { EditorReceipt, SnapshotManifest, ViewName } from "@scadforge/protocol";
+import { createApiClient, type ApiClient } from "./lib/apiClient.js";
 import { useProject } from "./hooks/useProject.js";
 import { useChat } from "./hooks/useChat.js";
 import { useSnapshots } from "./hooks/useSnapshots.js";
@@ -29,6 +29,9 @@ function triggerDownload(blob: Blob, filename: string): void {
   anchor.remove();
   URL.revokeObjectURL(url);
 }
+
+/** F1: a failed post-commit source re-read; Build stays pressable and retries it. */
+const SOURCE_RETRY_REASON = "The latest source could not be loaded. Press Build to try loading it again.";
 
 export function App() {
   const client = useMemo(() => createApiClient(), []);
@@ -63,29 +66,77 @@ export function App() {
   }, [snapshots.snapshots, chat.state.headSnapshot, switchingProjects]);
   const workingHeadId = workingHead?.id ?? null;
   const liveSource = useLiveModelSource(client, projectId, workingHeadId);
+  // F1: the source editor's reads and writes, tagged where they start. From an
+  // accepted editor receipt until a read or write that STARTED after it has
+  // returned a revision and the clean editor has adopted it, the source base is
+  // stale and Build would send it (409). `sourceStale` holds that state for
+  // one project; the tag (start sequence + project id) is what proves which
+  // request a result belongs to.
+  const sourceSeqRef = useRef(0);
+  const [sourceStale, setSourceStale] = useState<{
+    projectId: string;
+    /** The source request sequence at the receipt: only later requests count. */
+    sinceSeq: number;
+    /** The revision of the latest-started post-receipt read/write that succeeded. */
+    freshRevision: string | null;
+    /** The latest-started post-receipt read failed; Build retries it. */
+    failed: boolean;
+    /** The sequence when the last re-read was requested (`null`: none yet). */
+    requestedSeq: number | null;
+    /** The latest-started post-receipt request that settled. */
+    settledSeq: number;
+  } | null>(null);
+  const sourceClient = useMemo<ApiClient>(() => {
+    const settle = (projectIdOfRequest: string, seq: number, revision: string | null) =>
+      setSourceStale((prev) =>
+        prev && prev.projectId === projectIdOfRequest && seq > prev.sinceSeq && seq >= prev.settledSeq
+          ? { ...prev, settledSeq: seq, freshRevision: revision ?? prev.freshRevision, failed: revision === null }
+          : prev
+      );
+    return {
+      ...client,
+      getSource(id: string) {
+        const seq = ++sourceSeqRef.current;
+        return client.getSource(id).then(
+          (response) => {
+            settle(id, seq, response.revision);
+            return response;
+          },
+          (cause: unknown) => {
+            settle(id, seq, null);
+            throw cause;
+          }
+        );
+      },
+      // A save sent after the receipt can only have succeeded against the post-commit revision.
+      updateSource(id: string, body: Parameters<ApiClient["updateSource"]>[1]) {
+        const seq = ++sourceSeqRef.current;
+        return client.updateSource(id, body).then((response) => {
+          settle(id, seq, response.revision);
+          return response;
+        });
+      }
+    };
+  }, [client]);
   // S3-C C4: params/source saves are external writes for the editor session (declared below).
   const reportEditorWriteRef = useRef<(reason: HostWriteReason) => void>(() => {});
   const handleSourceSaved = useCallback(() => {
     snapshots.refresh();
     reportEditorWriteRef.current("source-saved");
   }, [snapshots.refresh]);
-  const sourceEditor = useSourceEditor(client, projectId, handleSourceSaved);
+  const sourceEditor = useSourceEditor(sourceClient, projectId, handleSourceSaved);
   const handleParamsSaved = useCallback(() => {
     snapshots.refresh();
     reportEditorWriteRef.current("params-saved");
   }, [snapshots.refresh]);
   const paramsController = useParamsController(client, projectId, workingHeadId, handleParamsSaved);
-  // F1: an accepted editor commit changes the source revision Build sends
-  // (`computeSourceRevision(head, scad, params)`). A CLEAN source editor
-  // adopts it; a dirty or saving draft is never dropped (it keeps its base
-  // and surfaces as a conflict, as for any other external write).
-  const sourceEditorRef = useRef(sourceEditor);
-  sourceEditorRef.current = sourceEditor;
-  const handleEditorCommitted = useCallback(() => {
-    snapshots.refresh();
-    const source = sourceEditorRef.current;
-    if (!source.dirty && !source.saving) source.reload();
-  }, [snapshots.refresh]);
+  const handleEditorCommitted = useCallback(
+    (receipt: EditorReceipt) => {
+      snapshots.refresh();
+      setSourceStale({ projectId: receipt.projectId, sinceSeq: sourceSeqRef.current, freshRevision: null, failed: false, requestedSeq: null, settledSeq: 0 });
+    },
+    [snapshots.refresh]
+  );
   const editorSession = useEditorSession({
     api: client,
     projectId,
@@ -95,9 +146,32 @@ export function App() {
     paramsSaving: paramsController.saving,
     chatItems: chat.state.items,
     chatStreaming: chat.isStreaming,
+    headSnapshotId: workingHeadId,
     onCommitted: handleEditorCommitted
   });
   reportEditorWriteRef.current = editorSession.reportWrite;
+
+  // F1: drive the stale source base to fresh. A dirty or saving draft is never
+  // reloaded over; the re-read waits until it is clean (Discard, or a save).
+  const reloadSource = sourceEditor.reload;
+  useEffect(() => {
+    const stale = sourceStale;
+    if (!stale) return;
+    if (stale.projectId !== projectId) {
+      setSourceStale(null); // a project switch: the new project's source loads fresh
+      return;
+    }
+    if (sourceEditor.dirty || sourceEditor.saving) return;
+    if (stale.freshRevision !== null && sourceEditor.baseRevision === stale.freshRevision) {
+      setSourceStale(null);
+      return;
+    }
+    if (stale.failed || sourceEditor.loading) return;
+    if (stale.requestedSeq !== null && stale.settledSeq <= stale.requestedSeq) return; // our re-read has not settled yet
+    setSourceStale({ ...stale, requestedSeq: sourceSeqRef.current });
+    reloadSource();
+  }, [sourceStale, projectId, sourceEditor.dirty, sourceEditor.saving, sourceEditor.loading, sourceEditor.baseRevision, reloadSource]);
+  const sourceStaleHere = sourceStale !== null && sourceStale.projectId === projectId ? sourceStale : null;
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
   const [headerNotice, setHeaderNotice] = useState<string | null>(null);
@@ -151,30 +225,52 @@ export function App() {
   const pngUrls = useMemo<Partial<Record<ViewName, string | null>>>(() => Object.fromEntries((currentSnapshot?.renders ?? []).map((render) => [render.view, client.resolveUrl(render.url)])), [currentSnapshot, client]);
   const validation = currentSnapshot?.validation ?? null;
   const historical = selectedSnapshotId !== null && selectedSnapshotId !== workingHeadId;
-  // F4: this project's last server render (the last `ready` head mesh), the
-  // edit preview's fallback while it has nothing to show. Recorded only when
-  // the mesh result itself changes, so a result left over from the previous
-  // project or a historical selection is never recorded under the new one.
-  const [lastServerRender, setLastServerRender] = useState<{ projectId: string; url: string } | null>(null);
-  const meshOwnerRef = useRef({ projectId, historical });
-  meshOwnerRef.current = { projectId, historical };
+  // F4: the mesh result is used for edit-preview decisions ONLY when its own
+  // identity (the project and snapshot it was requested for) is the current
+  // project's head; any other result counts as "no server mesh known".
+  const headMesh = !historical && projectId !== null && workingHeadId !== null && mesh.projectId === projectId && mesh.snapshotId === workingHeadId ? mesh : null;
+  const headMeshReady = headMesh !== null && headMesh.status === "ready" && headMesh.url !== null;
+  // The viewer's own server URL obeys the same rule for the displayed snapshot.
+  // A result without identity fields (a test stand-in) is used as before.
+  const viewMesh =
+    mesh.projectId === undefined || (mesh.projectId === projectId && mesh.snapshotId === currentSnapshotId) ? mesh : { url: null, status: "checking" as const };
+  // This project's last server render (the last `ready` head mesh), the edit
+  // preview's fallback while it has nothing to show.
+  const [lastServerRender, setLastServerRender] = useState<{ projectId: string; snapshotId: string; url: string } | null>(null);
   useEffect(() => {
-    const owner = meshOwnerRef.current;
-    if (mesh.status === "ready" && mesh.url && owner.projectId && !owner.historical) setLastServerRender({ projectId: owner.projectId, url: mesh.url });
-  }, [mesh.status, mesh.url]);
-  const fallbackUrl = lastServerRender?.projectId === projectId ? lastServerRender.url : null;
+    if (mesh.status === "ready" && mesh.url && mesh.projectId && mesh.snapshotId && mesh.projectId === projectId && mesh.snapshotId === workingHeadId) {
+      setLastServerRender({ projectId: mesh.projectId, snapshotId: mesh.snapshotId, url: mesh.url });
+    }
+  }, [mesh, projectId, workingHeadId]);
+  const fallback = lastServerRender?.projectId === projectId ? lastServerRender : null;
   // G1: the local preview takes the viewer only while it is the subject (a
-  // gesture, a save, a post-receipt step) or the head has no server mesh (absent, or still being checked);
-  // otherwise the validated server mesh stays, with Inspect and Measure.
+  // gesture, a save, a post-receipt step, or a saved edit the head has not
+  // caught up with, L4) or the head has no known server mesh; otherwise the
+  // validated server mesh stays, with Inspect and Measure.
   const editBinding = !historical && editorSession.editPreview?.projectId === projectId ? editorSession.editPreview : null;
   const editPreview =
-    editBinding && (editBinding.inUse || mesh.status !== "ready")
-      ? { objectUrl: editBinding.objectUrl, status: editBinding.status, fallbackUrl, fallbackIsHead: fallbackUrl !== null && fallbackUrl === mesh.url }
+    editBinding && (editBinding.inUse || !headMeshReady)
+      ? {
+          objectUrl: editBinding.objectUrl,
+          status: editBinding.status,
+          fallbackUrl: fallback?.url ?? null,
+          fallbackIsHead: fallback !== null && fallback.snapshotId === workingHeadId && !editBinding.headStale,
+          checking: !(headMesh !== null && headMesh.status === "absent"),
+          // L4: why the pre-commit mesh is not shown yet, with a way out if the list refresh failed or hangs.
+          notice: editBinding.headStale
+            ? {
+                text: snapshots.error
+                  ? "The snapshot list could not be refreshed, so the server render of your saved edit is not known yet."
+                  : "Waiting for the snapshot list to show your saved edit.",
+                actionLabel: "Retry",
+                onAction: snapshots.refresh
+              }
+            : null
+        }
       : null;
-  // F1: from an edit's commit until the source editor has re-read the
-  // post-commit revision, Build would send a stale base revision (409).
+  // F1: from an edit's commit until the source editor has the post-commit
+  // revision, Build would send a stale base revision (409).
   const editorSaving = editorSession.state.kind === "committing" || editorSession.state.kind === "resolving";
-  const sourceReloading = editorSession.active && sourceEditor.loading;
   // Issue #78: every inline Build CTA (Preview's empty state, the status
   // panel's "Not validated" state) mirrors the header Build button's own
   // disabled conditions, plus one case the header doesn't have — Build
@@ -192,12 +288,15 @@ export function App() {
             ? "Save or discard your source edits before building."
             : editorSaving
               ? "Wait for your edit to finish saving before building."
-              : sourceReloading
-                ? "Loading the latest source before building…"
+              : sourceStaleHere
+                ? sourceStaleHere.failed
+                  ? SOURCE_RETRY_REASON
+                  : "Loading the latest source before building…"
                 : historical
                   ? "Build validates the current head; select the head to build"
                   : null;
-  const buildDisabled = buildDisabledReason !== null;
+  // A failed source re-read keeps Build pressable: pressing it retries the re-read.
+  const buildDisabled = buildDisabledReason !== null && buildDisabledReason !== SOURCE_RETRY_REASON;
   const liveSourceReady = (liveSource.projectId === undefined || liveSource.projectId === projectId)
     && (liveSource.headSnapshotId === undefined || liveSource.headSnapshotId === workingHeadId)
     && liveSource.scad !== null;
@@ -257,7 +356,20 @@ export function App() {
   async function build() {
     if (!projectId || sourceEditor.dirty || !sourceEditor.baseRevision) return;
     // The header's Build button has its own disabled rule; this covers it too.
-    if (editorSaving || sourceReloading) {
+    if (sourceStaleHere?.failed && !editorSaving) {
+      setSourceStale({ ...sourceStaleHere, failed: false, requestedSeq: sourceSeqRef.current });
+      sourceEditor.reload();
+      setHeaderNotice("The latest source could not be loaded; trying again. Press Build once it has loaded.");
+      return;
+    }
+    if (sourceStaleHere && !editorSaving && sourceStaleHere.requestedSeq !== null && sourceStaleHere.settledSeq <= sourceStaleHere.requestedSeq) {
+      // The re-read is still out (it may hang: there is no timeout): pressing Build starts a new one.
+      setSourceStale({ ...sourceStaleHere, requestedSeq: sourceSeqRef.current });
+      sourceEditor.reload();
+      setHeaderNotice("Still loading the latest source; trying again. Press Build once it has loaded.");
+      return;
+    }
+    if (editorSaving || sourceStaleHere) {
       setHeaderNotice(buildDisabledReason);
       return;
     }
@@ -299,7 +411,7 @@ export function App() {
       {headerNotice || exportState ? <div className="studio-notice" role="status">{headerNotice ?? exportState}<button type="button" aria-label="Dismiss notice" onClick={() => { setHeaderNotice(null); setExportState(null); }}>Dismiss</button></div> : null}
       <main className="app-body">
         <Workspace
-          preview={<PreviewTab key={`preview-${projectId ?? "no-project"}`} stlUrl={mesh.url} meshStatus={mesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} editPreview={editPreview} />}
+          preview={<PreviewTab key={`preview-${projectId ?? "no-project"}`} stlUrl={viewMesh.url} meshStatus={viewMesh.status} snapshotId={currentSnapshotId} validation={validation} pngUrls={pngUrls} liveScad={effectiveScad} liveParams={liveParams} historical={historical} onReturnToCurrent={() => setSelectedSnapshotId(null)} onBuild={() => void build()} building={buildState === "building"} buildDisabled={buildDisabled} buildDisabledReason={buildDisabledReason} editPreview={editPreview} />}
           chat={<ChatPanel state={chat.state} isStreaming={chat.isStreaming} streamError={chat.streamError} onSend={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} onCheckConnection={() => void chat.checkConnectionResult()} onDismissConnection={chat.dismissConnectionLost} />}
           edit={<EditSurface session={editorSession} />}
           onTabChange={(tab) => {

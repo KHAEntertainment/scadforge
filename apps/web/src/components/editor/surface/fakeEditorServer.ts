@@ -90,7 +90,7 @@ export interface Hold {
   arrived: Promise<void>;
 }
 
-type Route = "editor-get" | "verify" | "commit" | "operation" | "params-update" | "chat" | "source-get";
+type Route = "editor-get" | "verify" | "commit" | "operation" | "params-update" | "chat" | "source-get" | "mesh" | "snapshots-list";
 
 const ZERO_REV = "0".repeat(64);
 
@@ -133,6 +133,10 @@ export class FakeEditorServer {
   afterCommit: ((projectId: string) => void) | null = null;
   /** The next GET /editor for these project ids answers 500. */
   readonly failEditorGet = new Set<string>();
+  /** The next GET /source for these project ids answers 500. */
+  readonly failSourceGet = new Set<string>();
+  /** The next GET /snapshots for these project ids answers 500. */
+  readonly failSnapshotsList = new Set<string>();
   /** Build POSTs received, with the base revision each sent and whether it was current. */
   readonly buildPosts: Array<{ projectId: string; baseRevision: string; current: boolean }> = [];
   /** Snapshots with a built mesh, as `projectId/snapshotId`. */
@@ -229,9 +233,13 @@ export class FakeEditorServer {
 
   /** Builds the project's current head: its mesh route now serves `FIXTURE_STL`. Returns that route. */
   buildMesh(projectId: string): string {
-    const head = this.state(projectId).snapshots[0];
-    this.meshes.add(`${projectId}/${head.id}`);
-    return `/api/projects/${projectId}/snapshots/${head.id}/mesh`;
+    return this.buildSnapshotMesh(projectId, this.state(projectId).snapshots[0].id);
+  }
+
+  /** Builds one snapshot's mesh (it need not be the head). Returns its route. */
+  buildSnapshotMesh(projectId: string, snapshotId: string): string {
+    this.meshes.add(`${projectId}/${snapshotId}`);
+    return `/api/projects/${projectId}/snapshots/${snapshotId}/mesh`;
   }
 
   /** Opens nothing by itself: the next chat POST streams `turn_started` and stays open until `dropChat()`. */
@@ -258,9 +266,14 @@ export class FakeEditorServer {
     if (!state) return apiError(404, "NOT_FOUND", `no project ${projectId}`);
 
     if (rest === "" && method === "GET") return json(200, this.projectResponse(state));
-    if (rest === "/snapshots" && method === "GET") return json(200, { snapshots: state.snapshots });
+    if (rest === "/snapshots" && method === "GET") {
+      await this.passHold("snapshots-list");
+      if (this.failSnapshotsList.delete(projectId)) return apiError(500, "INTERNAL_ERROR", "snapshot list failed (test fault)");
+      return json(200, { snapshots: state.snapshots });
+    }
     const mesh = /^\/snapshots\/([^/]+)\/mesh$/.exec(rest);
     if (mesh) {
+      await this.passHold("mesh");
       if (!this.meshes.has(`${projectId}/${mesh[1]}`)) return new Response(null, { status: 404 });
       return new Response(method === "HEAD" ? null : FIXTURE_STL, { status: 200, headers: { "content-type": "model/stl" } });
     }
@@ -283,6 +296,7 @@ export class FakeEditorServer {
     }
     if (rest === "/source" && method === "GET") {
       await this.passHold("source-get");
+      if (this.failSourceGet.delete(projectId)) return apiError(500, "INTERNAL_ERROR", "source read failed (test fault)");
       return json(200, { ...this.projectResponse(state), revision: this.sourceRevision(state) });
     }
     if (rest === "/export" && method === "POST") {
