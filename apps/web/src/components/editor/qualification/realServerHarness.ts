@@ -161,6 +161,12 @@ export interface ChildTracker {
    * child and throws — a child started after teardown must never survive.
    */
   track(child: ChildProcess): ChildProcess;
+  /**
+   * Stops tracking a child the start loop has already HANDLED (it is dead
+   * by then, and its diagnostics are already recorded). A handled attempt's
+   * exit is not a failure of the test that ran after it.
+   */
+  release(child: ChildProcess): void;
   /** The captured stdout/stderr of a tracked child. */
   outputOf(child: ChildProcess): ChildOutput;
   /** Kills every tracked child, awaits each, then throws if any of THOSE children is still running. */
@@ -200,6 +206,11 @@ export function createChildTracker(): ChildTracker {
         throw new Error("c5-qualification: outputOf() was called for a child that is not tracked");
       }
       return entry.output;
+    },
+    release(child) {
+      const index = children.findIndex((entry) => entry.child === child);
+      if (index === -1) return;
+      children.splice(index, 1);
     },
     async killAll() {
       closed = true;
@@ -341,6 +352,11 @@ export async function startServerChild(
 
     failures.push(`attempt ${attempt} (port ${port}): ${failure}`);
     await killChild(child);
+    // The loop has HANDLED this attempt: its diagnostics are in `failures`
+    // and the child is dead (killChild awaited its exit). Stop tracking it,
+    // so a port collision the retry survived cannot fail the teardown of
+    // the test that ran after it.
+    tracker.release(child);
   }
 
   throw new Error(
