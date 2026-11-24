@@ -162,8 +162,14 @@ beforeEach(async () => {
 }, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
-  await tracker.killAll();
-  await projects.cleanup();
+  // F7: the temp directory is removed on EVERY path — a child that exited
+  // non-zero makes killAll() throw, and the directory must not be left on
+  // disk because of it. The killAll() error still fails the hook.
+  try {
+    await tracker.killAll();
+  } finally {
+    await projects.cleanup();
+  }
 }, HOOK_TIMEOUT_MS);
 
 describe.skipIf(!dockerAvailable())("@docker C5 client/server undo-redo inverse agreement (carried comment 2)", () => {

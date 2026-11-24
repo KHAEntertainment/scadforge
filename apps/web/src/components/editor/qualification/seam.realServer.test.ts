@@ -45,6 +45,7 @@ import { join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { withRecoveredProject } from "@scadforge/scad-core";
 import type { EditorFeature } from "@scadforge/protocol";
+import { RESOLVING_MAX_DELAY_MS } from "../controller/backoff.js";
 import {
   assertServerBuilt,
   createChildTracker,
@@ -161,8 +162,14 @@ beforeEach(async () => {
 }, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
-  await tracker.killAll();
-  await projects.cleanup();
+  // F7: the temp directory is removed on EVERY path — a child that exited
+  // non-zero makes killAll() throw, and the directory must not be left on
+  // disk because of it. The killAll() error still fails the hook.
+  try {
+    await tracker.killAll();
+  } finally {
+    await projects.cleanup();
+  }
 }, HOOK_TIMEOUT_MS);
 
 describe("C5 real-server seam cases (criterion 2)", () => {
@@ -494,11 +501,15 @@ describe("C5 real-server seam cases (criterion 2)", () => {
       expect(refused?.errorBody?.message).toContain("could not acquire the");
 
       // F4(c): positive evidence of CONTINUED polling after the refusal —
-      // at least two further real operations lookups. The controller's poll
-      // intervals are 500/1000/2000/4000/8000/15000 ms
-      // (`controller/backoff.ts`), and each lookup attempt is cut off by the
-      // client's 2 s attempt timeout, so the next two lookups land a few
-      // seconds and ~10 s after the refusal.
+      // at least two further real operations lookups.
+      //
+      // F8: the bound is computed from the real schedule, not written as a
+      // literal. The controller's poll delay is capped at
+      // RESOLVING_MAX_DELAY_MS (15 s, `controller/backoff.ts`) and each
+      // lookup attempt can take the client's own attempt timeout
+      // (SHORT_TIMEOUT_MS = 2 s here), so the worst case for two further
+      // lookups is two cycles at the cap — 34 s — plus a 15 s load margin.
+      const POLLING_BOUND_MS = 2 * (RESOLVING_MAX_DELAY_MS + SHORT_TIMEOUT_MS) + 15_000;
       const operationLookups = () =>
         editorTraffic(wire).filter(
           (call) => call.method === "GET" && call.url.includes("/editor/operations/")
@@ -506,7 +517,7 @@ describe("C5 real-server seam cases (criterion 2)", () => {
       const lookupsAtRefusal = operationLookups();
       await waitFor(() => operationLookups() >= lookupsAtRefusal + 2, {
         description: "two further operations lookups after the refused re-send",
-        timeoutMs: 30_000
+        timeoutMs: POLLING_BOUND_MS
       });
 
       // During that window nothing settled, no claim was ever reserved, and
@@ -529,5 +540,8 @@ describe("C5 real-server seam cases (criterion 2)", () => {
       disposeHost(host);
       await pending.catch(() => undefined);
     }
-  }, 90000);
+    // F8: the case's own timeout covers the SUM of its bounded waits — the
+    // 40 s wait for the refused re-send, the 49 s polling bound — plus the
+    // rest of the case, with a margin.
+  }, 180000);
 });

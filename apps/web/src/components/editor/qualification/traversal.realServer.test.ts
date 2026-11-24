@@ -87,8 +87,14 @@ beforeEach(async () => {
 }, HOOK_TIMEOUT_MS);
 
 afterEach(async () => {
-  await tracker.killAll();
-  await projects.cleanup();
+  // F7: the temp directory is removed on EVERY path — a child that exited
+  // non-zero makes killAll() throw, and the directory must not be left on
+  // disk because of it. The killAll() error still fails the hook.
+  try {
+    await tracker.killAll();
+  } finally {
+    await projects.cleanup();
+  }
 }, HOOK_TIMEOUT_MS);
 
 describe("C5 the real server refuses a traversal whose command is not the exact inverse", () => {
