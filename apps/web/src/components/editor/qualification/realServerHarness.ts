@@ -326,14 +326,15 @@ export async function startServerChild(
   const failures: string[] = [];
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    // F1: after teardown nothing may be spawned. A start loop that is still
-    // running stops here instead of retrying on a drained tracker.
+    const port = await reserveFreePort();
+    // F1: after teardown nothing may be spawned. The check sits AFTER the
+    // last await and directly before the spawn-and-track, so no child can
+    // be started once killAll() has run.
     if (tracker.closed) {
       throw new Error(
         "c5-qualification: the tracker was closed (killAll ran) while the server child was starting — no child was started"
       );
     }
-    const port = await reserveFreePort();
     const baseUrl = `http://127.0.0.1:${port}`;
     const child = tracker.track(
       spawn(process.execPath, [SERVER_DIST_ENTRY], {
@@ -352,11 +353,11 @@ export async function startServerChild(
 
     failures.push(`attempt ${attempt} (port ${port}): ${failure}`);
     await killChild(child);
-    // The loop has HANDLED this attempt: its diagnostics are in `failures`
-    // and the child is dead (killChild awaited its exit). Stop tracking it,
-    // so a port collision the retry survived cannot fail the teardown of
-    // the test that ran after it.
-    tracker.release(child);
+    // The loop has HANDLED this attempt: its diagnostics are in `failures`.
+    // Stop tracking it — but ONLY once its exit is confirmed. killChild
+    // swallows its own 5 s exit timeout, so a child that is still running
+    // stays tracked: killAll() then kills it again and reports it.
+    if (!isRunning(child)) tracker.release(child);
   }
 
   throw new Error(
@@ -365,27 +366,37 @@ export async function startServerChild(
 }
 
 /**
- * ONE bounded health probe: a raw HTTP GET whose own socket timeout bounds
- * it, so one hung connection can never outlast the probe (F1).
+ * ONE bounded health probe: a raw HTTP GET with a WALL-CLOCK deadline, so
+ * one hung connection can never outlast the probe (F1).
+ *
+ * The wall-clock timer is the real bound: `request.setTimeout` is only a
+ * socket INACTIVITY timeout, and a peer that keeps dripping a few bytes
+ * would keep the probe pending for ever.
  *
  * `node:http` rather than `fetch`: the jsdom test environment's global
  * `AbortController` belongs to a different realm than Node's `fetch`, and
  * undici rejects a foreign signal outright — so a `fetch` carrying a signal
- * fails in every test file. A raw request with its own socket timeout is
+ * fails in every test file. A raw request with its own deadline is
  * realm-proof and bounds the probe exactly as required.
  */
 function probeHealth(baseUrl: string, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
-    const settle = (healthy: boolean): void => {
-      if (settled) return;
-      settled = true;
-      resolve(healthy);
-    };
     const request = httpGet(`${baseUrl}/api/health`, (res) => {
       res.resume(); // drain the body so the socket can close
       settle(res.statusCode === 200);
     });
+    // The wall-clock deadline: the probe ends here on EVERY path.
+    const wallClock = setTimeout(() => {
+      request.destroy();
+      settle(false);
+    }, timeoutMs);
+    const settle = (healthy: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(wallClock);
+      resolve(healthy);
+    };
     request.setTimeout(timeoutMs, () => {
       request.destroy();
       settle(false);
