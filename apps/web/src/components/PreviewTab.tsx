@@ -219,6 +219,7 @@ function PreviewTabBody({
   const [measuredBBox, setMeasuredBBox] = useState<BBox | null>(null);
   const [inspectEnabled, setInspectEnabled] = useState(false);
   const [inspectOutcome, setInspectOutcome] = useState<InspectionOutcome | null>(null);
+  const [fitNonce, setFitNonce] = useState(0);
   const inspectDisabled = mode !== "orbit" || stlUrl === null || editing;
 
   // Nothing here relies on Viewer3D's own clearing (S2-4): a stlUrl/snapshotId
@@ -316,7 +317,17 @@ function PreviewTabBody({
         >
           Inspect
         </button>
-        <button type="button" onClick={() => onModeChange("orbit")}>Fit</button>
+        <button
+          type="button"
+          aria-label="Fit view"
+          data-testid="fit-view-button"
+          onClick={() => {
+            onModeChange("orbit");
+            setFitNonce((value) => value + 1);
+          }}
+        >
+          Fit
+        </button>
       </div>
 
       {measure && !editing ? (
@@ -388,6 +399,7 @@ function PreviewTabBody({
             onBoundingBox={setMeasuredBBox}
             inspect={inspectEnabled && mode === "orbit" && !editing}
             onInspect={setInspectOutcome}
+            fitNonce={fitNonce}
           />
           {/* Issue #78 AC1/AC5: the empty-mesh placeholder above only ever
               explained the situation — this is the actual action that fixes
