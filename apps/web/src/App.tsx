@@ -404,6 +404,10 @@ export function App() {
       const result = await client.build(projectId, { base_revision: sourceEditor.baseRevision });
       snapshots.refresh();
       setSelectedSnapshotId(result.snapshot.id);
+      // Issue #143: Build attaches the mesh to the snapshot that is often
+      // already the current one — probe again explicitly (the success path
+      // only; a failed Build leaves the local preview alone).
+      mesh.reprobe?.();
       setHeaderNotice(`Build complete — snapshot ${result.snapshot.id} is pinned to the preview.`);
     } catch (cause) {
       setHeaderNotice(cause instanceof Error ? cause.message : "Build failed.");

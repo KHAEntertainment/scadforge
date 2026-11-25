@@ -1176,3 +1176,67 @@ function DragSource({ session }: { session: EditorSession }) {
     </div>
   );
 }
+
+// ── Issue #143: Build re-probes the mesh for the snapshot already current ──
+
+describe("Issue #143 — after save then Build the mesh is probed again for the same snapshot", () => {
+  function headerBuild(): HTMLElement {
+    return within(screen.getByRole("banner")).getByRole("button", { name: /^Build$/ });
+  }
+
+  /** Mesh probes issued so far (the useSnapshotMesh HEAD). */
+  function meshProbes(): number {
+    return server.log.filter((line) => line.startsWith("HEAD /projects/p1/snapshots/")).length;
+  }
+
+  it("after save then Build the server mesh replaces the local edit preview and Inspect and Measure are enabled", async () => {
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    // The saved edit's head snapshot has no server mesh: the local preview shows.
+    await waitFor(() => expect(viewerUrl()).toMatch(/^blob:fake-mesh-/), { timeout: 3000 });
+    expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("Local edit preview — not built or validated.");
+    expect(screen.getByTestId("inspect-toggle")).toBeDisabled();
+    expect(screen.getByTestId("measure-toggle")).toBeDisabled();
+
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].current).toBe(true);
+    await screen.findByText(/Build complete/);
+
+    // Build attached the mesh to the snapshot that was already current: the
+    // viewer must receive it with no further user action.
+    await waitFor(() => expect(viewerUrl()).toMatch(/^\/api\/projects\/p1\/snapshots\/[^/]+\/mesh$/), { timeout: 3000 });
+    expect(screen.queryByTestId("edit-preview-status")).toBeNull();
+    expect(screen.getByTestId("inspect-toggle")).toBeEnabled();
+    expect(screen.getByTestId("measure-toggle")).toBeEnabled();
+  });
+
+  it("a failed Build keeps the local edit preview with its label and issues no further mesh probe", async () => {
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    await waitFor(() => expect(viewerUrl()).toMatch(/^blob:fake-mesh-/), { timeout: 3000 });
+    expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("Local edit preview — not built or validated.");
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    const probesBefore = meshProbes();
+
+    // Another tab writes params (no signal reaches this tab): the editor's
+    // base revision is stale and Build answers 409.
+    server.externalWrite("p1", { wall: 5 });
+    fireEvent.click(headerBuild());
+    await screen.findByText(/The source changed since this revision/);
+    expect(server.buildPosts).toHaveLength(1);
+    expect(server.buildPosts[0].current).toBe(false);
+
+    // The labelled local preview stays, no error boundary appears, and no
+    // further mesh probe is issued (no loop).
+    expect(screen.getByTestId("edit-preview-status")).toHaveTextContent("Local edit preview — not built or validated.");
+    expect(viewerUrl()).toMatch(/^blob:fake-mesh-/);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(meshProbes()).toBe(probesBefore);
+  });
+});
