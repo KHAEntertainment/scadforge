@@ -1393,34 +1393,75 @@ describe("Issue #165 — head-moving writes outside the source editor refresh ba
     expect(previewBuild).toHaveAttribute("title", "Save or discard your source edits before building.");
   });
 
-  it("two writes in a row while a re-read is already in flight trigger a fresh re-read for the second write before Build", async () => {
+  it("two writes in a row: an old GET /source response captured before the second write and delivered after it is not adopted as fresh and Build sends the newest revision", async () => {
+    let captureNextSourceGet = false;
+    let releaseCapturedResponse: (() => void) | null = null;
+    let markResponseCaptured!: () => void;
+    const responseCaptured = new Promise<void>((resolve) => {
+      markResponseCaptured = resolve;
+    });
+    const realFetch = server.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (captureNextSourceGet && method === "GET" && url.pathname === "/api/projects/p1/source") {
+        captureNextSourceGet = false;
+        // Run the server handler NOW so the pre-revert Response is already serialized.
+        const oldResponse = await realFetch(input, init);
+        const delivered = new Promise<void>((resolve) => {
+          releaseCapturedResponse = resolve;
+        });
+        markResponseCaptured();
+        await delivered;
+        return oldResponse;
+      }
+      return realFetch(input, init);
+    });
+
     render(<App />);
     await openEdit();
     await saveWall("3");
     await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
     await settle();
 
-    // Hold the re-read from the first write (editor save), then perform a revert while it is still out.
-    const firstReread = server.hold("source-get");
+    // First write (editor save to wall=4): capture its GET /source response BEFORE the second write.
+    captureNextSourceGet = true;
     await saveWall("4");
-    await firstReread.arrived;
+    await responseCaptured;
+    const staleRevisionAfterFirstWrite = expectedSourceRevision("p1");
 
+    // Second write (History revert back to wall=2) completes while the old serialized response is in flight.
     fireEvent.click(screen.getByRole("tab", { name: /history/i }));
     await screen.findAllByTestId("snapshot-row");
     fireEvent.click(screen.getAllByTestId("snapshot-row").at(-1)!);
     fireEvent.click(await screen.findByTestId("revert-trigger"));
     fireEvent.click(await screen.findByTestId("revert-confirm-yes"));
     await waitFor(() => expect(server.log.some((line) => line.endsWith("/revert"))).toBe(true), { timeout: 3000 });
-    const readsBeforeRelease = sourceReads();
+    const newestRevisionAfterRevert = expectedSourceRevision("p1");
+    expect(newestRevisionAfterRevert).not.toBe(staleRevisionAfterFirstWrite);
 
-    firstReread.release();
-    await waitFor(() => expect(sourceReads()).toBe(readsBeforeRelease + 1), { timeout: 3000 });
+    // Hold the fresh re-read that must follow the late old response, then deliver the old serialized response.
+    const freshReread = server.hold("source-get");
+    const readsBeforeOldDelivery = sourceReads();
+    releaseCapturedResponse!();
+
+    // The old response must NOT be adopted as fresh: a second re-read starts and Build stays blocked until it finishes.
+    await freshReread.arrived;
+    expect(sourceReads()).toBe(readsBeforeOldDelivery + 1);
+    fireEvent.click(screen.getByRole("tab", { name: /preview/i }));
+    const previewBuild = await screen.findByTestId("preview-build-button");
+    expect(previewBuild).toBeDisabled();
+    expect(previewBuild).toHaveAttribute("title", "Loading the latest source before building…");
+    expect(server.buildPosts).toHaveLength(0);
+
+    freshReread.release();
     await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
     await settle();
 
     fireEvent.click(headerBuild());
     await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
-    expect(server.buildPosts[0].baseRevision).toBe(expectedSourceRevision("p1"));
+    expect(server.buildPosts[0].baseRevision).toBe(newestRevisionAfterRevert);
+    expect(server.buildPosts[0].baseRevision).not.toBe(staleRevisionAfterFirstWrite);
     expect(server.buildPosts[0].current).toBe(true);
     await screen.findByText(/Build complete/);
   });

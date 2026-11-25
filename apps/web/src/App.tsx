@@ -18,6 +18,12 @@ import { ParamsTab } from "./components/params/ParamsTab.js";
 import { useParamsController } from "./components/params/useParamsController.js";
 import { EditSurface } from "./components/editor/surface/EditSurface.js";
 import { useEditorSession, type HostWriteReason } from "./components/editor/surface/useEditorSession.js";
+import {
+  clearSourceStaleIfCurrent,
+  createSourceStaleMark,
+  patchSourceStaleIfCurrent,
+  type SourceStaleState
+} from "./sourceStale.js";
 
 function triggerDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
@@ -76,28 +82,9 @@ export function App() {
   // one project; the tag (start sequence + project id) is what proves which
   // request a result belongs to.
   const sourceSeqRef = useRef(0);
-  const [sourceStale, setSourceStale] = useState<{
-    projectId: string;
-    /** The source request sequence at the receipt: only later requests count. */
-    sinceSeq: number;
-    /** The revision of the latest-started post-receipt read/write that succeeded. */
-    freshRevision: string | null;
-    /** The latest-started post-receipt read failed; Build retries it. */
-    failed: boolean;
-    /** The sequence when the last re-read was requested (`null`: none yet). */
-    requestedSeq: number | null;
-    /** The latest-started post-receipt request that settled. */
-    settledSeq: number;
-  } | null>(null);
+  const [sourceStale, setSourceStale] = useState<SourceStaleState | null>(null);
   const markSourceStale = useCallback((targetProjectId: string) => {
-    setSourceStale({
-      projectId: targetProjectId,
-      sinceSeq: sourceSeqRef.current,
-      freshRevision: null,
-      failed: false,
-      requestedSeq: null,
-      settledSeq: 0
-    });
+    setSourceStale(createSourceStaleMark(targetProjectId, sourceSeqRef.current));
   }, []);
   const sourceClient = useMemo<ApiClient>(() => {
     const settle = (projectIdOfRequest: string, seq: number, revision: string | null) =>
@@ -174,17 +161,17 @@ export function App() {
     const stale = sourceStale;
     if (!stale) return;
     if (stale.projectId !== projectId) {
-      setSourceStale(null); // a project switch: the new project's source loads fresh
+      setSourceStale(clearSourceStaleIfCurrent(stale)); // a project switch: the new project's source loads fresh
       return;
     }
     if (sourceEditor.dirty || sourceEditor.saving) return;
     if (stale.freshRevision !== null && sourceEditor.baseRevision === stale.freshRevision) {
-      setSourceStale(null);
+      setSourceStale(clearSourceStaleIfCurrent(stale));
       return;
     }
     if (stale.failed || sourceEditor.loading) return;
     if (stale.requestedSeq !== null && stale.settledSeq <= stale.requestedSeq) return; // our re-read has not settled yet
-    setSourceStale({ ...stale, requestedSeq: sourceSeqRef.current });
+    setSourceStale(patchSourceStaleIfCurrent(stale, { requestedSeq: sourceSeqRef.current }));
     reloadSource();
   }, [sourceStale, projectId, sourceEditor.dirty, sourceEditor.saving, sourceEditor.loading, sourceEditor.baseRevision, reloadSource]);
   const sourceStaleHere = sourceStale !== null && sourceStale.projectId === projectId ? sourceStale : null;
@@ -405,14 +392,14 @@ export function App() {
     if (!projectId || sourceEditor.dirty || !sourceEditor.baseRevision) return;
     // The header's Build button has its own disabled rule; this covers it too.
     if (sourceStaleHere?.failed && !editorSaving) {
-      setSourceStale({ ...sourceStaleHere, failed: false, requestedSeq: sourceSeqRef.current });
+      setSourceStale(patchSourceStaleIfCurrent(sourceStaleHere, { failed: false, requestedSeq: sourceSeqRef.current }));
       sourceEditor.reload();
       setHeaderNotice("The latest source could not be loaded; trying again. Press Build once it has loaded.");
       return;
     }
     if (sourceStaleHere && !editorSaving && sourceStaleHere.requestedSeq !== null && sourceStaleHere.settledSeq <= sourceStaleHere.requestedSeq) {
       // The re-read is still out (it may hang: there is no timeout): pressing Build starts a new one.
-      setSourceStale({ ...sourceStaleHere, requestedSeq: sourceSeqRef.current });
+      setSourceStale(patchSourceStaleIfCurrent(sourceStaleHere, { requestedSeq: sourceSeqRef.current }));
       sourceEditor.reload();
       setHeaderNotice("Still loading the latest source; trying again. Press Build once it has loaded.");
       return;
