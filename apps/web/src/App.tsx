@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EditorReceipt, SnapshotManifest, ViewName } from "@scadforge/protocol";
-import { createApiClient, type ApiClient } from "./lib/apiClient.js";
+import { ApiClientError, createApiClient, type ApiClient } from "./lib/apiClient.js";
 import { useProject } from "./hooks/useProject.js";
 import { useChat } from "./hooks/useChat.js";
 import { useSnapshots } from "./hooks/useSnapshots.js";
@@ -89,6 +89,16 @@ export function App() {
     /** The latest-started post-receipt request that settled. */
     settledSeq: number;
   } | null>(null);
+  const markSourceStale = useCallback((targetProjectId: string) => {
+    setSourceStale({
+      projectId: targetProjectId,
+      sinceSeq: sourceSeqRef.current,
+      freshRevision: null,
+      failed: false,
+      requestedSeq: null,
+      settledSeq: 0
+    });
+  }, []);
   const sourceClient = useMemo<ApiClient>(() => {
     const settle = (projectIdOfRequest: string, seq: number, revision: string | null) =>
       setSourceStale((prev) =>
@@ -131,14 +141,15 @@ export function App() {
   const handleParamsSaved = useCallback(() => {
     snapshots.refresh();
     reportEditorWriteRef.current("params-saved");
-  }, [snapshots.refresh]);
+    if (projectId) markSourceStale(projectId);
+  }, [snapshots.refresh, projectId, markSourceStale]);
   const paramsController = useParamsController(client, projectId, workingHeadId, handleParamsSaved);
   const handleEditorCommitted = useCallback(
     (receipt: EditorReceipt) => {
       snapshots.refresh();
-      setSourceStale({ projectId: receipt.projectId, sinceSeq: sourceSeqRef.current, freshRevision: null, failed: false, requestedSeq: null, settledSeq: 0 });
+      markSourceStale(receipt.projectId);
     },
-    [snapshots.refresh]
+    [snapshots.refresh, markSourceStale]
   );
   // L4: the session ends its wait for a saved edit's snapshot only once this list contains it.
   const listedSnapshotIds = useMemo(() => snapshots.snapshots.map((snapshot) => snapshot.id), [snapshots.snapshots]);
@@ -330,11 +341,29 @@ export function App() {
     const chatHeadId = chat.state.headSnapshot?.id;
     if (chatHeadId) snapshots.refresh();
   }, [chat.state.headSnapshot?.id, snapshots.refresh]);
-  const turnWasStreamingRef = useRef(false);
+  const prevChatHeadForSourceRef = useRef<{ projectId: string | null; headId: string | null }>({
+    projectId,
+    headId: chat.state.headSnapshot?.id ?? null
+  });
   useEffect(() => {
-    if (chat.isStreaming) turnWasStreamingRef.current = true;
-    else if (turnWasStreamingRef.current) { turnWasStreamingRef.current = false; snapshots.refresh(); }
-  }, [chat.isStreaming, snapshots.refresh]);
+    const chatHeadId = chat.state.headSnapshot?.id ?? null;
+    const prev = prevChatHeadForSourceRef.current;
+    prevChatHeadForSourceRef.current = { projectId, headId: chatHeadId };
+    if (projectId && prev.projectId === projectId && chatHeadId && chatHeadId !== prev.headId) {
+      markSourceStale(projectId);
+    }
+  }, [chat.state.headSnapshot?.id, projectId, markSourceStale]);
+  const streamingProjectIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (chat.isStreaming) {
+      streamingProjectIdRef.current = projectId;
+    } else if (streamingProjectIdRef.current !== null) {
+      const finishedProjectId = streamingProjectIdRef.current;
+      streamingProjectIdRef.current = null;
+      snapshots.refresh();
+      if (finishedProjectId === projectId) markSourceStale(finishedProjectId);
+    }
+  }, [chat.isStreaming, snapshots.refresh, projectId, markSourceStale]);
 
   function requestProjectSwitch(id: string) {
     if (id === projectId) return;
@@ -400,8 +429,9 @@ export function App() {
     }
     setBuildState("building");
     setHeaderNotice(null);
+    const buildProjectId = projectId;
     try {
-      const result = await client.build(projectId, { base_revision: sourceEditor.baseRevision });
+      const result = await client.build(buildProjectId, { base_revision: sourceEditor.baseRevision });
       snapshots.refresh();
       setSelectedSnapshotId(result.snapshot.id);
       // Issue #143: Build attaches the mesh to the snapshot that is often
@@ -410,7 +440,14 @@ export function App() {
       mesh.reprobe?.();
       setHeaderNotice(`Build complete — snapshot ${result.snapshot.id} is pinned to the preview.`);
     } catch (cause) {
-      setHeaderNotice(cause instanceof Error ? cause.message : "Build failed.");
+      if (cause instanceof ApiClientError && cause.error_code === "CONFLICT") {
+        if (buildProjectId === previousProjectIdForHeadRef.current) {
+          markSourceStale(buildProjectId);
+          setHeaderNotice(`${cause.message} Reloading the latest source now — press Build again once it has loaded.`);
+        }
+      } else {
+        setHeaderNotice(cause instanceof Error ? cause.message : "Build failed.");
+      }
     } finally { setBuildState("idle"); }
   }
 
@@ -448,7 +485,7 @@ export function App() {
           }}
           params={<ParamsTab controller={paramsController} onAskAgent={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           code={<CodeTab client={client} projectId={projectId} editor={sourceEditor} historicalSnapshotId={selectedSnapshotId} isHistorical={historical} />}
-          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onReverted={() => { if (projectId === previousProjectIdForHeadRef.current) editorSession.reportWrite("reverted"); }} onSelectSnapshot={(id) => { if (projectId === previousProjectIdForHeadRef.current) setSelectedSnapshotId(id); }} />}
+          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onReverted={() => { if (projectId === previousProjectIdForHeadRef.current) { editorSession.reportWrite("reverted"); if (projectId) markSourceStale(projectId); } }} onSelectSnapshot={(id) => { if (projectId === previousProjectIdForHeadRef.current) setSelectedSnapshotId(id); }} />}
         />
       </main>
       {projectError ? <p className="app-error" role="alert">{projectError}</p> : null}
