@@ -9,6 +9,7 @@ import { SurfaceHighlight } from "./inspect/SurfaceHighlight.js";
 import { useStlGeometry } from "./useStlGeometry.js";
 import { bindInspectionPointerEvents } from "./inspectionPointerEvents.js";
 import type { InspectionOutcome } from "./inspect/inspectionTypes.js";
+import { createCameraPoseHolder, type CameraPose, type CameraPoseHolder } from "./cameraFraming.js";
 export { isInspectClick } from "./inspectionPointerEvents.js";
 
 export interface Viewer3DProps {
@@ -46,6 +47,24 @@ export interface Viewer3DProps {
    * off, or this viewer unmounting.
    */
   onInspect?: (outcome: InspectionOutcome | null) => void;
+  /** Incrementing this token resets the user camera pose and re-frames on the model. */
+  fitNonce?: number;
+}
+
+interface ControlsTargetLike {
+  object?: { position?: { x: number; y: number; z: number } };
+  target?: { x: number; y: number; z: number };
+}
+
+function readControlsPose(event?: { target?: unknown }): CameraPose | undefined {
+  const ctrl = event?.target as ControlsTargetLike | undefined;
+  const pos = ctrl?.object?.position;
+  const tgt = ctrl?.target;
+  if (!pos || !tgt) return undefined;
+  return {
+    position: { x: pos.x, y: pos.y, z: pos.z },
+    target: { x: tgt.x, y: tgt.y, z: tgt.z }
+  };
 }
 
 /**
@@ -91,55 +110,56 @@ class ViewerErrorBoundary extends Component<{ children: ReactNode }, { failed: b
 }
 
 /**
- * Frames the camera on the loaded mesh (Issue #41).
- *
- * The camera used to sit at a fixed `[80, 80, 80]`, which only suits a model
- * a few tens of mm across. The demo's box is 200 mm wide, so the very first
- * mesh this viewer ever showed a user was an extreme close-up of one hinge —
- * technically "rendering", but unreadable, and easily mistaken for the blank
- * preview this issue is about. Models are authored at arbitrary scales and
- * are not necessarily centred on the origin, so the framing has to be derived
- * from the geometry rather than guessed.
+ * Frames the camera on the loaded mesh initially and on Fit reset (Issue #41, #164),
+ * while preserving a user-adjusted pose across same-project mesh swaps.
  */
-function FitCamera({ geometry }: { geometry: BufferGeometry }) {
+function FitCamera({
+  geometry,
+  cameraHolder,
+  fitNonce,
+  controlsInteractedRef
+}: {
+  geometry: BufferGeometry;
+  cameraHolder: CameraPoseHolder;
+  fitNonce: number;
+  controlsInteractedRef: { current: boolean };
+}) {
   const camera = useThree((state) => state.camera) as PerspectiveCamera;
   const controls = useThree((state) => state.controls) as { target: Vector3; update: () => void } | null;
 
   useEffect(() => {
+    controlsInteractedRef.current = false;
     geometry.computeBoundingSphere();
     const sphere = geometry.boundingSphere;
-    // A degenerate or empty mesh has no usable sphere; leaving the default
-    // camera alone beats dividing by zero and producing a NaN transform that
-    // renders nothing at all.
-    if (!sphere || !Number.isFinite(sphere.radius) || sphere.radius <= 0) return;
+    const decision = cameraHolder.resolveForGeometry(
+      sphere ? { center: { x: sphere.center.x, y: sphere.center.y, z: sphere.center.z }, radius: sphere.radius } : null,
+      camera.fov,
+      camera.aspect,
+      fitNonce
+    );
+    if (!decision) return;
 
-    const fovRadians = (camera.fov * Math.PI) / 180;
-    // Distance at which a sphere of this radius exactly fills the vertical
-    // field of view, plus a small margin so the model does not touch the edges.
-    const distance = (sphere.radius / Math.sin(fovRadians / 2)) * 1.15;
-
-    const direction = new Vector3(1, 0.8, 1).normalize();
-    camera.position.copy(sphere.center).addScaledVector(direction, distance);
-    // Re-scale the clipping planes with the model: the defaults clip a large
-    // model away entirely, and a too-small `near` z-fights on a small one.
-    camera.near = Math.max(distance / 1000, 0.01);
-    camera.far = distance * 10;
+    camera.position.set(decision.position.x, decision.position.y, decision.position.z);
+    camera.near = decision.near;
+    camera.far = decision.far;
     camera.updateProjectionMatrix();
-    camera.lookAt(sphere.center);
+    camera.lookAt(decision.target.x, decision.target.y, decision.target.z);
 
-    // Orbit around the model's own centre, not the origin, so dragging keeps
-    // the part in frame for an off-origin model.
+    // Orbit around the target so dragging keeps the part in frame.
     if (controls) {
-      controls.target.copy(sphere.center);
+      controls.target.set(decision.target.x, decision.target.y, decision.target.z);
       controls.update();
     }
-  }, [geometry, camera, controls]);
+  }, [geometry, camera, controls, cameraHolder, fitNonce, controlsInteractedRef]);
 
   return null;
 }
 
 interface StlMeshProps {
   geometry: BufferGeometry;
+  cameraHolder: CameraPoseHolder;
+  fitNonce: number;
+  controlsInteractedRef: { current: boolean };
   measure?: boolean;
   measureAxis?: MeasureFocus;
   onBoundingBox?: (box: BBox | null) => void;
@@ -159,7 +179,7 @@ export function StlModel({ url, children }: { url: string; children: (geometry: 
   return geometry ? children(geometry) : <ViewerPlaceholder message="Loading model…" />;
 }
 
-function LoadedStlMesh({ geometry, measure = false, measureAxis = "all", onBoundingBox, inspect = false, outcome = null, onSurfaceClick, onGeometryChange, onEmptyClick }: StlMeshProps) {
+function LoadedStlMesh({ geometry, cameraHolder, fitNonce, controlsInteractedRef, measure = false, measureAxis = "all", onBoundingBox, inspect = false, outcome = null, onSurfaceClick, onGeometryChange, onEmptyClick }: StlMeshProps) {
   const mesh = useRef<Mesh>(null);
   const { camera, gl } = useThree();
 
@@ -201,7 +221,12 @@ function LoadedStlMesh({ geometry, measure = false, measureAxis = "all", onBound
 
   return (
     <>
-      <FitCamera geometry={geometry} />
+      <FitCamera
+        geometry={geometry}
+        cameraHolder={cameraHolder}
+        fitNonce={fitNonce}
+        controlsInteractedRef={controlsInteractedRef}
+      />
       <mesh ref={mesh}>
         <primitive object={geometry} attach="geometry" />
         <meshStandardMaterial color="#c9c9d4" />
@@ -215,8 +240,10 @@ function LoadedStlMesh({ geometry, measure = false, measureAxis = "all", onBound
 }
 
 /** SDP §9 Preview: three.js orbit view of the server-authoritative mesh. */
-export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = "all", onBoundingBox, inspect = false, onInspect }: Viewer3DProps) {
+export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = "all", onBoundingBox, inspect = false, onInspect, fitNonce = 0 }: Viewer3DProps) {
   const [outcome, setOutcome] = useState<InspectionOutcome | null>(null);
+  const [cameraHolder] = useState(createCameraPoseHolder);
+  const controlsInteractedRef = useRef(false);
 
   // Read from effects/handlers so they don't need to re-subscribe just
   // because the caller passed a fresh callback identity every render.
@@ -274,6 +301,9 @@ export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = 
               <directionalLight position={[100, 150, 100]} intensity={0.8} />
               <LoadedStlMesh
                 geometry={geometry}
+                cameraHolder={cameraHolder}
+                fitNonce={fitNonce}
+                controlsInteractedRef={controlsInteractedRef}
                 measure={measure}
                 measureAxis={measureAxis}
                 onBoundingBox={onBoundingBox}
@@ -283,7 +313,24 @@ export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = 
                 onGeometryChange={clearInspection}
                 onEmptyClick={clearInspection}
               />
-              <OrbitControls makeDefault enableDamping />
+              <OrbitControls
+                makeDefault
+                enableDamping
+                onStart={(event) => {
+                  controlsInteractedRef.current = true;
+                  cameraHolder.onUserStart(readControlsPose(event));
+                }}
+                onChange={(event) => {
+                  if (!controlsInteractedRef.current) return;
+                  const pose = readControlsPose(event);
+                  if (pose) cameraHolder.onControlsChange(pose);
+                }}
+                onEnd={(event) => {
+                  if (!controlsInteractedRef.current) return;
+                  const pose = readControlsPose(event);
+                  if (pose) cameraHolder.onControlsChange(pose);
+                }}
+              />
             </Canvas>
           )}</StlModel>
         </Suspense>

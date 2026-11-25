@@ -55,6 +55,21 @@ describe("Viewer3D", () => {
     expect(screen.getByText(/no render yet/i)).toBeInTheDocument();
     expect(screen.queryByTestId("viewer-3d")).not.toBeInTheDocument();
   });
+
+  it("keeps loading feedback intact across stlUrl swaps and fitNonce updates without remounting the viewer container", () => {
+    vi.spyOn(STLLoader.prototype, "load").mockImplementation(() => undefined);
+    const { rerender } = render(<Viewer3D stlUrl="/a.stl" fitNonce={0} />);
+    const container = screen.getByTestId("viewer-3d");
+    expect(screen.getByText("Loading model…")).toBeVisible();
+
+    rerender(<Viewer3D stlUrl="/b.stl" fitNonce={0} />);
+    expect(screen.getByTestId("viewer-3d")).toBe(container);
+    expect(screen.getByText("Loading model…")).toBeVisible();
+
+    rerender(<Viewer3D stlUrl="/b.stl" fitNonce={1} />);
+    expect(screen.getByTestId("viewer-3d")).toBe(container);
+    expect(screen.getByText("Loading model…")).toBeVisible();
+  });
 });
 
 describe("isInspectClick", () => {
