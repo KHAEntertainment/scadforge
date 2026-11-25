@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EditorReceipt, SnapshotManifest, ViewName } from "@scadforge/protocol";
-import { createApiClient, type ApiClient } from "./lib/apiClient.js";
+import { ApiClientError, createApiClient, type ApiClient } from "./lib/apiClient.js";
 import { useProject } from "./hooks/useProject.js";
 import { useChat } from "./hooks/useChat.js";
 import { useSnapshots } from "./hooks/useSnapshots.js";
@@ -18,6 +18,12 @@ import { ParamsTab } from "./components/params/ParamsTab.js";
 import { useParamsController } from "./components/params/useParamsController.js";
 import { EditSurface } from "./components/editor/surface/EditSurface.js";
 import { useEditorSession, type HostWriteReason } from "./components/editor/surface/useEditorSession.js";
+import {
+  clearSourceStaleIfCurrent,
+  createSourceStaleMark,
+  patchSourceStaleIfCurrent,
+  type SourceStaleState
+} from "./sourceStale.js";
 
 function triggerDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob);
@@ -76,19 +82,10 @@ export function App() {
   // one project; the tag (start sequence + project id) is what proves which
   // request a result belongs to.
   const sourceSeqRef = useRef(0);
-  const [sourceStale, setSourceStale] = useState<{
-    projectId: string;
-    /** The source request sequence at the receipt: only later requests count. */
-    sinceSeq: number;
-    /** The revision of the latest-started post-receipt read/write that succeeded. */
-    freshRevision: string | null;
-    /** The latest-started post-receipt read failed; Build retries it. */
-    failed: boolean;
-    /** The sequence when the last re-read was requested (`null`: none yet). */
-    requestedSeq: number | null;
-    /** The latest-started post-receipt request that settled. */
-    settledSeq: number;
-  } | null>(null);
+  const [sourceStale, setSourceStale] = useState<SourceStaleState | null>(null);
+  const markSourceStale = useCallback((targetProjectId: string) => {
+    setSourceStale(createSourceStaleMark(targetProjectId, sourceSeqRef.current));
+  }, []);
   const sourceClient = useMemo<ApiClient>(() => {
     const settle = (projectIdOfRequest: string, seq: number, revision: string | null) =>
       setSourceStale((prev) =>
@@ -131,14 +128,15 @@ export function App() {
   const handleParamsSaved = useCallback(() => {
     snapshots.refresh();
     reportEditorWriteRef.current("params-saved");
-  }, [snapshots.refresh]);
+    if (projectId) markSourceStale(projectId);
+  }, [snapshots.refresh, projectId, markSourceStale]);
   const paramsController = useParamsController(client, projectId, workingHeadId, handleParamsSaved);
   const handleEditorCommitted = useCallback(
     (receipt: EditorReceipt) => {
       snapshots.refresh();
-      setSourceStale({ projectId: receipt.projectId, sinceSeq: sourceSeqRef.current, freshRevision: null, failed: false, requestedSeq: null, settledSeq: 0 });
+      markSourceStale(receipt.projectId);
     },
-    [snapshots.refresh]
+    [snapshots.refresh, markSourceStale]
   );
   // L4: the session ends its wait for a saved edit's snapshot only once this list contains it.
   const listedSnapshotIds = useMemo(() => snapshots.snapshots.map((snapshot) => snapshot.id), [snapshots.snapshots]);
@@ -163,17 +161,17 @@ export function App() {
     const stale = sourceStale;
     if (!stale) return;
     if (stale.projectId !== projectId) {
-      setSourceStale(null); // a project switch: the new project's source loads fresh
+      setSourceStale(clearSourceStaleIfCurrent(stale)); // a project switch: the new project's source loads fresh
       return;
     }
     if (sourceEditor.dirty || sourceEditor.saving) return;
     if (stale.freshRevision !== null && sourceEditor.baseRevision === stale.freshRevision) {
-      setSourceStale(null);
+      setSourceStale(clearSourceStaleIfCurrent(stale));
       return;
     }
     if (stale.failed || sourceEditor.loading) return;
     if (stale.requestedSeq !== null && stale.settledSeq <= stale.requestedSeq) return; // our re-read has not settled yet
-    setSourceStale({ ...stale, requestedSeq: sourceSeqRef.current });
+    setSourceStale(patchSourceStaleIfCurrent(stale, { requestedSeq: sourceSeqRef.current }));
     reloadSource();
   }, [sourceStale, projectId, sourceEditor.dirty, sourceEditor.saving, sourceEditor.loading, sourceEditor.baseRevision, reloadSource]);
   const sourceStaleHere = sourceStale !== null && sourceStale.projectId === projectId ? sourceStale : null;
@@ -330,11 +328,29 @@ export function App() {
     const chatHeadId = chat.state.headSnapshot?.id;
     if (chatHeadId) snapshots.refresh();
   }, [chat.state.headSnapshot?.id, snapshots.refresh]);
-  const turnWasStreamingRef = useRef(false);
+  const prevChatHeadForSourceRef = useRef<{ projectId: string | null; headId: string | null }>({
+    projectId,
+    headId: chat.state.headSnapshot?.id ?? null
+  });
   useEffect(() => {
-    if (chat.isStreaming) turnWasStreamingRef.current = true;
-    else if (turnWasStreamingRef.current) { turnWasStreamingRef.current = false; snapshots.refresh(); }
-  }, [chat.isStreaming, snapshots.refresh]);
+    const chatHeadId = chat.state.headSnapshot?.id ?? null;
+    const prev = prevChatHeadForSourceRef.current;
+    prevChatHeadForSourceRef.current = { projectId, headId: chatHeadId };
+    if (projectId && prev.projectId === projectId && chatHeadId && chatHeadId !== prev.headId) {
+      markSourceStale(projectId);
+    }
+  }, [chat.state.headSnapshot?.id, projectId, markSourceStale]);
+  const streamingProjectIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (chat.isStreaming) {
+      streamingProjectIdRef.current = projectId;
+    } else if (streamingProjectIdRef.current !== null) {
+      const finishedProjectId = streamingProjectIdRef.current;
+      streamingProjectIdRef.current = null;
+      snapshots.refresh();
+      if (finishedProjectId === projectId) markSourceStale(finishedProjectId);
+    }
+  }, [chat.isStreaming, snapshots.refresh, projectId, markSourceStale]);
 
   function requestProjectSwitch(id: string) {
     if (id === projectId) return;
@@ -376,14 +392,14 @@ export function App() {
     if (!projectId || sourceEditor.dirty || !sourceEditor.baseRevision) return;
     // The header's Build button has its own disabled rule; this covers it too.
     if (sourceStaleHere?.failed && !editorSaving) {
-      setSourceStale({ ...sourceStaleHere, failed: false, requestedSeq: sourceSeqRef.current });
+      setSourceStale(patchSourceStaleIfCurrent(sourceStaleHere, { failed: false, requestedSeq: sourceSeqRef.current }));
       sourceEditor.reload();
       setHeaderNotice("The latest source could not be loaded; trying again. Press Build once it has loaded.");
       return;
     }
     if (sourceStaleHere && !editorSaving && sourceStaleHere.requestedSeq !== null && sourceStaleHere.settledSeq <= sourceStaleHere.requestedSeq) {
       // The re-read is still out (it may hang: there is no timeout): pressing Build starts a new one.
-      setSourceStale({ ...sourceStaleHere, requestedSeq: sourceSeqRef.current });
+      setSourceStale(patchSourceStaleIfCurrent(sourceStaleHere, { requestedSeq: sourceSeqRef.current }));
       sourceEditor.reload();
       setHeaderNotice("Still loading the latest source; trying again. Press Build once it has loaded.");
       return;
@@ -400,8 +416,9 @@ export function App() {
     }
     setBuildState("building");
     setHeaderNotice(null);
+    const buildProjectId = projectId;
     try {
-      const result = await client.build(projectId, { base_revision: sourceEditor.baseRevision });
+      const result = await client.build(buildProjectId, { base_revision: sourceEditor.baseRevision });
       snapshots.refresh();
       setSelectedSnapshotId(result.snapshot.id);
       // Issue #143: Build attaches the mesh to the snapshot that is often
@@ -410,7 +427,14 @@ export function App() {
       mesh.reprobe?.();
       setHeaderNotice(`Build complete — snapshot ${result.snapshot.id} is pinned to the preview.`);
     } catch (cause) {
-      setHeaderNotice(cause instanceof Error ? cause.message : "Build failed.");
+      if (cause instanceof ApiClientError && cause.error_code === "CONFLICT") {
+        if (buildProjectId === previousProjectIdForHeadRef.current) {
+          markSourceStale(buildProjectId);
+          setHeaderNotice(`${cause.message} Reloading the latest source now — press Build again once it has loaded.`);
+        }
+      } else {
+        setHeaderNotice(cause instanceof Error ? cause.message : "Build failed.");
+      }
     } finally { setBuildState("idle"); }
   }
 
@@ -448,7 +472,7 @@ export function App() {
           }}
           params={<ParamsTab controller={paramsController} onAskAgent={(text) => void chat.sendMessage(text)} disabled={projectLoading || !projectId || sourceEditor.dirty} />}
           code={<CodeTab client={client} projectId={projectId} editor={sourceEditor} historicalSnapshotId={selectedSnapshotId} isHistorical={historical} />}
-          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onReverted={() => { if (projectId === previousProjectIdForHeadRef.current) editorSession.reportWrite("reverted"); }} onSelectSnapshot={(id) => { if (projectId === previousProjectIdForHeadRef.current) setSelectedSnapshotId(id); }} />}
+          history={<HistoryTab key={`history-${projectId ?? "no-project"}`} client={client} projectId={projectId} snapshots={snapshots.snapshots} loading={snapshots.loading} error={snapshots.error} onExported={snapshots.refresh} onReverted={() => { if (projectId === previousProjectIdForHeadRef.current) { editorSession.reportWrite("reverted"); if (projectId) markSourceStale(projectId); } }} onSelectSnapshot={(id) => { if (projectId === previousProjectIdForHeadRef.current) setSelectedSnapshotId(id); }} />}
         />
       </main>
       {projectError ? <p className="app-error" role="alert">{projectError}</p> : null}

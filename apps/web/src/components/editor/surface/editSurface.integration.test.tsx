@@ -15,6 +15,7 @@ import { StrictMode, useEffect, useReducer, useRef, useState } from "react";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ParamValues } from "@scadforge/protocol";
+import { computeSourceRevision } from "@scadforge/scad-core";
 import { App } from "../../../App.js";
 import { createApiClient, type ApiClient } from "../../../lib/apiClient.js";
 import { EditSurface } from "./EditSurface.js";
@@ -1238,5 +1239,230 @@ describe("Issue #143 — after save then Build the mesh is probed again for the 
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
     expect(meshProbes()).toBe(probesBefore);
+  });
+});
+
+// ── Issue #165: external head-moving writes refresh sourceEditor.baseRevision ──
+
+describe("Issue #165 — head-moving writes outside the source editor refresh base_revision before Build", () => {
+  function headerBuild(): HTMLElement {
+    return within(screen.getByRole("banner")).getByRole("button", { name: /^Build$/ });
+  }
+
+  function sourceReads(): number {
+    return server.log.filter((line) => line === "GET /projects/p1/source").length;
+  }
+
+  function expectedSourceRevision(projectId = "p1"): string {
+    const state = server.projects.get(projectId)!;
+    return computeSourceRevision(state.snapshots[0]?.id ?? null, state.scad, state.values);
+  }
+
+  async function settle(ms = 50): Promise<void> {
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    });
+  }
+
+  it("(a) after a History revert, Build sends the reverted head's source revision and does not hit 409 CONFLICT", async () => {
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+
+    fireEvent.click(screen.getByRole("tab", { name: /history/i }));
+    await screen.findAllByTestId("snapshot-row");
+    fireEvent.click(screen.getAllByTestId("snapshot-row").at(-1)!);
+    fireEvent.click(await screen.findByTestId("revert-trigger"));
+    fireEvent.click(await screen.findByTestId("revert-confirm-yes"));
+    await waitFor(() => expect(server.log.some((line) => line.endsWith("/revert"))).toBe(true), { timeout: 3000 });
+
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].baseRevision).toBe(expectedSourceRevision("p1"));
+    expect(server.buildPosts[0].current).toBe(true);
+    expect(screen.queryByText(/The source changed since this revision/)).toBeNull();
+    await screen.findByText(/Build complete/);
+  });
+
+  it("(b) after a Params save, Build sends the updated head's source revision and does not hit 409 CONFLICT", async () => {
+    render(<App />);
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+
+    fireEvent.click(screen.getByRole("tab", { name: "Params" }));
+    const slider = await screen.findByLabelText("wall");
+    fireEvent.change(slider, { target: { value: "6" } });
+    await waitFor(() => expect(server.values("p1")).toEqual({ wall: 6 }), { timeout: 3000 });
+    await waitFor(() => expect(screen.getByTestId("params-status")).toHaveTextContent("Saved"), { timeout: 3000 });
+
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].baseRevision).toBe(expectedSourceRevision("p1"));
+    expect(server.buildPosts[0].current).toBe(true);
+    expect(screen.queryByText(/The source changed since this revision/)).toBeNull();
+    await screen.findByText(/Build complete/);
+  });
+
+  it("(c) after a chat turn that creates a snapshot, Build sends the updated head's source revision and does not hit 409 CONFLICT", async () => {
+    render(<App />);
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+
+    server.fastChat = { values: { wall: 6 } };
+    fireEvent.click(screen.getByRole("tab", { name: /chat/i }));
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "make it thicker" } });
+    fireEvent.submit(screen.getByLabelText("Message").closest("form")!);
+    await waitFor(() => expect(server.log).toContain("POST /projects/p1/chat"), { timeout: 3000 });
+    await screen.findByText("Done.");
+
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].baseRevision).toBe(expectedSourceRevision("p1"));
+    expect(server.buildPosts[0].current).toBe(true);
+    expect(screen.queryByText(/The source changed since this revision/)).toBeNull();
+    await screen.findByText(/Build complete/);
+  });
+
+  it("CONFLICT recovery: a 409 from Build triggers one source re-read, does not auto-retry, and the next Build sends the fresh revision", async () => {
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+
+    // Head advances externally; Build answers 409 CONFLICT once.
+    server.externalWrite("p1", { wall: 5 });
+    const reread = server.hold("source-get");
+    const readsBefore = sourceReads();
+
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].current).toBe(false);
+    await screen.findByText(/Reloading the latest source now — press Build again once it has loaded\./);
+    await reread.arrived;
+    expect(server.buildPosts).toHaveLength(1);
+
+    reread.release();
+    await waitFor(() => expect(sourceReads()).toBe(readsBefore + 1), { timeout: 3000 });
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+    expect(server.buildPosts).toHaveLength(1);
+
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(2), { timeout: 3000 });
+    expect(server.buildPosts[1].baseRevision).toBe(expectedSourceRevision("p1"));
+    expect(server.buildPosts[1].current).toBe(true);
+    await screen.findByText(/Build complete/);
+  });
+
+  it("dirty draft: a History revert with unsaved Code-tab edits does not reload over the draft and Build stays disabled with its reason", async () => {
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+
+    fireEvent.click(screen.getByRole("tab", { name: /code/i }));
+    await screen.findByLabelText("OpenSCAD source");
+    await settle(20);
+    const draft = "cube([wall, 14, 10]); // unsaved draft";
+    fireEvent.change(screen.getByLabelText("OpenSCAD source"), { target: { value: draft } });
+    const readsBefore = sourceReads();
+
+    fireEvent.click(screen.getByRole("tab", { name: /history/i }));
+    await screen.findAllByTestId("snapshot-row");
+    fireEvent.click(screen.getAllByTestId("snapshot-row").at(-1)!);
+    fireEvent.click(await screen.findByTestId("revert-trigger"));
+    fireEvent.click(await screen.findByTestId("revert-confirm-yes"));
+    await waitFor(() => expect(server.log.some((line) => line.endsWith("/revert"))).toBe(true), { timeout: 3000 });
+    await settle();
+
+    expect(sourceReads()).toBe(readsBefore);
+    expect(headerBuild()).toBeDisabled();
+    fireEvent.click(screen.getByRole("tab", { name: /code/i }));
+    expect((screen.getByLabelText("OpenSCAD source") as HTMLTextAreaElement).value).toBe(draft);
+    fireEvent.click(screen.getByRole("tab", { name: /preview/i }));
+    const previewBuild = await screen.findByTestId("preview-build-button");
+    expect(previewBuild).toBeDisabled();
+    expect(previewBuild).toHaveAttribute("title", "Save or discard your source edits before building.");
+  });
+
+  it("two writes in a row: an old GET /source response captured before the second write and delivered after it is not adopted as fresh and Build sends the newest revision", async () => {
+    let captureNextSourceGet = false;
+    let releaseCapturedResponse: (() => void) | null = null;
+    let markResponseCaptured!: () => void;
+    const responseCaptured = new Promise<void>((resolve) => {
+      markResponseCaptured = resolve;
+    });
+    const realFetch = server.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), "http://localhost");
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (captureNextSourceGet && method === "GET" && url.pathname === "/api/projects/p1/source") {
+        captureNextSourceGet = false;
+        // Run the server handler NOW so the pre-revert Response is already serialized.
+        const oldResponse = await realFetch(input, init);
+        const delivered = new Promise<void>((resolve) => {
+          releaseCapturedResponse = resolve;
+        });
+        markResponseCaptured();
+        await delivered;
+        return oldResponse;
+      }
+      return realFetch(input, init);
+    });
+
+    render(<App />);
+    await openEdit();
+    await saveWall("3");
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+
+    // First write (editor save to wall=4): capture its GET /source response BEFORE the second write.
+    captureNextSourceGet = true;
+    await saveWall("4");
+    await responseCaptured;
+    const staleRevisionAfterFirstWrite = expectedSourceRevision("p1");
+
+    // Second write (History revert back to wall=2) completes while the old serialized response is in flight.
+    fireEvent.click(screen.getByRole("tab", { name: /history/i }));
+    await screen.findAllByTestId("snapshot-row");
+    fireEvent.click(screen.getAllByTestId("snapshot-row").at(-1)!);
+    fireEvent.click(await screen.findByTestId("revert-trigger"));
+    fireEvent.click(await screen.findByTestId("revert-confirm-yes"));
+    await waitFor(() => expect(server.log.some((line) => line.endsWith("/revert"))).toBe(true), { timeout: 3000 });
+    const newestRevisionAfterRevert = expectedSourceRevision("p1");
+    expect(newestRevisionAfterRevert).not.toBe(staleRevisionAfterFirstWrite);
+
+    // Hold the fresh re-read that must follow the late old response, then deliver the old serialized response.
+    const freshReread = server.hold("source-get");
+    const readsBeforeOldDelivery = sourceReads();
+    releaseCapturedResponse!();
+
+    // The old response must NOT be adopted as fresh: a second re-read starts and Build stays blocked until it finishes.
+    await freshReread.arrived;
+    expect(sourceReads()).toBe(readsBeforeOldDelivery + 1);
+    fireEvent.click(screen.getByRole("tab", { name: /preview/i }));
+    const previewBuild = await screen.findByTestId("preview-build-button");
+    expect(previewBuild).toBeDisabled();
+    expect(previewBuild).toHaveAttribute("title", "Loading the latest source before building…");
+    expect(server.buildPosts).toHaveLength(0);
+
+    freshReread.release();
+    await waitFor(() => expect(headerBuild()).toBeEnabled(), { timeout: 3000 });
+    await settle();
+
+    fireEvent.click(headerBuild());
+    await waitFor(() => expect(server.buildPosts).toHaveLength(1), { timeout: 3000 });
+    expect(server.buildPosts[0].baseRevision).toBe(newestRevisionAfterRevert);
+    expect(server.buildPosts[0].baseRevision).not.toBe(staleRevisionAfterFirstWrite);
+    expect(server.buildPosts[0].current).toBe(true);
+    await screen.findByText(/Build complete/);
   });
 });
