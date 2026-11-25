@@ -37,6 +37,20 @@ export interface CameraFramingDecision {
   framed: boolean;
 }
 
+export interface CameraApplyTarget {
+  position: { set: (x: number, y: number, z: number) => unknown };
+  near: number;
+  far: number;
+  updateProjectionMatrix: () => void;
+  lookAt: (x: number, y: number, z: number) => void;
+}
+
+export interface ControlsApplyTarget {
+  target: { set: (x: number, y: number, z: number) => unknown };
+  enableDamping?: boolean;
+  update: () => unknown;
+}
+
 /** Margin multiplier around the fitted sphere so the model does not touch viewport edges. */
 export const FIT_MARGIN_FACTOR = 1.15;
 
@@ -205,6 +219,50 @@ export function decideCameraPose(input: CameraFramingInput): CameraFramingDecisi
   };
 }
 
+/**
+ * Applies a camera framing decision to a perspective camera and orbit controls.
+ * Temporarily turns damping off for one `controls.update()` before writing the
+ * decision pose so pending orbit, pan, and dolly inertia is flushed instead of
+ * drifting the camera away after Fit or a programmatic pose update.
+ */
+export function applyCameraFramingDecision(
+  camera: CameraApplyTarget,
+  controls: ControlsApplyTarget | null,
+  decision: CameraFramingDecision
+): void {
+  if (!controls) {
+    camera.position.set(decision.position.x, decision.position.y, decision.position.z);
+    camera.near = decision.near;
+    camera.far = decision.far;
+    camera.updateProjectionMatrix();
+    camera.lookAt(decision.target.x, decision.target.y, decision.target.z);
+    return;
+  }
+
+  const hasDampingProp = "enableDamping" in controls;
+  const wasDamping = controls.enableDamping;
+  if (hasDampingProp) {
+    controls.enableDamping = false;
+  }
+  try {
+    // Public-API inertia flush: update() with enableDamping=false zeroes sphericalDelta, panOffset, and scale.
+    controls.update();
+
+    camera.position.set(decision.position.x, decision.position.y, decision.position.z);
+    camera.near = decision.near;
+    camera.far = decision.far;
+    camera.updateProjectionMatrix();
+    camera.lookAt(decision.target.x, decision.target.y, decision.target.z);
+
+    controls.target.set(decision.target.x, decision.target.y, decision.target.z);
+    controls.update();
+  } finally {
+    if (hasDampingProp) {
+      controls.enableDamping = wasDamping;
+    }
+  }
+}
+
 export interface CameraPoseHolder {
   readonly userMoved: boolean;
   readonly pose: CameraPose | null;
@@ -250,12 +308,12 @@ export function createCameraPoseHolder(): CameraPoseHolder {
       }
       if (poseDiffers(startPose, currentPose, POSE_CHANGE_EPSILON)) {
         userMoved = true;
+        armed = false;
+        startPose = null;
         pose = clonePose(currentPose);
       }
     },
     onUserEnd(currentPose?: CameraPose) {
-      armed = false;
-      startPose = null;
       if (userMoved && currentPose) {
         pose = clonePose(currentPose);
       }
@@ -274,6 +332,7 @@ export function createCameraPoseHolder(): CameraPoseHolder {
         armed = false;
         startPose = null;
       }
+      const prevPose = pose;
       const decision = decideCameraPose({
         sphere,
         fovDeg,
@@ -282,6 +341,11 @@ export function createCameraPoseHolder(): CameraPoseHolder {
         reset
       });
       if (!decision) return null;
+      const reframedByCode = reset || decision.framed || !prevPose || poseDiffers(prevPose, decision, 0);
+      if (reframedByCode) {
+        armed = false;
+        startPose = null;
+      }
       if (userMoved && !reset) {
         pose = { position: cloneVec3(decision.position), target: cloneVec3(decision.target) };
       }

@@ -1,7 +1,7 @@
 import { Component, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { Raycaster, Vector2, Vector3, type Mesh, type BufferGeometry, type PerspectiveCamera } from "three";
+import { Raycaster, Vector2, type Mesh, type BufferGeometry, type PerspectiveCamera } from "three";
 import { DimensionOverlay, type MeasureFocus } from "./DimensionOverlay.js";
 import { isValidBBox, type BBox } from "./measure.js";
 import { inspectSurface } from "./inspect/surfaceRegion.js";
@@ -9,7 +9,13 @@ import { SurfaceHighlight } from "./inspect/SurfaceHighlight.js";
 import { useStlGeometry } from "./useStlGeometry.js";
 import { bindInspectionPointerEvents } from "./inspectionPointerEvents.js";
 import type { InspectionOutcome } from "./inspect/inspectionTypes.js";
-import { createCameraPoseHolder, type CameraPose, type CameraPoseHolder } from "./cameraFraming.js";
+import {
+  applyCameraFramingDecision,
+  createCameraPoseHolder,
+  type CameraPose,
+  type CameraPoseHolder,
+  type ControlsApplyTarget
+} from "./cameraFraming.js";
 export { isInspectClick } from "./inspectionPointerEvents.js";
 
 export interface Viewer3DProps {
@@ -125,7 +131,7 @@ function FitCamera({
   programmaticUpdateRef: { current: boolean };
 }) {
   const camera = useThree((state) => state.camera) as PerspectiveCamera;
-  const controls = useThree((state) => state.controls) as { target: Vector3; update: () => void } | null;
+  const controls = useThree((state) => state.controls) as ControlsApplyTarget | null;
 
   useEffect(() => {
     geometry.computeBoundingSphere();
@@ -140,17 +146,7 @@ function FitCamera({
 
     programmaticUpdateRef.current = true;
     try {
-      camera.position.set(decision.position.x, decision.position.y, decision.position.z);
-      camera.near = decision.near;
-      camera.far = decision.far;
-      camera.updateProjectionMatrix();
-      camera.lookAt(decision.target.x, decision.target.y, decision.target.z);
-
-      // Orbit around the target so dragging keeps the part in frame.
-      if (controls) {
-        controls.target.set(decision.target.x, decision.target.y, decision.target.z);
-        controls.update();
-      }
+      applyCameraFramingDecision(camera, controls, decision);
     } finally {
       programmaticUpdateRef.current = false;
     }

@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { PerspectiveCamera } from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { describe, expect, it } from "vitest";
 import {
+  applyCameraFramingDecision,
   createCameraPoseHolder,
   decideCameraPose,
   FIT_MARGIN_FACTOR,
+  POSE_CHANGE_EPSILON,
   type BoundingSphere,
   type CameraPose
 } from "./cameraFraming.js";
@@ -22,6 +26,26 @@ function viewDirection(pose: CameraPose) {
 
 function distanceBetween(a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) {
   return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+function createControlsHarness(fovDeg = 45, aspect = 2) {
+  const domElement = document.createElement("div");
+  Object.defineProperty(domElement, "clientHeight", { value: 600, configurable: true });
+  domElement.setPointerCapture = () => undefined;
+  domElement.releasePointerCapture = () => undefined;
+
+  const camera = new PerspectiveCamera(fovDeg, aspect, 0.1, 1000);
+  camera.position.set(80, 80, 80);
+  const controls = new OrbitControls(camera, domElement);
+  controls.enableDamping = true;
+  return { camera, controls, domElement };
+}
+
+function readControlsPose(controls: OrbitControls): CameraPose {
+  return {
+    position: { x: controls.object.position.x, y: controls.object.position.y, z: controls.object.position.z },
+    target: { x: controls.target.x, y: controls.target.y, z: controls.target.z }
+  };
 }
 
 describe("decideCameraPose", () => {
@@ -55,6 +79,8 @@ describe("decideCameraPose", () => {
         state: { userMoved: false, pose: null }
       });
       expect(decision).not.toBeNull();
+      expect(decision!.near).toBe(Math.max(expectedFit / 1000, 0.01));
+      expect(decision!.far).toBe(expectedFit * 10);
       expect(distanceBetween(decision!.position, decision!.target)).toBeCloseTo(expectedFit, 8);
     }
   });
@@ -271,7 +297,7 @@ describe("decideCameraPose", () => {
 });
 
 describe("createCameraPoseHolder", () => {
-  it("does not set userMoved on a plain click (start then end with no pose change) or on change without start", () => {
+  it("does not set userMoved on a plain click (no movement) or un-started programmatic changes, and replaces/clears armed pose appropriately", () => {
     const holder = createCameraPoseHolder();
     const initial = holder.resolveForGeometry(UNIT_SPHERE, FOV_DEG, 1.5, 0);
     expect(initial?.framed).toBe(true);
@@ -289,12 +315,61 @@ describe("createCameraPoseHolder", () => {
     expect(holder.userMoved).toBe(false);
     expect(holder.pose).toBeNull();
 
-    // Plain click without any change between start and end, followed by a post-end change.
-    holder.onUserStart(startPose);
-    holder.onUserEnd(startPose);
+    // Next start replaces the armed comparison pose.
+    const nextStartPose: CameraPose = { position: { x: 10, y: 20, z: 30 }, target: { x: 0, y: 0, z: 0 } };
+    holder.onUserStart(nextStartPose);
+    holder.onControlsChange(nextStartPose);
+    holder.onUserEnd(nextStartPose);
+    expect(holder.userMoved).toBe(false);
+    expect(holder.pose).toBeNull();
+
+    // Plain click followed by framing by code (mesh swap while userMoved=false) clears armed startPose,
+    // so subsequent programmatic changes without start cannot set userMoved.
+    const nextFramed = holder.resolveForGeometry({ center: { x: 5, y: 0, z: 0 }, radius: 40 }, FOV_DEG, 1.5, 0);
+    expect(nextFramed?.framed).toBe(true);
     holder.onControlsChange({ position: { x: 10, y: 20, z: 30 }, target: { x: 0, y: 0, z: 0 } });
     expect(holder.userMoved).toBe(false);
     expect(holder.pose).toBeNull();
+
+    // Plain click followed by Fit reset also clears armed startPose.
+    holder.onUserStart(startPose);
+    holder.onUserEnd(startPose);
+    const fitFramed = holder.resolveForGeometry(UNIT_SPHERE, FOV_DEG, 1.5, 1);
+    expect(fitFramed?.framed).toBe(true);
+    holder.onControlsChange({ position: { x: 10, y: 20, z: 30 }, target: { x: 0, y: 0, z: 0 } });
+    expect(holder.userMoved).toBe(false);
+    expect(holder.pose).toBeNull();
+  });
+
+  it("stays armed across end when released before crossing epsilon, claiming ownership on cumulative damping changes", () => {
+    const holder = createCameraPoseHolder();
+    const initial = holder.resolveForGeometry(UNIT_SPHERE, FOV_DEG, 1.5, 0)!;
+    const startPose: CameraPose = { position: initial.position, target: initial.target };
+
+    const firstDamp: CameraPose = {
+      position: {
+        x: startPose.position.x + POSE_CHANGE_EPSILON * 0.6,
+        y: startPose.position.y,
+        z: startPose.position.z
+      },
+      target: { ...startPose.target }
+    };
+    const secondDamp: CameraPose = {
+      position: {
+        x: startPose.position.x + POSE_CHANGE_EPSILON * 1.4,
+        y: startPose.position.y,
+        z: startPose.position.z
+      },
+      target: { ...startPose.target }
+    };
+
+    holder.onUserStart(startPose);
+    holder.onUserEnd(startPose);
+    holder.onControlsChange(firstDamp);
+    expect(holder.userMoved).toBe(false);
+    holder.onControlsChange(secondDamp);
+    expect(holder.userMoved).toBe(true);
+    expect(holder.pose).toEqual(secondDamp);
   });
 
   it("sets userMoved on the first changed pose after start, keeps updating through damping after end, and resets on fitNonce", () => {
@@ -348,5 +423,101 @@ describe("createCameraPoseHolder", () => {
     expect(projectBHolder.userMoved).toBe(false);
     expect(decision?.framed).toBe(true);
     expect(decision?.target).toEqual(projectBSphere.center);
+  });
+});
+
+describe("applyCameraFramingDecision with real OrbitControls", () => {
+  it("discards pending orbit, pan, and dolly inertia on Fit so camera and target hold across 500 damping updates", () => {
+    const { camera, controls, domElement } = createControlsHarness(FOV_DEG, 2);
+    const holder = createCameraPoseHolder();
+    let programmaticUpdate = false;
+
+    controls.addEventListener("start", () => holder.onUserStart(readControlsPose(controls)));
+    controls.addEventListener("change", () => {
+      if (programmaticUpdate) return;
+      holder.onControlsChange(readControlsPose(controls));
+    });
+    controls.addEventListener("end", () => holder.onUserEnd(readControlsPose(controls)));
+
+    try {
+      const sphere: BoundingSphere = { center: { x: 0, y: 0, z: 0 }, radius: 20 };
+      const initial = holder.resolveForGeometry(sphere, camera.fov, camera.aspect, 0)!;
+      programmaticUpdate = true;
+      applyCameraFramingDecision(camera, controls, initial);
+      programmaticUpdate = false;
+
+      // Simulate user orbit + pan + dolly wheel gesture leaving active damping inertia on release.
+      domElement.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 100, clientY: 100 }));
+      domElement.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 220, clientY: 130 }));
+      domElement.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 220, clientY: 130 }));
+      domElement.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 2, clientX: 100, clientY: 100 }));
+      domElement.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 160, clientY: 140 }));
+      domElement.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 160, clientY: 140 }));
+      domElement.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -120 }));
+      expect(holder.userMoved).toBe(true);
+
+      // Click Fit before damping settles.
+      const fitDecision = holder.resolveForGeometry(sphere, camera.fov, camera.aspect, 1)!;
+      programmaticUpdate = true;
+      applyCameraFramingDecision(camera, controls, fitDecision);
+      programmaticUpdate = false;
+
+      expect(distanceBetween(camera.position, fitDecision.position)).toBeLessThan(1e-5);
+      expect(distanceBetween(controls.target, fitDecision.target)).toBeLessThan(1e-5);
+
+      for (let i = 0; i < 500; i += 1) {
+        controls.update();
+      }
+
+      expect(distanceBetween(camera.position, fitDecision.position)).toBeLessThan(1e-5);
+      expect(distanceBetween(controls.target, fitDecision.target)).toBeLessThan(1e-5);
+      expect(holder.userMoved).toBe(false);
+    } finally {
+      controls.dispose();
+    }
+  });
+
+  it("also keeps a kept pose steady across 500 damping updates when applied to OrbitControls with pending inertia", () => {
+    const { camera, controls, domElement } = createControlsHarness(FOV_DEG, 2);
+    const holder = createCameraPoseHolder();
+    let programmaticUpdate = false;
+
+    controls.addEventListener("start", () => holder.onUserStart(readControlsPose(controls)));
+    controls.addEventListener("change", () => {
+      if (programmaticUpdate) return;
+      holder.onControlsChange(readControlsPose(controls));
+    });
+    controls.addEventListener("end", () => holder.onUserEnd(readControlsPose(controls)));
+
+    try {
+      const sphereA: BoundingSphere = { center: { x: 0, y: 0, z: 0 }, radius: 20 };
+      const initial = holder.resolveForGeometry(sphereA, camera.fov, camera.aspect, 0)!;
+      programmaticUpdate = true;
+      applyCameraFramingDecision(camera, controls, initial);
+      programmaticUpdate = false;
+
+      domElement.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 120, clientY: 120 }));
+      domElement.dispatchEvent(new MouseEvent("pointermove", { bubbles: true, clientX: 240, clientY: 150 }));
+      domElement.dispatchEvent(new MouseEvent("pointerup", { bubbles: true, clientX: 240, clientY: 150 }));
+      expect(holder.userMoved).toBe(true);
+
+      const sphereB: BoundingSphere = { center: { x: 2, y: 0, z: 0 }, radius: 25 };
+      const swapDecision = holder.resolveForGeometry(sphereB, camera.fov, camera.aspect, 0)!;
+      expect(swapDecision.framed).toBe(false);
+
+      programmaticUpdate = true;
+      applyCameraFramingDecision(camera, controls, swapDecision);
+      programmaticUpdate = false;
+
+      for (let i = 0; i < 500; i += 1) {
+        controls.update();
+      }
+
+      expect(distanceBetween(camera.position, swapDecision.position)).toBeLessThan(1e-5);
+      expect(distanceBetween(controls.target, swapDecision.target)).toBeLessThan(1e-5);
+      expect(holder.userMoved).toBe(true);
+    } finally {
+      controls.dispose();
+    }
   });
 });
