@@ -117,18 +117,17 @@ function FitCamera({
   geometry,
   cameraHolder,
   fitNonce,
-  controlsInteractedRef
+  programmaticUpdateRef
 }: {
   geometry: BufferGeometry;
   cameraHolder: CameraPoseHolder;
   fitNonce: number;
-  controlsInteractedRef: { current: boolean };
+  programmaticUpdateRef: { current: boolean };
 }) {
   const camera = useThree((state) => state.camera) as PerspectiveCamera;
   const controls = useThree((state) => state.controls) as { target: Vector3; update: () => void } | null;
 
   useEffect(() => {
-    controlsInteractedRef.current = false;
     geometry.computeBoundingSphere();
     const sphere = geometry.boundingSphere;
     const decision = cameraHolder.resolveForGeometry(
@@ -139,18 +138,23 @@ function FitCamera({
     );
     if (!decision) return;
 
-    camera.position.set(decision.position.x, decision.position.y, decision.position.z);
-    camera.near = decision.near;
-    camera.far = decision.far;
-    camera.updateProjectionMatrix();
-    camera.lookAt(decision.target.x, decision.target.y, decision.target.z);
+    programmaticUpdateRef.current = true;
+    try {
+      camera.position.set(decision.position.x, decision.position.y, decision.position.z);
+      camera.near = decision.near;
+      camera.far = decision.far;
+      camera.updateProjectionMatrix();
+      camera.lookAt(decision.target.x, decision.target.y, decision.target.z);
 
-    // Orbit around the target so dragging keeps the part in frame.
-    if (controls) {
-      controls.target.set(decision.target.x, decision.target.y, decision.target.z);
-      controls.update();
+      // Orbit around the target so dragging keeps the part in frame.
+      if (controls) {
+        controls.target.set(decision.target.x, decision.target.y, decision.target.z);
+        controls.update();
+      }
+    } finally {
+      programmaticUpdateRef.current = false;
     }
-  }, [geometry, camera, controls, cameraHolder, fitNonce, controlsInteractedRef]);
+  }, [geometry, camera, controls, cameraHolder, fitNonce, programmaticUpdateRef]);
 
   return null;
 }
@@ -159,7 +163,7 @@ interface StlMeshProps {
   geometry: BufferGeometry;
   cameraHolder: CameraPoseHolder;
   fitNonce: number;
-  controlsInteractedRef: { current: boolean };
+  programmaticUpdateRef: { current: boolean };
   measure?: boolean;
   measureAxis?: MeasureFocus;
   onBoundingBox?: (box: BBox | null) => void;
@@ -179,7 +183,7 @@ export function StlModel({ url, children }: { url: string; children: (geometry: 
   return geometry ? children(geometry) : <ViewerPlaceholder message="Loading model…" />;
 }
 
-function LoadedStlMesh({ geometry, cameraHolder, fitNonce, controlsInteractedRef, measure = false, measureAxis = "all", onBoundingBox, inspect = false, outcome = null, onSurfaceClick, onGeometryChange, onEmptyClick }: StlMeshProps) {
+function LoadedStlMesh({ geometry, cameraHolder, fitNonce, programmaticUpdateRef, measure = false, measureAxis = "all", onBoundingBox, inspect = false, outcome = null, onSurfaceClick, onGeometryChange, onEmptyClick }: StlMeshProps) {
   const mesh = useRef<Mesh>(null);
   const { camera, gl } = useThree();
 
@@ -225,7 +229,7 @@ function LoadedStlMesh({ geometry, cameraHolder, fitNonce, controlsInteractedRef
         geometry={geometry}
         cameraHolder={cameraHolder}
         fitNonce={fitNonce}
-        controlsInteractedRef={controlsInteractedRef}
+        programmaticUpdateRef={programmaticUpdateRef}
       />
       <mesh ref={mesh}>
         <primitive object={geometry} attach="geometry" />
@@ -243,7 +247,7 @@ function LoadedStlMesh({ geometry, cameraHolder, fitNonce, controlsInteractedRef
 export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = "all", onBoundingBox, inspect = false, onInspect, fitNonce = 0 }: Viewer3DProps) {
   const [outcome, setOutcome] = useState<InspectionOutcome | null>(null);
   const [cameraHolder] = useState(createCameraPoseHolder);
-  const controlsInteractedRef = useRef(false);
+  const programmaticUpdateRef = useRef(false);
 
   // Read from effects/handlers so they don't need to re-subscribe just
   // because the caller passed a fresh callback identity every render.
@@ -303,7 +307,7 @@ export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = 
                 geometry={geometry}
                 cameraHolder={cameraHolder}
                 fitNonce={fitNonce}
-                controlsInteractedRef={controlsInteractedRef}
+                programmaticUpdateRef={programmaticUpdateRef}
                 measure={measure}
                 measureAxis={measureAxis}
                 onBoundingBox={onBoundingBox}
@@ -317,18 +321,15 @@ export function Viewer3D({ stlUrl, emptyMessage, measure = false, measureAxis = 
                 makeDefault
                 enableDamping
                 onStart={(event) => {
-                  controlsInteractedRef.current = true;
                   cameraHolder.onUserStart(readControlsPose(event));
                 }}
                 onChange={(event) => {
-                  if (!controlsInteractedRef.current) return;
+                  if (programmaticUpdateRef.current) return;
                   const pose = readControlsPose(event);
                   if (pose) cameraHolder.onControlsChange(pose);
                 }}
                 onEnd={(event) => {
-                  if (!controlsInteractedRef.current) return;
-                  const pose = readControlsPose(event);
-                  if (pose) cameraHolder.onControlsChange(pose);
+                  cameraHolder.onUserEnd(readControlsPose(event));
                 }}
               />
             </Canvas>

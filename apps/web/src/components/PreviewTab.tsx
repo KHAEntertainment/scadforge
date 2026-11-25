@@ -319,7 +319,7 @@ function PreviewTabBody({
         </button>
         <button
           type="button"
-          aria-label="Reset view"
+          aria-label="Fit view"
           data-testid="fit-view-button"
           onClick={() => {
             onModeChange("orbit");

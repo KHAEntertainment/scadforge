@@ -59,12 +59,12 @@ describe("PreviewTab — Live mode (Issue #31)", () => {
   });
 });
 
-describe("PreviewTab — Fit / Reset view control (Issue #164)", () => {
-  it("renders a visible Fit button with accessible name 'Reset view' that stays enabled without a mesh", () => {
+describe("PreviewTab — Fit view control (Issue #164)", () => {
+  it("renders a visible Fit button with accessible name 'Fit view' that stays enabled without a mesh", () => {
     useWasmPreviewMock.mockReturnValue(idleResult());
     render(<PreviewTab stlUrl={null} pngUrls={{ iso: "/iso.png" }} liveScad={null} liveParams={{}} />);
 
-    const fitButton = screen.getByRole("button", { name: "Reset view" });
+    const fitButton = screen.getByRole("button", { name: "Fit view" });
     expect(fitButton).toBeVisible();
     expect(fitButton).toHaveTextContent("Fit");
     expect(fitButton).toBeEnabled();
@@ -77,7 +77,7 @@ describe("PreviewTab — Fit / Reset view control (Issue #164)", () => {
     fireEvent.click(screen.getByTestId("view-button-iso"));
     expect(screen.getByAltText("iso view render")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Reset view" }));
+    fireEvent.click(screen.getByRole("button", { name: "Fit view" }));
     expect(screen.queryByAltText("iso view render")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "3D" })).toHaveClass("active");
   });
