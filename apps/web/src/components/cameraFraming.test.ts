@@ -20,6 +20,10 @@ function viewDirection(pose: CameraPose) {
   return { x: dx / len, y: dy / len, z: dz / len };
 }
 
+function distanceBetween(a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) {
+  return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
 describe("decideCameraPose", () => {
   it("frames the first mesh along (1, 0.8, 1) with model-scaled clipping planes", () => {
     const decision = decideCameraPose({
@@ -39,6 +43,73 @@ describe("decideCameraPose", () => {
     const fitDistance = (UNIT_SPHERE.radius / Math.sin((FOV_DEG * Math.PI) / 360)) * FIT_MARGIN_FACTOR;
     expect(decision!.near).toBeCloseTo(Math.max(fitDistance / 1000, 0.01), 5);
     expect(decision!.far).toBeCloseTo(fitDistance * 10, 5);
+  });
+
+  it("matches today's vertical fitDistance exactly when aspect is >= 1 (tested at 1.2 and 2)", () => {
+    const expectedFit = (UNIT_SPHERE.radius / Math.sin((FOV_DEG * Math.PI) / 360)) * FIT_MARGIN_FACTOR;
+    for (const aspect of [1.2, 2]) {
+      const decision = decideCameraPose({
+        sphere: UNIT_SPHERE,
+        fovDeg: FOV_DEG,
+        aspect,
+        state: { userMoved: false, pose: null }
+      });
+      expect(decision).not.toBeNull();
+      expect(distanceBetween(decision!.position, decision!.target)).toBeCloseTo(expectedFit, 8);
+    }
+  });
+
+  it("fits against the horizontal half-angle in a portrait viewer (aspect 0.5) so the model is not clipped sideways", () => {
+    const userPose: CameraPose = {
+      position: { x: 0, y: 0, z: 150 },
+      target: { x: 0, y: 0, z: 0 }
+    };
+    const farOffSphere: BoundingSphere = { center: { x: 500, y: 0, z: 0 }, radius: 20 };
+    const decision = decideCameraPose({
+      sphere: farOffSphere,
+      fovDeg: FOV_DEG,
+      aspect: 0.5,
+      state: { userMoved: true, pose: userPose }
+    });
+    expect(decision).not.toBeNull();
+    const halfV = (FOV_DEG * Math.PI) / 360;
+    const halfH = Math.atan(Math.tan(halfV) * 0.5);
+    const expectedHorizontalFit = (farOffSphere.radius / Math.sin(halfH)) * FIT_MARGIN_FACTOR;
+    const dist = distanceBetween(decision!.position, decision!.target);
+    expect(dist).toBeGreaterThan(98.62);
+    expect(dist).toBeCloseTo(expectedHorizontalFit, 5);
+  });
+
+  it("keeps a portrait pose when the sphere just fits horizontally and reframes to fit horizontally when just outside", () => {
+    const userPose: CameraPose = {
+      position: { x: 0, y: 0, z: 100 },
+      target: { x: 0, y: 0, z: 0 }
+    };
+    const radius = 20;
+    const aspect = 0.5;
+    const halfV = (FOV_DEG * Math.PI) / 360;
+    const tanHalfH = Math.tan(halfV) * aspect;
+    const hypH = Math.hypot(1, tanHalfH);
+    const boundaryX = 100 * tanHalfH + radius * hypH;
+
+    const justInside = decideCameraPose({
+      sphere: { center: { x: boundaryX - 0.01, y: 0, z: 0 }, radius },
+      fovDeg: FOV_DEG,
+      aspect,
+      state: { userMoved: true, pose: userPose }
+    });
+    expect(justInside!.position).toEqual(userPose.position);
+
+    const justOutside = decideCameraPose({
+      sphere: { center: { x: boundaryX + 0.01, y: 0, z: 0 }, radius },
+      fovDeg: FOV_DEG,
+      aspect,
+      state: { userMoved: true, pose: userPose }
+    });
+    const halfH = Math.atan(tanHalfH);
+    const dist = distanceBetween(justOutside!.position, justOutside!.target);
+    expect(dist * Math.sin(halfH)).toBeGreaterThan(radius);
+    expect(dist).toBeCloseTo((radius / Math.sin(halfH)) * FIT_MARGIN_FACTOR, 5);
   });
 
   it("keeps the user-moved camera position, view direction, and orbit target across a mesh swap", () => {
@@ -91,12 +162,7 @@ describe("decideCameraPose", () => {
     expect(viewDirection(decision!).y).toBeCloseTo(0, 5);
     expect(viewDirection(decision!).z).toBeCloseTo(1, 5);
     const fitDistance = (farOffSphere.radius / Math.sin((FOV_DEG * Math.PI) / 360)) * FIT_MARGIN_FACTOR;
-    const actualDist = Math.hypot(
-      decision!.position.x - decision!.target.x,
-      decision!.position.y - decision!.target.y,
-      decision!.position.z - decision!.target.z
-    );
-    expect(actualDist).toBeCloseTo(fitDistance, 5);
+    expect(distanceBetween(decision!.position, decision!.target)).toBeCloseTo(fitDistance, 5);
   });
 
   it("keeps view direction, centres target, and sets fitDistance when the new mesh shrinks below 1% of viewport height", () => {
@@ -137,21 +203,53 @@ describe("decideCameraPose", () => {
     expect(decision!.position.z).toBeCloseTo(fitDistance, 5);
   });
 
-  it("scales clipping planes at least as generously as today when a kept pose is far from the model", () => {
+  it("keeps near no larger and far no smaller than pre-PR when a kept pose is far from the model", () => {
+    const sphere: BoundingSphere = { center: { x: 0, y: 0, z: 0 }, radius: 20 };
     const userPose: CameraPose = {
       position: { x: 0, y: 0, z: 1200 },
       target: { x: 0, y: 0, z: 0 }
     };
+    const fitDistance = (sphere.radius / Math.sin((FOV_DEG * Math.PI) / 360)) * FIT_MARGIN_FACTOR;
+    const prePrNear = Math.max(fitDistance / 1000, 0.01);
+    const prePrFar = fitDistance * 10;
+
     const decision = decideCameraPose({
-      sphere: { center: { x: 0, y: 0, z: 0 }, radius: 20 },
+      sphere,
       fovDeg: FOV_DEG,
       aspect: 1.5,
       state: { userMoved: true, pose: userPose }
     });
     expect(decision).not.toBeNull();
     expect(decision!.position).toEqual(userPose.position);
-    expect(decision!.near).toBeCloseTo(1200 / 1000, 5);
+    expect(decision!.near).toBeLessThanOrEqual(prePrNear + 1e-9);
+    expect(decision!.near).toBeCloseTo(prePrNear, 5);
+    expect(decision!.far).toBeGreaterThanOrEqual(prePrFar - 1e-9);
     expect(decision!.far).toBeCloseTo(1200 * 10, 5);
+  });
+
+  it("keeps near no larger and far no smaller than pre-PR when a kept pose is closer than fitDistance", () => {
+    const sphere: BoundingSphere = { center: { x: 0, y: 0, z: 0 }, radius: 50 };
+    const closeD = 60;
+    const userPose: CameraPose = {
+      position: { x: 0, y: 0, z: closeD },
+      target: { x: 0, y: 0, z: 0 }
+    };
+    const fitDistance = (sphere.radius / Math.sin((FOV_DEG * Math.PI) / 360)) * FIT_MARGIN_FACTOR;
+    const prePrNear = Math.max(fitDistance / 1000, 0.01);
+    const prePrFar = fitDistance * 10;
+
+    const decision = decideCameraPose({
+      sphere,
+      fovDeg: FOV_DEG,
+      aspect: 1.5,
+      state: { userMoved: true, pose: userPose }
+    });
+    expect(decision).not.toBeNull();
+    expect(decision!.position).toEqual(userPose.position);
+    expect(decision!.near).toBeLessThanOrEqual(prePrNear);
+    expect(decision!.near).toBeCloseTo(Math.max(closeD / 1000, 0.01), 5);
+    expect(decision!.far).toBeGreaterThanOrEqual(prePrFar);
+    expect(decision!.far).toBeCloseTo(prePrFar, 5);
   });
 
   it("re-frames on reset even when userMoved is true", () => {
@@ -173,32 +271,59 @@ describe("decideCameraPose", () => {
 });
 
 describe("createCameraPoseHolder", () => {
-  it("sets userMoved only on onUserStart, never on programmatic onControlsChange, and resets back to auto-framing", () => {
+  it("does not set userMoved on a plain click (start then end with no pose change) or on change without start", () => {
     const holder = createCameraPoseHolder();
     const initial = holder.resolveForGeometry(UNIT_SPHERE, FOV_DEG, 1.5, 0);
     expect(initial?.framed).toBe(true);
-    expect(holder.userMoved).toBe(false);
+    const startPose: CameraPose = { position: initial!.position, target: initial!.target };
 
     // Programmatic controls.update() emits change without start; must not mark userMoved.
     holder.onControlsChange({ position: { x: 10, y: 20, z: 30 }, target: { x: 0, y: 0, z: 0 } });
     expect(holder.userMoved).toBe(false);
     expect(holder.pose).toBeNull();
 
-    // User drags (start -> change).
+    // Plain click: start -> (optional unchanged change) -> end.
+    holder.onUserStart(startPose);
+    holder.onControlsChange(startPose);
+    holder.onUserEnd(startPose);
+    expect(holder.userMoved).toBe(false);
+    expect(holder.pose).toBeNull();
+
+    // Plain click without any change between start and end, followed by a post-end change.
+    holder.onUserStart(startPose);
+    holder.onUserEnd(startPose);
+    holder.onControlsChange({ position: { x: 10, y: 20, z: 30 }, target: { x: 0, y: 0, z: 0 } });
+    expect(holder.userMoved).toBe(false);
+    expect(holder.pose).toBeNull();
+  });
+
+  it("sets userMoved on the first changed pose after start, keeps updating through damping after end, and resets on fitNonce", () => {
+    const holder = createCameraPoseHolder();
+    const initial = holder.resolveForGeometry(UNIT_SPHERE, FOV_DEG, 1.5, 0)!;
+    const startPose: CameraPose = { position: initial.position, target: initial.target };
+
+    // User drags (start -> change -> end -> post-end damping change).
     const draggedPose: CameraPose = {
       position: { x: -90, y: 40, z: 75 },
       target: { x: 2, y: 3, z: 4 }
     };
-    holder.onUserStart(initial!);
+    const dampedPose: CameraPose = {
+      position: { x: -95, y: 42, z: 72 },
+      target: { x: 2, y: 3, z: 4 }
+    };
+    holder.onUserStart(startPose);
     holder.onControlsChange(draggedPose);
     expect(holder.userMoved).toBe(true);
     expect(holder.pose).toEqual(draggedPose);
+    holder.onUserEnd(draggedPose);
+    holder.onControlsChange(dampedPose);
+    expect(holder.pose).toEqual(dampedPose);
 
-    // Next mesh swap keeps dragged pose.
+    // Next mesh swap keeps settled damped pose.
     const next = holder.resolveForGeometry({ center: { x: 1, y: 0, z: 0 }, radius: 52 }, FOV_DEG, 1.5, 0);
     expect(next?.framed).toBe(false);
-    expect(next?.position).toEqual(draggedPose.position);
-    expect(next?.target).toEqual(draggedPose.target);
+    expect(next?.position).toEqual(dampedPose.position);
+    expect(next?.target).toEqual(dampedPose.target);
 
     // Fit / reset clears userMoved so subsequent swaps frame again.
     const resetDecision = holder.resolveForGeometry(UNIT_SPHERE, FOV_DEG, 1.5, 1);
@@ -212,7 +337,9 @@ describe("createCameraPoseHolder", () => {
 
   it("frames a new project (fresh holder after PreviewTab remount) even after the previous project had a user-moved pose", () => {
     const projectAHolder = createCameraPoseHolder();
-    projectAHolder.onUserStart({ position: { x: -80, y: 20, z: 60 }, target: { x: 1, y: 2, z: 3 } });
+    const initialA = projectAHolder.resolveForGeometry(UNIT_SPHERE, FOV_DEG, 1.5, 0)!;
+    projectAHolder.onUserStart({ position: initialA.position, target: initialA.target });
+    projectAHolder.onControlsChange({ position: { x: -80, y: 20, z: 60 }, target: { x: 1, y: 2, z: 3 } });
     expect(projectAHolder.userMoved).toBe(true);
 
     const projectBHolder = createCameraPoseHolder();

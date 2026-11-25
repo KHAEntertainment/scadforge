@@ -46,8 +46,11 @@ export const MIN_VIEWPORT_FRACTION = 0.01;
 /** Minimum forward depth (mm) for a sphere's far side to intersect the camera view frustum. */
 export const FRUSTUM_MIN_DEPTH = 0;
 
-/** Fallback viewport aspect ratio used by the sphere-vs-frustum test when aspect is unavailable. */
+/** Guard fallback viewport aspect ratio used only when camera aspect is missing or non-finite/non-positive. */
 export const DEFAULT_FRUSTUM_ASPECT = 1;
+
+/** Minimum camera position or target delta (mm) after `start` required to count as user camera movement. */
+export const POSE_CHANGE_EPSILON = 1e-5;
 
 /** Minimum non-zero vector length (mm) before a direction vector is treated as degenerate. */
 const MIN_VECTOR_LENGTH = 1e-6;
@@ -97,6 +100,14 @@ function clonePose(pose: CameraPose): CameraPose {
   return { position: cloneVec3(pose.position), target: cloneVec3(pose.target) };
 }
 
+function poseDiffers(a: CameraPose, b: CameraPose, epsilon: number): boolean {
+  return length(sub(a.position, b.position)) > epsilon || length(sub(a.target, b.target)) > epsilon;
+}
+
+function resolveAspect(aspect: number | undefined): number {
+  return aspect !== undefined && Number.isFinite(aspect) && aspect > 0 ? aspect : DEFAULT_FRUSTUM_ASPECT;
+}
+
 /** Fallback direction when framing a model for the first time or after reset. */
 const DEFAULT_VIEW_DIRECTION: Vec3 = normalize({ x: 1, y: 0.8, z: 1 });
 
@@ -104,7 +115,7 @@ function hasLeftView(
   sphere: BoundingSphere,
   pose: CameraPose,
   fovRadians: number,
-  aspect: number | undefined
+  safeAspect: number
 ): boolean {
   const viewOffset = sub(pose.target, pose.position);
   if (length(viewOffset) <= MIN_VECTOR_LENGTH) return true;
@@ -115,7 +126,6 @@ function hasLeftView(
   if (depth + sphere.radius <= FRUSTUM_MIN_DEPTH) return true;
 
   const tanHalfV = Math.tan(fovRadians / 2);
-  const safeAspect = aspect !== undefined && Number.isFinite(aspect) && aspect > 0 ? aspect : DEFAULT_FRUSTUM_ASPECT;
   const tanHalfH = tanHalfV * safeAspect;
 
   const worldUp: Vec3 = Math.abs(dot(forward, { x: 0, y: 1, z: 0 })) > PARALLEL_UP_DOT
@@ -147,7 +157,11 @@ export function decideCameraPose(input: CameraFramingInput): CameraFramingDecisi
   if (!sphere || !Number.isFinite(sphere.radius) || sphere.radius <= 0) return null;
 
   const fovRadians = (fovDeg * Math.PI) / 180;
-  const sinHalf = Math.sin(fovRadians / 2);
+  const halfV = fovRadians / 2;
+  const safeAspect = resolveAspect(aspect);
+  const halfH = Math.atan(Math.tan(halfV) * safeAspect);
+  const effectiveHalfAngle = Math.min(halfV, halfH);
+  const sinHalf = Math.sin(effectiveHalfAngle);
   if (!Number.isFinite(sinHalf) || sinHalf <= 0) return null;
 
   const fitDistance = (sphere.radius / sinHalf) * FIT_MARGIN_FACTOR;
@@ -170,7 +184,7 @@ export function decideCameraPose(input: CameraFramingInput): CameraFramingDecisi
   const distToCenter = length(sub(saved.position, sphere.center));
   const cameraInsideSphere = distToCenter <= sphere.radius;
 
-  if (cameraInsideSphere || hasLeftView(sphere, saved, fovRadians, aspect)) {
+  if (cameraInsideSphere || hasLeftView(sphere, saved, fovRadians, safeAspect)) {
     const target = cloneVec3(sphere.center);
     const position = add(target, scale(viewDir, fitDistance));
     return {
@@ -182,12 +196,11 @@ export function decideCameraPose(input: CameraFramingInput): CameraFramingDecisi
     };
   }
 
-  const clipDistance = Math.max(fitDistance, distToCenter);
   return {
     position: cloneVec3(saved.position),
     target: cloneVec3(saved.target),
-    near: Math.max(clipDistance / 1000, 0.01),
-    far: clipDistance * 10,
+    near: Math.max(Math.min(fitDistance, distToCenter) / 1000, 0.01),
+    far: Math.max(fitDistance, distToCenter) * 10,
     framed: false
   };
 }
@@ -197,7 +210,7 @@ export interface CameraPoseHolder {
   readonly pose: CameraPose | null;
   onUserStart: (currentPose?: CameraPose) => void;
   onControlsChange: (currentPose: CameraPose) => void;
-  reset: () => void;
+  onUserEnd: (currentPose?: CameraPose) => void;
   resolveForGeometry: (
     sphere: BoundingSphere | null,
     fovDeg: number,
@@ -210,6 +223,8 @@ export interface CameraPoseHolder {
 export function createCameraPoseHolder(): CameraPoseHolder {
   let userMoved = false;
   let pose: CameraPose | null = null;
+  let armed = false;
+  let startPose: CameraPose | null = null;
   let lastFitNonce = 0;
 
   return {
@@ -220,21 +235,35 @@ export function createCameraPoseHolder(): CameraPoseHolder {
       return pose ? clonePose(pose) : null;
     },
     onUserStart(currentPose?: CameraPose) {
-      userMoved = true;
-      if (currentPose) pose = clonePose(currentPose);
+      armed = true;
+      startPose = currentPose ? clonePose(currentPose) : null;
     },
     onControlsChange(currentPose: CameraPose) {
-      if (!userMoved) return;
-      pose = clonePose(currentPose);
+      if (userMoved) {
+        pose = clonePose(currentPose);
+        return;
+      }
+      if (!armed) return;
+      if (!startPose) {
+        startPose = clonePose(currentPose);
+        return;
+      }
+      if (poseDiffers(startPose, currentPose, POSE_CHANGE_EPSILON)) {
+        userMoved = true;
+        pose = clonePose(currentPose);
+      }
     },
-    reset() {
-      userMoved = false;
-      pose = null;
+    onUserEnd(currentPose?: CameraPose) {
+      armed = false;
+      startPose = null;
+      if (userMoved && currentPose) {
+        pose = clonePose(currentPose);
+      }
     },
     resolveForGeometry(
       sphere: BoundingSphere | null,
       fovDeg: number,
-      aspect = DEFAULT_FRUSTUM_ASPECT,
+      aspect?: number,
       fitNonce = lastFitNonce
     ): CameraFramingDecision | null {
       const reset = fitNonce !== lastFitNonce;
@@ -242,6 +271,8 @@ export function createCameraPoseHolder(): CameraPoseHolder {
         lastFitNonce = fitNonce;
         userMoved = false;
         pose = null;
+        armed = false;
+        startPose = null;
       }
       const decision = decideCameraPose({
         sphere,
